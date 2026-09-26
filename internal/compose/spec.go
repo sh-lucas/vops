@@ -13,6 +13,24 @@ import (
 	"time"
 )
 
+// NormalizeImage makes short names explicit the way docker and compose read them: "postgres:16" is
+// docker.io/library/postgres:16, "user/app" is docker.io/user/app. podman refuses short names unless
+// the host configured search registries, so a compose file that works with docker would fail here.
+func NormalizeImage(ref string) string {
+	name := ref
+	if i := strings.Index(name, "@"); i >= 0 {
+		name = name[:i]
+	}
+	first, _, hasSlash := strings.Cut(name, "/")
+	if hasSlash && (strings.ContainsAny(first, ".:") || first == "localhost") {
+		return ref
+	}
+	if !hasSlash {
+		return "docker.io/library/" + ref
+	}
+	return "docker.io/" + ref
+}
+
 // Slug is the project path as used in podman object names: "Shop/api" -> "shop.api".
 func Slug(path string) string { return strings.ToLower(strings.ReplaceAll(path, "/", ".")) }
 
@@ -95,7 +113,7 @@ func (p *Project) Specs(rootDomain string, env map[string]string) ([]*Spec, erro
 
 func (p *Project) spec(s *Service, rootDomain string, onlyRouted bool, projectEnv map[string]string) (*Spec, error) {
 	sp := &Spec{
-		Project: p.Path, Service: s.Name, Image: s.Image, Build: s.Build, Cmd: s.Command,
+		Project: p.Path, Service: s.Name, Image: NormalizeImage(s.Image), Build: s.Build, Cmd: s.Command,
 		Job: s.job, DependsOn: s.DependsOn.Names(), Port: s.Vops.Port, Health: s.Vops.Health,
 		Replicas: s.Vops.Replicas, Strategy: s.Vops.Strategy, Watch: s.Vops.Watch == nil || *s.Vops.Watch,
 		Timeout: time.Duration(s.Vops.Timeout), StopWait: 10 * time.Second,

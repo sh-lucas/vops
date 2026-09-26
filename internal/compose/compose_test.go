@@ -207,6 +207,23 @@ func TestMergeFilesAndDomains(t *testing.T) {
 	}
 }
 
+func TestNormalizeImage(t *testing.T) {
+	for in, want := range map[string]string{
+		"postgres":                           "docker.io/library/postgres",
+		"postgres:16-alpine@sha256:ab":       "docker.io/library/postgres:16-alpine@sha256:ab",
+		"mysql@sha256:ab":                    "docker.io/library/mysql@sha256:ab",
+		"traefik/whoami:v1":                  "docker.io/traefik/whoami:v1",
+		"ghcr.io/org/app:1":                  "ghcr.io/org/app:1",
+		"registry.fascode.com.br/app:latest": "registry.fascode.com.br/app:latest",
+		"127.0.0.1:9984/app":                 "127.0.0.1:9984/app",
+		"localhost/vops/x:1":                 "localhost/vops/x:1",
+	} {
+		if got := NormalizeImage(in); got != want {
+			t.Errorf("%s: got %s want %s", in, got, want)
+		}
+	}
+}
+
 func TestSplitWords(t *testing.T) {
 	for in, want := range map[string][]string{
 		`a b  c`:              {"a", "b", "c"},
