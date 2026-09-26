@@ -1,0 +1,6 @@
+FROM quay.io/podman/stable
+RUN dnf -y install openssh-server git systemd procps-ng iproute && dnf clean all && systemctl enable sshd
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+COPY authorized_keys /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+CMD ["/sbin/init"]

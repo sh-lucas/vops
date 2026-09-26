@@ -1,0 +1,100 @@
+# vops or versionated-ops
+
+`vops` is a simple project. If it's not simple, then it's wrong.
+vops is a cli and a daemon to self-host containers with less pain and overhead than traditional operations: a git repo of compose files is the whole state of a server.
+
+## State, development, lifecycle
+
+**v0.1, first usable version.** Everything below "Features" works and is covered by end-to-end tests against real podman (rootless), plus a production-like check (`just vps-test`: a container with systemd, a real sshd and podman as the "VPS", install over real ssh as root, git+ssh sync, daemon restarts, rolling release under load with 0 failed requests). Not yet run on a real cloud VPS with real DNS and Let's Encrypt; that is the last step before calling it production ready.
+
+- Runtime deps on the host: linux, systemd, podman 4+ (netavark), git. btrfs is not used yet.
+- The daemon idles at ~16MB RSS. The binary is static, ~13MB.
+- Why things are the way they are: [reference/decisions.md](reference/decisions.md).
+
+## How it works
+
+```
+your laptop                                   the host
+./ (git repo)  --- git push over ssh --->     ~/vops/ (working tree, updated on push)
+  vops.yml                                      shop/api/compose.yml  -> containers
+  shop/api/compose.yml                          registry/data/        -> your images
+  vops-lock.yml (gitignored)                  ~/.vops/                -> sqlite, certs, binary, socket
+```
+
+`vops sync` pulls from the host, pushes to it, shows what will change and asks before applying. The daemon runs the containers with podman, routes `https://<service>.<project>.<domain>` to them, gets certificates from Let's Encrypt, serves a registry at `registry.<domain>` and a dashboard at `vops.<domain>`.
+
+## Quick start
+
+```sh
+# on your machine, in a new or existing repo
+vops init --domain example.com --email you@example.com
+vops install root@203.0.113.10          # or user@host --ssh-key ~/.ssh/id_ed25519
+# dns: example.com and *.example.com -> the host
+
+mkdir -p site/html && echo hello > site/html/index.html
+cat > site/compose.yml <<'EOF'
+services:
+  web:
+    image: docker.io/library/nginx:alpine
+    volumes: [./html:/usr/share/nginx/html:ro]
+    environment: [SOME_SECRET]            # comes from `vops env set`
+    x-vops: {port: 80}
+EOF
+vops env set site SOME_SECRET              # prompts, never echoed, never readable again
+git add -A && git commit -m site && vops sync
+# -> https://site.example.com
+```
+
+## Features
+
+### Git sync
+- `vops sync`: `git pull` from the host, `git push`, plan, confirm, apply. `-y` for CI.
+- Several people (or CI) can push; sync merges the host's commits first.
+- Plain `git push vops` works too; the dashboard then shows "the host differs from git" with an apply button.
+- Login: `vops-lock.yml` (gitignored, written by `install`) or `--host user@host --ssh-key path`. See [reference/ci.md](reference/ci.md) for GitHub Actions.
+
+### Projects
+- Any git-tracked dir with `compose.yml` (or `*.compose.yml`, `docker-compose.yml`) is a project. Nested dirs are nested projects: `shop/api` is served at `api.shop.<domain>`.
+- vops reads compose itself (a strict subset: unknown keys are errors). Reference: [reference/compose.md](reference/compose.md).
+- Networking: services of a project reach each other by name (`db`); any project reaches any other one at `<service>.<project reversed>` (e.g. `db.api.shop`).
+- Rolling releases for routed services: new replica, readiness check, switch traffic, drain, remove old. A failed readiness check keeps the old version serving. Everything else is recreated (stop, then start).
+- Env vars per project, write-only: set from the cli or the dashboard, used for `${VAR}` and `environment: [VAR]`, never shown again.
+- Disable/enable a project without deleting it; removing its dir from git removes its containers (volumes and data dirs stay).
+
+### Registry
+- Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).
+- Users are simple: a name, a generated token, and a regex and/or a list of repos they may push/pull. `vops user add ci --pattern 'shop/.*'`.
+- The dashboard admin pulls everything and pushes nothing.
+- Pushing a tag that a service runs redeploys it (rolling). No watchtower. Opt out with `x-vops.watch: false`.
+- Garbage collection: dashboard button, `vops registry gc`, and daily.
+
+### Dashboard
+- `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`.
+- Tree of projects/services/containers, pending changes + apply, logs (live, filter), restart, enable/disable, env vars, registry images and users, git-tracked files (text only), events.
+
+### Logs
+- Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts.
+
+## Commands
+
+```
+vops init | install user@host | sync [-y] | ui
+vops status | plan | apply [-y] [project...]
+vops logs <project> [service] [-f] [-n N] [--grep s]
+vops restart <project> [service] | enable <project> | disable <project>
+vops env ls|set|rm <project> ...         vops user ls|add|rm|token ...
+vops registry ls|rm|gc                    vops admin password | events | version
+```
+
+Inside a linked repo commands run on the host over ssh; on the host they talk to the daemon directly.
+
+## Development
+
+```sh
+just test       # everything, needs podman; uses an isolated podman storage in ~/.cache/vops-test
+just build      # ./vops for this machine
+just release    # dist/vops-linux-{amd64,arm64}
+just vps-test   # systemd + real sshd + podman in a container as the host (slow, needs network)
+```
+
+Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api), `internal/deploy` checks zero failed requests during a rolling release, `internal/registry` pushes and pulls with real podman.

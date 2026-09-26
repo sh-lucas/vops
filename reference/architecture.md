@@ -1,0 +1,60 @@
+## Thoughts
+
+A daemon (if needed) and a cli. The cli should install the daemon on the host by ssh (and modify systemd or just use podman run there) and have sub-commands for managing the daemon and containers.
+`podman` runs the container, the daemon handles and abstracts the state, change, management, log aggregation and gitops side of things.
+
+The vops cli should have a push command that pushes the current git repo to any ssh host; it should save the repo itself in `~/vops/` and itself's state in `~/.vops/`.
+You don't need to implement the daemon pulling the repo, but know that it's a planned feature. It would be cool if you could make releated git repos and pull and push via SSH, but that's optional; consider that creating a github actions manually for the repo is fine, just guarantee that there is a way to "log-in" with a gitignored vops-lock.toml/yml (and in this case add the line to a gitignore file automatically on vops init) AND by passing `--ssh-key <path>` to the cli (or something like that).
+
+`~/vops/` is the repo on the remote, `./` is the repo locally, `~/vops/registry` should be created automatically and contain the data for the registry, `~/vops/<projectName>` is the way to declare a new project.
+If the repo is pushed to the remote by ssh, vops should check and up and down any compose files with vops sync, asking for confirmation before taking any action.
+
+It should be almost staless if possible, and I would love to see rooling releases; that's to say: create a new container replica, redirect the trafic (after a readyness probe confirmation) and just then remove the old container.
+All state should be saved on an sqlite database on the remote machine.
+
+Example:
+- ~/vops/registry is fixed, and should be created automatically with a .gitignore to ignore data/ (that should contain all blobs for the images themselves).
+- ~/vops/myProject/ is an old project that I have commited and pushed.
+    - ~/vops/myProject/compose.yml is the compose file for the project.
+    - ~/vops/myProject/data/ is the stuff I declare, and it's my responsability to gitignore it.
+- `./myCoolProject/` is another project that I just created locally.
+    - `vops sync` should git pull and then push the latest commit I did, do a podman compose up if there is any "*compose.yml" file in `./myCoolProject`.
+    - If I created `./myCoolProject/mySubProject/compose.yml`, vops sync should create a new subproject `~/vops/myCoolProject/mySubProject/` and up the containers as expected.
+    - In the previous case, mySubProject.myCoolProject.myDomain.com should be the path of the network in that case.
+    - I don't really care how you do the networking, but keep it simple and specify a default for every project so it's easy to connect one to another.
+- preferably, vops should have it's own container namespace or at least use the sqlite to manage everything.
+
+
+When pushed, vops should compare the local state (of the repo) to the state on the remote host and push any changes, upping new containers that follow `~/vops/<projectName>/compose.yml` and create a new network automatically routing it using the daemon, or Traefik, or Caddy, or nginx, or whatever you feel that it's beter.
+
+Everything should be testable using local containers, docker-in-docker or, if really needed, ask the user for a real cloud machine for the testing. You can (and probably should) ship the daemon with subcommands that does the upping and downing of the containers, since that way it would be easier to understand what's happening.
+
+vops.yourDomain.com/ should have a simple UI to manage the projects, basically see which one is which, and allow the user to:
+- Deactivate/turn off a project
+- see the whole VPS structure in a tree view
+- see container logs, restart containers
+- see the images pushed to the registry
+- CRUD for registry users; that's important for me, and should be very very simple way to create a new user for manaing an entire project.
+    - you can use whatever user:pass or jwt's, I don't care.
+    - you should be able to define a regex and a list of names allowed for that user to push.
+- the login and password for the dashboard itself should be capable of downloading any image, but not pushing any shit.
+- It should not be a file explorer; just the folders tracked by git should be shown and only folders and the most common text files.
+- it should allow environment variables to be set for each project.
+    - Yeah, any user can set any project's environment variables, but no way that anybody should see the variable itself.
+
+## Implementation map
+
+The thoughts above are the original brief. How it ended up (details and reasons in [decisions.md](decisions.md)):
+
+| package | does |
+|---|---|
+| `cmd/vops` | main |
+| `internal/cli` | commands: forwards host commands over ssh (`remote.go`), talks to the socket on the host (`host.go`), init/install/sync/apply (`local.go`), host setup + systemd unit (`setup.go`) |
+| `internal/daemon` | listeners, TLS (autocert), host routing, json api, sessions, logs, git-tracked file tree |
+| `internal/deploy` | plan (git vs podman), apply, rolling/recreate, readiness, routes from labels |
+| `internal/compose` | compose subset parser, interpolation, service → podman args |
+| `internal/registry` | OCI registry on the filesystem, GC |
+| `internal/proxy` | routing table + reverse proxy |
+| `internal/store` | sqlite: env (encrypted), users, sessions, events, project flags |
+| `internal/ui` | embedded dashboard (html/css/js) |
+| `e2e` | the real binary end to end, with a fake ssh |

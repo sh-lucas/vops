@@ -1,0 +1,9 @@
+- log aggregation in batches into a/many duckdb/parquet files so every project's logs are aggregated, and one update doesn't overwrite the entire file.
+    - for now journald does it (see decisions.md, "Logs"); revisit if months-long search is needed.
+- easy search of said files
+    - `vops logs --grep` and the dashboard filter search the journal.
+- validate on a real cloud VPS (real dns + let's encrypt, and a non-root user with linger), then tag v0.1. root + real sshd + systemd is covered by `just vps-test`.
+- btrfs snapshots of project `data/` dirs before a deploy that changes that project, with `vops rollback`.
+- re-pull third-party tags (`postgres:16`) on demand from the dashboard ("update images").
+- prebuilt release binaries (amd64/arm64) so install and CI don't need go.
+- per-container metrics (podman stats) in the dashboard.
