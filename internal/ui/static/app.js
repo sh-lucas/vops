@@ -78,7 +78,7 @@ const ago = (unix) => {
 };
 const size = (n) => n >= 1 << 30 ? (n / (1 << 30)).toFixed(1) + " GB" : n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B";
 // a finished job (exit 0) is fine, not an error
-const stateOf = (c) => (c.Labels && c.Labels["vops.job"] && c.State === "exited" && c.ExitCode === 0 ? "done" : c.State);
+const stateOf = (c) => (c.Labels && c.Labels["vops.job"] && (c.State === "exited" || c.State === "stopped") && c.ExitCode === 0 ? "done" : c.State);
 const short = (s, n = 12) => (s || "").replace("sha256:", "").slice(0, n);
 const enc = encodeURIComponent;
 

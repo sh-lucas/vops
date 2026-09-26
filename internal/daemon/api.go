@@ -105,7 +105,6 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		// a client that disconnects must not abort a rollout halfway
 		ctx := context.WithoutCancel(r.Context())
 		_, err := d.Engine.Apply(ctx, flushWriter{w}, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects})
-		d.reloadRepoConfig()
 		if err != nil {
 			fmt.Fprintf(w, "==> error: %v\n", err)
 		} else {

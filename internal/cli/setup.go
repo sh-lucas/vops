@@ -4,14 +4,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/daemon"
 	"github.com/sh-lucas/vops/internal/podman"
 	"github.com/sh-lucas/vops/internal/store"
@@ -43,6 +46,20 @@ func cmdSetup(args []string) error {
 	vh, repo := daemon.Paths(home)
 	for _, d := range []string{filepath.Join(vh, "bin"), filepath.Join(vh, "certs")} {
 		if err := os.MkdirAll(d, 0o700); err != nil {
+			return err
+		}
+	}
+	// --config-stdin: the repo's vops.yml becomes the lock the daemon starts from
+	if slices.Contains(args, "--config-stdin") {
+		b, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			return err
+		}
+		cfg, err := config.Parse(b)
+		if err != nil {
+			return fmt.Errorf("vops.yml: %w", err)
+		}
+		if err := config.WriteLockFile(daemon.LockPath(vh), cfg); err != nil {
 			return err
 		}
 	}

@@ -28,7 +28,7 @@ Phase 1 is done: data lives on btrfs subvolumes, snapshots before every deploy, 
 
 ### Smaller data items
 
-- Opt-out per project for pre-deploy snapshots (top-level `x-vops: {snapshots: false}` in compose; today it's host-wide in `~/.vops/config.yml`).
+- Opt-out per project for pre-deploy snapshots (top-level `x-vops: {snapshots: false}` in compose; today it's host-wide in `vops.yml`).
 - `vops snapshot diff <id>`: `btrfs subvolume find-new` / sizes, to see how much a snapshot holds exclusively.
 - Show snapshot disk usage (needs quotas or `btrfs filesystem du`, which is slow; maybe only on demand).
 - Off-host backups: `btrfs send` of a snapshot to a file/ssh target (`vops snapshot export <id> > file`), incremental against the previous one.

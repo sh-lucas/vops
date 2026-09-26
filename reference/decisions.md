@@ -19,7 +19,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 | `~/vops/<project>/compose.yml` | a project |
 | `~/.vops/bin/vops` | the binary (absolute path, so non-interactive ssh `PATH` doesn't matter) |
 | `~/.vops/vops.db` | sqlite: env vars, users, sessions, events, project flags |
-| `~/.vops/config.yml` | host-only settings (listen addresses, tls) |
+| `~/.vops/config.yml` | the config lock: copy of the last applied `vops.yml` |
 | `~/.vops/secret.key` | AES key for env values at rest |
 | `~/.vops/certs/` | ACME cache |
 | `~/.vops/vops.sock` | daemon socket |
@@ -75,7 +75,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 ## Web UI
 
 - Plain HTML + CSS + vanilla JS, embedded with `embed`. It uses the same JSON API as the socket.
-- Served on `ui` listen address (default `127.0.0.1:9984`) and on `vops.<domain>` over HTTPS. The default is loopback because plain HTTP with a password over the internet is bad; `vops ui` opens an ssh tunnel and the browser. Set `ui: ":9984"` in `~/.vops/config.yml` to expose it.
+- Served on `ui` listen address (default `127.0.0.1:9984`) and on `vops.<domain>` over HTTPS. The default is loopback because plain HTTP with a password over the internet is bad; `vops ui` opens an ssh tunnel and the browser. Set `ui: ":9984"` in `vops.yml` to expose it.
 - Sessions: random id in an `HttpOnly; SameSite=Strict` cookie, sha256 stored in sqlite. Mutating requests also need the `X-Vops: 1` header (blocks CSRF without tokens).
 - Env values are write-only: the API has no way to read them back.
 
@@ -91,6 +91,15 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - `service_completed_successfully` turns the dependency into a job: ready = exit 0, default `restart: no` (an always-restarting job would loop), 10 min timeout. A finished job isn't rerun until its definition changes (compose `up` does the same); a failed one is retried on the next apply.
 - When a service fails, its dependents are skipped in that apply instead of deployed against a broken dependency.
 - Active profiles come from `COMPOSE_PROFILES` in the project env: the compose-standard variable, set the vops way. `depends_on.restart` is rejected: vops never restarts dependents behind your back.
+
+## Config: vops.yml and its lock
+
+- One config file, `vops.yml`, committed: domain, email, listeners, tls, snapshots. It is desired state like the compose files: a change shows up in the plan (`~ ui: a -> b`) and takes effect on apply.
+- The host keeps `~/.vops/config.yml`, a copy of the last applied `vops.yml` (the "lock"). The daemon always starts from the lock, never straight from the repo, so a broken or half-pushed `vops.yml` can't stop it: the plan warns "keeping the config in effect" and nothing changes.
+- `vops install` sends the local `vops.yml` to the host as its first lock, so the daemon starts with the right ports and tls before the first sync.
+- A hand edit of the lock is drift: the next plan shows it and apply puts `vops.yml` back.
+- Listener changes (http, https, ui, tls, acme email) need new sockets: after apply the daemon re-execs itself (same pid, systemd doesn't notice; containers keep running, routes are rebuilt from labels). Everything else (domain, snapshots) applies live.
+- Parsing is strict: a typo in `vops.yml` is an error, not a silently ignored key.
 
 ## Snapshots and rollback
 

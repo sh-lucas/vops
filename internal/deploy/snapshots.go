@@ -161,7 +161,7 @@ func (e *Engine) DataState(ctx context.Context, project string) DataState {
 	st := DataState{Supported: e.snapshotsOn() && snapshot.Supported(e.SnapshotDir), Protected: []string{}}
 	switch {
 	case e.SnapshotsOff:
-		st.Reason = "snapshots are off in ~/.vops/config.yml"
+		st.Reason = "snapshots are off (snapshots: off in vops.yml)"
 	case !st.Supported:
 		st.Reason = "snapshots need btrfs (and btrfs-progs) under " + e.SnapshotDir
 	}
@@ -252,7 +252,7 @@ func (e *Engine) deleteSnapshot(ctx context.Context, s store.Snapshot) error {
 }
 
 // preDeploy snapshots a project's data before a deploy changes it. No data is fine; a failed
-// snapshot aborts the deploy (turn snapshots off in config.yml to deploy without them).
+// snapshot aborts the deploy (set snapshots: off in vops.yml to deploy without them).
 func (e *Engine) preDeploy(ctx context.Context, w io.Writer, pp *ProjectPlan, commit string) error {
 	if !e.snapshotsOn() || !snapshot.Supported(e.SnapshotDir) {
 		return nil
@@ -264,7 +264,7 @@ func (e *Engine) preDeploy(ctx context.Context, w io.Writer, pp *ProjectPlan, co
 	current, _ := e.DB.Projects()
 	_, err = e.snap(ctx, w, store.Snapshot{Project: pp.Path, Reason: "pre-deploy", Note: "before " + short(commit), Commit: current[pp.Path].Commit, Volumes: vols}, users)
 	if err != nil && !errors.Is(err, errNoData) {
-		return fmt.Errorf("pre-deploy snapshot failed, nothing was deployed (snapshots: off in ~/.vops/config.yml skips them): %w", err)
+		return fmt.Errorf("pre-deploy snapshot failed, nothing was deployed (snapshots: off in vops.yml skips them): %w", err)
 	}
 	return nil
 }
@@ -281,7 +281,7 @@ func (e *Engine) Snapshot(ctx context.Context, w io.Writer, project, note string
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.snapshotsOn() {
-		return store.Snapshot{}, errors.New("snapshots are off in ~/.vops/config.yml")
+		return store.Snapshot{}, errors.New("snapshots are off (snapshots: off in vops.yml)")
 	}
 	vols, unprotected, users, err := e.projectData(ctx, project)
 	if err != nil {
@@ -330,7 +330,7 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, project string, id i
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.snapshotsOn() {
-		return errors.New("snapshots are off in ~/.vops/config.yml")
+		return errors.New("snapshots are off (snapshots: off in vops.yml)")
 	}
 	s, err := e.DB.Snapshot(id)
 	if err != nil {

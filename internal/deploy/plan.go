@@ -45,7 +45,12 @@ type Engine struct {
 	SnapshotDir  string             // where snapshots live (same btrfs as the data); empty disables snapshots
 	SnapshotKeep int                // automatic snapshots kept per project (default 5)
 	SnapshotsOff bool
-	PullAuthFile string // podman authfile (0600) with credentials for PullAddr; not --creds, which shows in ps
+	PullAuthFile string
+
+	// Config returns the config in effect (the host lock); ApplyConfig makes a new one take effect.
+	// Both nil means vops.yml is only read for the domain (tests).
+	Config      func() config.Config
+	ApplyConfig func(config.Config, io.Writer) error // podman authfile (0600) with credentials for PullAddr; not --creds, which shows in ps
 
 	mu sync.Mutex // one apply at a time
 }
@@ -54,7 +59,15 @@ type Plan struct {
 	Commit   string         `json:"commit"`
 	Domain   string         `json:"domain"`
 	Projects []*ProjectPlan `json:"projects"`
+	Config   *ConfigChange  `json:"config,omitempty"`
 	Warnings []string       `json:"warnings"`
+}
+
+// ConfigChange is vops.yml differing from the config in effect.
+type ConfigChange struct {
+	Changes []string      `json:"changes"`
+	Restart bool          `json:"restart"` // listeners change: the daemon restarts itself (containers keep running)
+	To      config.Config `json:"to"`
 }
 
 type ProjectPlan struct {
@@ -85,6 +98,9 @@ type desired struct {
 
 // Changes reports whether the plan does anything.
 func (p *Plan) Changes() bool {
+	if p.Config != nil {
+		return true
+	}
 	for _, pp := range p.Projects {
 		if pp.Error != "" {
 			return true
@@ -107,6 +123,15 @@ func (p *Plan) Print(w io.Writer) {
 	fmt.Fprintf(w, "commit %s\n", short)
 	for _, warn := range p.Warnings {
 		fmt.Fprintf(w, "  ! %s\n", warn)
+	}
+	if c := p.Config; c != nil {
+		fmt.Fprintln(w, "vops.yml")
+		for _, ch := range c.Changes {
+			fmt.Fprintf(w, "  ~ %s\n", ch)
+		}
+		if c.Restart {
+			fmt.Fprintln(w, "  (the daemon restarts to apply it; containers keep running)")
+		}
 	}
 	for _, pp := range p.Projects {
 		label := pp.Path
@@ -172,7 +197,16 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	plan := &Plan{Warnings: []string{}}
 	plan.Commit, _ = git(ctx, e.Repo, "rev-parse", "HEAD")
 	cfg, err := config.ReadRepo(e.Repo)
-	if err != nil {
+	if e.Config != nil {
+		current := e.Config()
+		switch {
+		case err != nil:
+			plan.Warnings = append(plan.Warnings, fmt.Sprintf("%v: keeping the config in effect", err))
+			cfg = current
+		case cfg != current:
+			plan.Config = &ConfigChange{Changes: current.Diff(cfg), Restart: current.Listeners(cfg), To: cfg}
+		}
+	} else if err != nil {
 		return nil, err
 	}
 	plan.Domain = cfg.Domain
@@ -319,11 +353,11 @@ func compare(d *desired, actual []podman.Container) Action {
 			a.Kind, a.Reason = "update", "definition changed"
 			return a
 		}
-		if d.spec.Job && c.State == "exited" && c.ExitCode != 0 {
+		if d.spec.Job && finished(c.State) && c.ExitCode != 0 {
 			a.Kind, a.Reason = "update", fmt.Sprintf("last run failed (exit %d)", c.ExitCode)
 			return a
 		}
-		if c.State == "running" || d.spec.Job && c.State == "exited" {
+		if c.State == "running" || d.spec.Job && finished(c.State) {
 			running++
 		}
 	}
@@ -522,3 +556,6 @@ func (pp *ProjectPlan) Services() []ServiceState {
 	}
 	return out
 }
+
+// finished: podman reports a container that ran to completion as exited, or stopped once cleaned up.
+func finished(state string) bool { return state == "exited" || state == "stopped" }

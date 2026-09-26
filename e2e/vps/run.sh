@@ -23,9 +23,9 @@ CGO_ENABLED=0 go build -o "$W/vops" ./cmd/vops
 V=$W/vops
 mkdir "$W/repo" && cd "$W/repo"
 $V init --domain vps.test >/dev/null
+# no public dns in here, so no acme: plain http. install seeds the host config from vops.yml
+sed -i 's/^tls: auto/tls: off/' vops.yml
 $V install root@127.0.0.1 --port 2222 --ssh-key "$W/key"
-# no public dns in here, so no acme: plain http
-"$W/ssh" -i "$W/key" -p 2222 root@127.0.0.1 'printf "tls: off\n" > ~/.vops/config.yml && systemctl restart vops'
 
 mkdir -p site/html && echo v1 > site/html/index.html
 printf 'services:\n  web:\n    image: docker.io/library/nginx:alpine\n    volumes: ["./html:/usr/share/nginx/html:ro,Z"]\n    environment: {V: "1"}\n    x-vops: {port: 80, replicas: 2}\n' > site/compose.yml

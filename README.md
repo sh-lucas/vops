@@ -79,11 +79,15 @@ git add -A && git commit -m site && vops sync
 - Every named volume and every bind mount inside the project dir is created as a btrfs subvolume, so snapshots are instant and copy-on-write, even for a 50GB database.
 - Before any deploy that changes a project, its data is snapshotted (`pre-deploy`); containers using it are paused for the few milliseconds it takes, so all volumes are captured at the same instant.
 - `vops rollback <project> [id]` stops the project, snapshots the current data (`pre-rollback`, so the rollback itself can be undone), restores, starts again. Code is not touched; the snapshot says which commit its data belongs to.
-- `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `~/.vops/config.yml`); manual ones stay until deleted.
+- `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `vops.yml`); manual ones stay until deleted.
 - Works rootless (through `podman unshare`), no root and no special mount options.
 
 ### Audit log
 - Every write to the host's database (env changes, users, logins, snapshots, projects) is recorded by sqlite triggers, so no code path can forget it. Secrets never land there. `vops audit`, or the Events page.
+
+### Config
+- Everything is in `vops.yml` at the repo root (`vops init` writes it with comments): domain, email, listeners, tls, snapshots. Changes show up in the plan and take effect on apply, like compose files.
+- The host keeps the last applied copy in `~/.vops/config.yml` and always runs from it, so a broken `vops.yml` never breaks the daemon. New listeners restart the daemon in place (containers keep running).
 
 ### Registry
 - Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).

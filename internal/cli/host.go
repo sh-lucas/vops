@@ -525,7 +525,7 @@ func printStatus(c *client, out io.Writer) error {
 				}
 				if ct.Labels["vops.job"] != "" {
 					state = "done"
-					if ct.State == "exited" && ct.ExitCode == 0 {
+					if (ct.State == "exited" || ct.State == "stopped") && ct.ExitCode == 0 {
 						running++
 					}
 				}

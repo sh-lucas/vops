@@ -76,21 +76,31 @@ func cmdInit(args []string) error {
 		}
 		root = cwd
 	}
-	cfg, err := config.ReadRepo(root)
-	if err != nil {
+	path := filepath.Join(root, config.RepoFile)
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		b = []byte(config.Template(strings.ToLower(*domain), *email))
+	case err != nil:
 		return err
-	}
-	_, statErr := os.Stat(filepath.Join(root, config.RepoFile))
-	if *domain != "" {
-		cfg.Domain = strings.ToLower(*domain)
-	}
-	if *email != "" {
-		cfg.Email = *email
-	}
-	if statErr != nil || *domain != "" || *email != "" {
-		if err := config.WriteRepo(root, cfg); err != nil {
-			return err
+	case *domain != "" || *email != "":
+		fields := map[string]string{}
+		if *domain != "" {
+			fields["domain"] = strings.ToLower(*domain)
 		}
+		if *email != "" {
+			fields["email"] = *email
+		}
+		if b, err = config.SetFields(b, fields); err != nil {
+			return fmt.Errorf("%s: %w", config.RepoFile, err)
+		}
+	}
+	cfg, err := config.Parse(b)
+	if err != nil {
+		return fmt.Errorf("%s: %w", config.RepoFile, err)
+	}
+	if err := os.WriteFile(path, b, 0o644); err != nil {
+		return err
 	}
 	if err := ensureLine(filepath.Join(root, "registry", ".gitignore"), "data/"); err != nil {
 		return err
@@ -171,7 +181,18 @@ func cmdInstall(g globals, args []string) error {
 	if err := r.Shell(`mkdir -p ~/.vops/bin && cat > ~/.vops/bin/vops.new && chmod 755 ~/.vops/bin/vops.new && mv -f ~/.vops/bin/vops.new ~/.vops/bin/vops`, f, os.Stdout); err != nil {
 		return err
 	}
-	if err := r.Run([]string{"setup"}, nil, os.Stdout, false); err != nil {
+	// the host starts from this repo's vops.yml (its lock), so the first start already has the right ports and tls
+	var setupIn io.Reader
+	setupArgs := []string{"setup"}
+	if root := repoRoot(); root != "" {
+		if b, err := os.ReadFile(filepath.Join(root, config.RepoFile)); err == nil {
+			if _, err := config.Parse(b); err != nil {
+				return fmt.Errorf("%s: %w", config.RepoFile, err)
+			}
+			setupIn, setupArgs = bytes.NewReader(b), append(setupArgs, "--config-stdin")
+		}
+	}
+	if err := r.Run(setupArgs, setupIn, os.Stdout, false); err != nil {
 		return err
 	}
 	if root := repoRoot(); root != "" {
@@ -396,7 +417,16 @@ func cmdDaemon() error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	return d.Run(ctx)
+	err = d.Run(ctx)
+	if errors.Is(err, daemon.ErrRestart) {
+		// new listeners from vops.yml: become a fresh daemon, same pid (systemd doesn't notice)
+		exe, xerr := os.Executable()
+		if xerr != nil {
+			return xerr
+		}
+		return syscall.Exec(strings.TrimSuffix(exe, " (deleted)"), os.Args, os.Environ())
+	}
+	return err
 }
 
 // ---- rollback: show what gets restored, ask, then restore that exact snapshot

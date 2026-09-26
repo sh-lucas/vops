@@ -19,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/podman"
 	"github.com/sh-lucas/vops/internal/snapshot"
 	"github.com/sh-lucas/vops/internal/testenv"
@@ -67,13 +68,23 @@ func setup(t *testing.T) *world {
 	hostHome := filepath.Join(dir, "host")
 	os.MkdirAll(filepath.Join(hostHome, ".vops"), 0o700)
 	w := &world{t: t, bin: bin, hostHome: hostHome, httpAddr: freeAddr(t), uiAddr: freeAddr(t), app: app}
-	os.WriteFile(filepath.Join(hostHome, ".vops", "config.yml"), fmt.Appendf(nil, "http: %s\nhttps: \"\"\nui: %s\ntls: off\n", w.httpAddr, w.uiAddr), 0o644)
 	w.env = append(os.Environ(),
 		"VOPS_SSH="+ssh, "FAKE_HOME="+hostHome, "VOPS_PODMAN="+wrapper, "VOPS_NO_SYSTEMD=1",
 		"GIT_AUTHOR_NAME=dev", "GIT_AUTHOR_EMAIL=dev@x", "GIT_COMMITTER_NAME=dev", "GIT_COMMITTER_EMAIL=dev@x",
 		"HOME="+filepath.Join(dir, "devhome"),
 	)
 	return w
+}
+
+func (w *world) setConfig(dir string, fields map[string]string) {
+	w.t.Helper()
+	path := filepath.Join(dir, "vops.yml")
+	b, _ := os.ReadFile(path)
+	b, err := config.SetFields(b, fields)
+	if err != nil {
+		w.t.Fatal(err)
+	}
+	os.WriteFile(path, b, 0o644)
 }
 
 // vops runs the cli in dir and fails the test on error.
@@ -178,6 +189,8 @@ func TestEndToEnd(t *testing.T) {
 			t.Fatalf("init did not create %s", f)
 		}
 	}
+	// the whole config lives in the repo: listeners for this test, no acme in here
+	w.setConfig(dev, map[string]string{"http": w.httpAddr, "https": "off", "ui": w.uiAddr, "tls": "off"})
 	out := w.vops(dev, "install", "dev@fakehost", "--binary", w.bin)
 	m := regexp.MustCompile(`dashboard login: admin / (\S+)`).FindStringSubmatch(out)
 	if m == nil {
@@ -394,5 +407,41 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if ev := w.vops(dev, "events"); !strings.Contains(ev, "push") || !strings.Contains(ev, "shop") {
 		t.Fatalf("events:\n%s", ev)
+	}
+
+	// vops.yml is desired state too: a change shows in the plan, apply writes the host lock,
+	// and new listeners restart the daemon in place (containers keep serving)
+	lock := filepath.Join(w.hostHome, ".vops", "config.yml")
+	if b, _ := os.ReadFile(lock); !strings.Contains(string(b), w.httpAddr) || !strings.Contains(string(b), "vops.test") {
+		t.Fatalf("install did not seed the lock from vops.yml:\n%s", b)
+	}
+	newUI := freeAddr(t)
+	w.setConfig(dev, map[string]string{"ui": newUI, "snapshot_keep": "3"})
+	w.git(dev, "commit", "-qam", "config")
+	out = w.vops(dev, "sync", "--yes")
+	if !strings.Contains(out, "~ ui: "+w.uiAddr+" -> "+newUI) || !strings.Contains(out, "~ snapshot_keep: 5 -> 3") || !strings.Contains(out, "daemon restarts") {
+		t.Fatalf("config change not planned:\n%s", out)
+	}
+	if b, _ := os.ReadFile(lock); !strings.Contains(string(b), newUI) || !strings.Contains(string(b), "snapshot_keep: 3") {
+		t.Fatalf("lock not updated:\n%s", b)
+	}
+	w.eventually("dashboard on the new port", func() bool {
+		resp, err := http.Get("http://" + newUI + "/")
+		if err == nil {
+			resp.Body.Close()
+		}
+		return err == nil && resp.StatusCode == 200
+	})
+	if code, body := w.get("shop.vops.test"); code != 200 || body != "again" {
+		t.Fatalf("site after daemon restart: %d %q", code, body)
+	}
+	if out := w.vops(dev, "plan"); !strings.Contains(out, "nothing to do") {
+		t.Fatalf("config should be in sync:\n%s", out)
+	}
+	// a broken vops.yml never reaches the daemon: plan warns and keeps the config in effect
+	w.setConfig(dev, map[string]string{"tls": "maybe"})
+	w.git(dev, "commit", "-qam", "broken config")
+	if out, err := w.try(dev, "", "sync", "--yes"); err != nil || !strings.Contains(out, "keeping the config in effect") {
+		t.Fatalf("broken config: %v\n%s", err, out)
 	}
 }

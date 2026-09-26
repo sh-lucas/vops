@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -32,14 +33,14 @@ import (
 type Daemon struct {
 	Home string // ~/.vops
 	Repo string // ~/vops
-	Host config.Host
 
 	DB     *store.DB
 	Reg    *registry.Registry
 	Engine *deploy.Engine
 	Routes *proxy.Table
 
-	repoCfg   atomic.Pointer[config.Repo]
+	cfg       atomic.Pointer[config.Config] // the lock (~/.vops/config.yml): what is in effect
+	restart   chan struct{}                 // listeners changed: Run returns ErrRestart
 	pullToken string
 	authCache sync.Map // sha256(user:pass) -> cachedAuth
 }
@@ -56,14 +57,29 @@ func Paths(home string) (vopsHome, repo string) {
 
 func SocketPath(vopsHome string) string { return filepath.Join(vopsHome, "vops.sock") }
 
+// ErrRestart: the daemon must be restarted (re-exec'd) to apply new listeners.
+var ErrRestart = errors.New("restart")
+
+// LockPath is the host copy of the last applied vops.yml.
+func LockPath(vopsHome string) string { return filepath.Join(vopsHome, "config.yml") }
+
 // New opens the state. It does not listen yet.
 func New(vopsHome, repo string) (*Daemon, error) {
 	if err := os.MkdirAll(vopsHome, 0o700); err != nil {
 		return nil, err
 	}
-	host, err := config.ReadHost(filepath.Join(vopsHome, "config.yml"))
+	host, err := config.Read(LockPath(vopsHome))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w (fix it, or delete it to start from vops.yml / defaults)", err)
+	}
+	if _, statErr := os.Stat(LockPath(vopsHome)); statErr != nil {
+		// no lock yet (install normally writes one): start from the repo's vops.yml if it is valid
+		if c, err := config.ReadRepo(repo); err == nil {
+			host = c
+		}
+		if err := config.WriteLockFile(LockPath(vopsHome), host); err != nil {
+			return nil, err
+		}
 	}
 	db, err := store.Open(filepath.Join(vopsHome, "vops.db"), filepath.Join(vopsHome, "secret.key"))
 	if err != nil {
@@ -73,17 +89,38 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Daemon{Home: vopsHome, Repo: repo, Host: host, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token()}
+	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1)}
+	d.cfg.Store(&host)
 	reg.Auth = d.registryAuth
 	reg.OnPush = d.onPush
 	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
-		SnapshotDir: filepath.Join(vopsHome, "snapshots"), SnapshotKeep: host.SnapshotKeep, SnapshotsOff: host.Snapshots == "off"}
+		SnapshotDir: filepath.Join(vopsHome, "snapshots"), SnapshotKeep: host.SnapshotKeep, SnapshotsOff: host.Snapshots == "off",
+		Config: func() config.Config { return *d.cfg.Load() }, ApplyConfig: d.applyConfig}
 	auth := fmt.Sprintf(`{"auths":{%q:{"auth":%q}}}`, d.Engine.PullAddr, base64.StdEncoding.EncodeToString([]byte("vops-internal:"+d.pullToken)))
 	if err := os.WriteFile(d.Engine.PullAuthFile, []byte(auth), 0o600); err != nil {
 		return nil, err
 	}
-	d.reloadRepoConfig()
 	return d, nil
+}
+
+// applyConfig makes a new vops.yml take effect: write the lock, update what can change live,
+// and restart the daemon when listeners change. Called by apply (engine lock held).
+func (d *Daemon) applyConfig(c config.Config, w io.Writer) error {
+	old := *d.cfg.Load()
+	if err := config.WriteLockFile(LockPath(d.Home), c); err != nil {
+		return err
+	}
+	d.cfg.Store(&c)
+	d.Engine.SnapshotKeep, d.Engine.SnapshotsOff = c.SnapshotKeep, c.Snapshots == "off"
+	d.DB.Event("", "config", "vops.yml applied: %s", strings.Join(old.Diff(c), ", "))
+	if old.Listeners(c) {
+		fmt.Fprintln(w, "vops.yml: listeners changed, the daemon restarts in a second (containers keep running)")
+		go func() {
+			time.Sleep(time.Second) // let the apply response finish
+			d.restart <- struct{}{}
+		}()
+	}
+	return nil
 }
 
 // loopback turns ":9984" or "0.0.0.0:9984" into "127.0.0.1:9984" (what podman pulls from).
@@ -98,15 +135,7 @@ func loopback(addr string) string {
 	return net.JoinHostPort(host, port)
 }
 
-func (d *Daemon) reloadRepoConfig() {
-	cfg, err := config.ReadRepo(d.Repo)
-	if err != nil {
-		log.Printf("vops.yml: %v", err)
-	}
-	d.repoCfg.Store(&cfg)
-}
-
-func (d *Daemon) domain() string { return d.repoCfg.Load().Domain }
+func (d *Daemon) domain() string { return d.cfg.Load().Domain }
 
 func (d *Daemon) uiHost() string {
 	if d.domain() == "" {
@@ -249,6 +278,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	log.SetFlags(0)
 	d.Engine.StartStopped(ctx, &logWriter{prefix: "boot: "})
 
+	cfg := *d.cfg.Load()
 	var servers []*http.Server
 	errc := make(chan error, 4)
 	serve := func(name string, l net.Listener, h http.Handler, tlsCfg *tls.Config) {
@@ -277,8 +307,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	os.Chmod(sock, 0o600)
 	serve("socket", sl, d.API(true), nil)
 
-	if d.Host.UI != "" && d.Host.UI != "off" {
-		l, err := net.Listen("tcp", d.Host.UI)
+	if cfg.UI != "" && cfg.UI != "off" {
+		l, err := net.Listen("tcp", cfg.UI)
 		if err != nil {
 			return fmt.Errorf("ui: %w", err)
 		}
@@ -292,25 +322,25 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		return net.Listen("tcp", addr)
 	}
-	if d.Host.TLS != "off" && d.Host.HTTPS != "" && d.Host.HTTPS != "off" {
+	if cfg.TLS != "off" && cfg.HTTPS != "" && cfg.HTTPS != "off" {
 		// always listen: the domain may only arrive with the first sync
 		m := &autocert.Manager{
 			Prompt:     autocert.AcceptTOS,
 			Cache:      autocert.DirCache(filepath.Join(d.Home, "certs")),
-			Email:      d.repoCfg.Load().Email,
+			Email:      cfg.Email,
 			HostPolicy: d.hostPolicy,
 		}
-		if d.Host.ACMEDirectory != "" {
-			m.Client = &acme.Client{DirectoryURL: d.Host.ACMEDirectory}
+		if cfg.ACMEDirectory != "" {
+			m.Client = &acme.Client{DirectoryURL: cfg.ACMEDirectory}
 		}
-		l, err := listen(d.Host.HTTPS)
+		l, err := listen(cfg.HTTPS)
 		if err != nil {
 			return fmt.Errorf("https: %w", err)
 		}
 		tlsCfg := m.TLSConfig()
 		tlsCfg.MinVersion = tls.VersionTLS12
 		serve("https", l, hsts(main), tlsCfg)
-		if l, err := listen(d.Host.HTTP); err != nil {
+		if l, err := listen(cfg.HTTP); err != nil {
 			return fmt.Errorf("http: %w", err)
 		} else if l != nil {
 			// acme challenges, then https redirects for hosts we serve; plain http until a domain is set
@@ -326,7 +356,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				http.Redirect(w, r, "https://"+proxy.Host(r.Host)+r.URL.RequestURI(), http.StatusMovedPermanently)
 			})), nil)
 		}
-	} else if l, err := listen(d.Host.HTTP); err != nil {
+	} else if l, err := listen(cfg.HTTP); err != nil {
 		return fmt.Errorf("http: %w", err)
 	} else if l != nil {
 		serve("http, tls off", l, main, nil)
@@ -336,6 +366,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 	case err = <-errc:
+	case <-d.restart:
+		err = ErrRestart
 	}
 	shutdown, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()

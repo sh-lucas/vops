@@ -67,6 +67,13 @@ func (e *Engine) Apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan,
 			failed = append(failed, pp.Path)
 		}
 	}
+	if plan.Config != nil && len(opts.Projects) == 0 && len(opts.Services) == 0 && e.ApplyConfig != nil {
+		fmt.Fprintf(w, "vops.yml: %s\n", strings.Join(plan.Config.Changes, ", "))
+		if err := e.ApplyConfig(plan.Config.To, w); err != nil {
+			fmt.Fprintf(w, "vops.yml: ✗ %v\n", err)
+			failed = append(failed, "vops.yml")
+		}
+	}
 	if err := e.RefreshRoutes(ctx); err != nil {
 		fmt.Fprintf(w, "routes: %v\n", err)
 	}
@@ -447,7 +454,7 @@ func (e *Engine) waitReady(ctx context.Context, sp *compose.Spec, r replica) err
 			return err
 		}
 		status, code, _ := strings.Cut(state, " ")
-		if sp.Job && status == "exited" {
+		if sp.Job && (status == "exited" || status == "stopped") {
 			if code == "0" {
 				return nil
 			}
