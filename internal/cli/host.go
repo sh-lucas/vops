@@ -420,10 +420,16 @@ func printStatus(c *client, out io.Writer) error {
 			fmt.Fprintf(tw, "  ✗ %s\t\t\n", p.Error)
 		}
 		for _, s := range p.Services {
-			running := 0
+			running, state := 0, "running"
 			for _, ct := range s.Containers {
 				if ct.State == "running" {
 					running++
+				}
+				if ct.Labels["vops.job"] != "" {
+					state = "done"
+					if ct.State == "exited" && ct.ExitCode == 0 {
+						running++
+					}
 				}
 			}
 			info := ""
@@ -436,7 +442,7 @@ func printStatus(c *client, out io.Writer) error {
 			if s.Pending != "" {
 				info = strings.TrimSpace(info + "  pending: " + s.Pending + " " + s.Reason)
 			}
-			fmt.Fprintf(tw, "  %s\t%d/%d running\t%s\n", s.Name, running, len(s.Containers), info)
+			fmt.Fprintf(tw, "  %s\t%d/%d %s\t%s\n", s.Name, running, len(s.Containers), state, info)
 		}
 	}
 	tw.Flush()

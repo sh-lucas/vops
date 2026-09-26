@@ -46,6 +46,7 @@ th, td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align
 tr:last-child td { border-bottom: 0; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
 .dot.running { background: var(--ok); }
+.dot.done { background: var(--ok); opacity: .45; }
 .dot.exited, .dot.dead, .dot.stopped { background: var(--bad); }
 .dot.created, .dot.paused, .dot.restarting { background: var(--warn); }
 .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 99px; background: var(--code); color: var(--muted); }

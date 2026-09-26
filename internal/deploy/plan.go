@@ -32,6 +32,8 @@ const (
 	LHostPort = "vops.hostport"
 	LDomains  = "vops.domains"
 	LImage    = "vops.image"
+	LJob      = "vops.job"
+	LNetHash  = "vops.nethash"
 )
 
 type Engine struct {
@@ -61,6 +63,7 @@ type ProjectPlan struct {
 
 	specs  map[string]*desired
 	actual map[string][]podman.Container
+	nets   []compose.NetworkDef
 }
 
 type Action struct {
@@ -257,6 +260,14 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, files []strin
 	if err != nil {
 		return err
 	}
+	pp.nets = proj.NetworkDefs()
+	for _, n := range pp.nets {
+		if !n.External {
+			if old, exists := networkHash(ctx, n.Name); exists && old != n.Hash() && !(old == "" && n.Plain()) {
+				*warns = append(*warns, fmt.Sprintf("%s: network %s changed and will be recreated: its containers restart", pp.Path, n.Name))
+			}
+		}
+	}
 	var order []Action
 	for _, sp := range specs {
 		d, err := e.resolve(ctx, sp, domain)
@@ -273,6 +284,15 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, files []strin
 	}
 	pp.Actions = order
 	return nil
+}
+
+// networkHash returns the vops.nethash label of a network and whether it exists.
+func networkHash(ctx context.Context, name string) (string, bool) {
+	out, err := podman.Run(ctx, "network", "inspect", "--format", `{{index .Labels "`+LNetHash+`"}}`, name)
+	if err != nil {
+		return "", false
+	}
+	return strings.TrimSpace(strings.ReplaceAll(out, "<no value>", "")), true
 }
 
 // builtinEnv is available for interpolation in every project.
@@ -296,7 +316,11 @@ func compare(d *desired, actual []podman.Container) Action {
 			a.Kind, a.Reason = "update", "definition changed"
 			return a
 		}
-		if c.State == "running" {
+		if d.spec.Job && c.State == "exited" && c.ExitCode != 0 {
+			a.Kind, a.Reason = "update", fmt.Sprintf("last run failed (exit %d)", c.ExitCode)
+			return a
+		}
+		if c.State == "running" || d.spec.Job && c.State == "exited" {
 			running++
 		}
 	}
@@ -325,7 +349,10 @@ func (e *Engine) resolve(ctx context.Context, sp *compose.Spec, domain string) (
 	w(sp.Args...)
 	w("--cmd")
 	w(sp.Cmd...)
-	w("--net", strconv.FormatBool(sp.Networks), strconv.Itoa(sp.Port), strconv.Itoa(sp.Replicas))
+	for _, n := range sp.Networks {
+		w("--net", n.Flag(), n.Hash)
+	}
+	w("--job", strconv.FormatBool(sp.Job), strconv.Itoa(sp.Port), strconv.Itoa(sp.Replicas))
 	w(sp.Domains...)
 	switch {
 	case sp.Build != nil:

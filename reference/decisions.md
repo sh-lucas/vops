@@ -46,6 +46,9 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Every container also joins the shared network `vops` with alias `<service>.<project reversed>` (e.g. `db.sub.proj`), so any project can reach any other one by a predictable name.
 - The proxy reaches containers through a port published on `127.0.0.1:<port>`; vops picks the port (stable across restarts). Works the same rootless or rootful.
 - netavark is required (aliases + DNS). CNI setups without dnsname don't resolve names.
+- Compose `networks` work like compose: no `networks` = project `default` + shared `vops`; with `networks` = exactly those. `vops` is a reserved key for the shared network, so a service can opt in explicitly and a db on an internal network stays invisible to other projects.
+- Networks carry a `vops.nethash` label with the hash of their definition. A changed definition means remove the project's containers on it, recreate, redeploy (podman can't change a network in place). The default network created before networks were configurable has no hash; it is accepted as long as it is still a plain bridge, so upgrading doesn't restart everything.
+- Service hashes include the hash of the networks they join, so a network change redeploys its services.
 
 ## Deploys
 
@@ -81,6 +84,13 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - `vops install user@host` checks arch/podman/git/systemd, uploads the binary and runs `vops setup` on the host, which: creates dirs, inits `~/vops`, writes the systemd unit, enables linger (non-root), starts the daemon and prints the admin password once.
 - root → system unit `/etc/systemd/system/vops.service`; non-root → user unit, needs `net.ipv4.ip_unprivileged_port_start<=80` (setup tells you the sudo command if it isn't).
 - `KillMode=process` so restarting the daemon never kills containers.
+
+## depends_on, jobs, profiles
+
+- vops always waits for readiness between services, so `service_started` behaves like `service_healthy`. Stricter than compose, never looser.
+- `service_completed_successfully` turns the dependency into a job: ready = exit 0, default `restart: no` (an always-restarting job would loop), 10 min timeout. A finished job isn't rerun until its definition changes (compose `up` does the same); a failed one is retried on the next apply.
+- When a service fails, its dependents are skipped in that apply instead of deployed against a broken dependency.
+- Active profiles come from `COMPOSE_PROFILES` in the project env: the compose-standard variable, set the vops way. `depends_on.restart` is rejected: vops never restarts dependents behind your back.
 
 ## Small ones
 

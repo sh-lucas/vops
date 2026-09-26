@@ -388,3 +388,126 @@ func mustRead(t *testing.T, p string) string {
 	}
 	return string(b)
 }
+
+// Custom and internal networks, aliases, a migration job gating the web service, profiles,
+// a failing job that blocks its dependents, and a network whose definition changes.
+func TestNetworksJobsProfiles(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	p, other := v.ns+"/app", v.ns+"/other"
+	host := "app." + v.ns + ".test"
+	compose := func(migrate, msg, internal string) string {
+		return `services:
+  migrate:
+    image: APP
+    command: ` + migrate + `
+    networks: [backend]
+  db:
+    image: APP
+    environment: {MSG: from-db, PORT: "9000"}
+    networks:
+      backend: {aliases: [database]}
+  web:
+    image: APP
+    environment: {MSG: ` + msg + `}
+    networks: [default, backend, vops]
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      db: {condition: service_healthy}
+    x-vops: {port: 8080, domains: [` + host + `]}
+  debug:
+    image: APP
+    profiles: [debug]
+networks:
+  backend: {internal: ` + internal + `}
+`
+	}
+	v.commit(map[string]string{
+		p + "/compose.yml":     compose(`["lookup", "localhost"]`, "web-1", "true"),
+		other + "/compose.yml": "services:\n  probe:\n    image: APP\n",
+	})
+	plan, out, err := v.apply(ApplyOpts{})
+	if err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if got := actions(plan); !strings.Contains(got, p+"/db:create "+p+"/migrate:create "+p+"/web:create") || strings.Contains(got, "debug") {
+		t.Fatalf("order/profiles: %s", got)
+	}
+	if code, body := v.get(host); code != 200 || body != "web-1" {
+		t.Fatalf("web: %d %q", code, body)
+	}
+	run := func(project, service string, args ...string) (string, error) {
+		cs, _ := podman.PS(ctx, LProject+"="+project, LService+"="+service)
+		if len(cs) == 0 {
+			t.Fatalf("no container for %s/%s", project, service)
+		}
+		return podman.Run(ctx, append([]string{"exec", cs[0].ID, "/app"}, args...)...)
+	}
+	if out, err := run(p, "web", "get", "http://database:9000/"); err != nil || out != "from-db" {
+		t.Fatalf("web -> database alias: %q %v", out, err)
+	}
+	if internal, _ := podman.Run(ctx, "network", "inspect", "--format", "{{.Internal}}", "vops-"+v.ns+".app-backend"); internal != "true" {
+		t.Fatalf("backend not internal: %q", internal)
+	}
+	// web joined the shared network explicitly; db didn't, so other projects can't see it
+	if _, err := run(other, "probe", "lookup", "web.app."+v.ns); err != nil {
+		t.Fatal("web should be reachable from other projects")
+	}
+	if _, err := run(other, "probe", "lookup", "db.app."+v.ns); err == nil {
+		t.Fatal("db must not be reachable from other projects")
+	}
+	// the job ran once and is done: nothing to do, it is not rerun
+	if cs := v.containers(p); len(cs) != 3 {
+		t.Fatalf("%d containers", len(cs))
+	}
+	if plan, _ := v.e.Plan(ctx); plan.Changes() {
+		t.Fatalf("finished job must not be rerun: %s", actions(plan))
+	}
+	// profiles come from COMPOSE_PROFILES in the project env
+	v.e.DB.SetEnv(p, "COMPOSE_PROFILES", "debug")
+	if plan, _ := v.e.Plan(ctx); actions(plan) != p+"/db:none "+p+"/debug:create "+p+"/migrate:none "+p+"/web:none "+other+"/probe:none" {
+		t.Fatalf("profile on: %s", actions(plan))
+	}
+	v.e.DB.UnsetEnv(p, "COMPOSE_PROFILES")
+
+	// a failing migration: web (also changed) is skipped and the old web keeps serving
+	v.commit(map[string]string{p + "/compose.yml": compose(`["exit"]`, "web-2", "true")})
+	_, out, err = v.apply(ApplyOpts{Projects: []string{p}})
+	if err == nil || !strings.Contains(out, "failed (exit 3)") || !strings.Contains(out, "skipped: migrate failed") {
+		t.Fatalf("expected failed job + skipped web: %v\n%s", err, out)
+	}
+	if _, body := v.get(host); body != "web-1" {
+		t.Fatalf("old web should still serve: %q", body)
+	}
+	if plan, _ := v.e.Plan(ctx); !strings.Contains(actions(plan), p+"/migrate:update") {
+		t.Fatalf("failed job should be retried: %s", actions(plan))
+	}
+
+	// fix the job and make backend a normal network: it is recreated, everything comes back
+	v.commit(map[string]string{p + "/compose.yml": compose(`["lookup", "localhost"]`, "web-3", "false")})
+	plan, _ = v.e.Plan(ctx)
+	if !strings.Contains(strings.Join(plan.Warnings, " "), "will be recreated") {
+		t.Fatalf("no recreate warning: %v", plan.Warnings)
+	}
+	if _, out, err = v.apply(ApplyOpts{}); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if internal, _ := podman.Run(ctx, "network", "inspect", "--format", "{{.Internal}}", "vops-"+v.ns+".app-backend"); internal != "false" {
+		t.Fatalf("backend still internal: %q", internal)
+	}
+	if code, body := v.get(host); code != 200 || body != "web-3" {
+		t.Fatalf("after network change: %d %q", code, body)
+	}
+	if out, err := run(p, "web", "get", "http://db:9000/"); err != nil || out != "from-db" {
+		t.Fatalf("web -> db after recreate: %q %v", out, err)
+	}
+
+	// dropping the custom network from compose removes it
+	v.commit(map[string]string{p + "/compose.yml": "services:\n  web:\n    image: APP\n    x-vops: {port: 8080, domains: [" + host + "]}\n"})
+	if _, out, err = v.apply(ApplyOpts{}); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if _, err := podman.Run(ctx, "network", "exists", "vops-"+v.ns+".app-backend"); err == nil {
+		t.Fatal("unused network not removed")
+	}
+}

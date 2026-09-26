@@ -23,6 +23,19 @@ your laptop                                   the host
 
 `vops sync` pulls from the host, pushes to it, shows what will change and asks before applying. The daemon runs the containers with podman, routes `https://<service>.<project>.<domain>` to them, gets certificates from Let's Encrypt, serves a registry at `registry.<domain>` and a dashboard at `vops.<domain>`.
 
+## Install
+
+```sh
+go install github.com/sh-lucas/vops/cmd/vops@latest   # go 1.27+, puts vops in $(go env GOPATH)/bin
+```
+
+`vops install` copies this same binary to the host, so it must match the host (linux, same arch). From a mac or for an arm64 host:
+
+```sh
+GOOS=linux GOARCH=arm64 go install github.com/sh-lucas/vops/cmd/vops@latest
+vops install user@host --binary $(go env GOPATH)/bin/linux_arm64/vops
+```
+
 ## Quick start
 
 ```sh
@@ -56,7 +69,8 @@ git add -A && git commit -m site && vops sync
 ### Projects
 - Any git-tracked dir with `compose.yml` (or `*.compose.yml`, `docker-compose.yml`) is a project. Nested dirs are nested projects: `shop/api` is served at `api.shop.<domain>`.
 - vops reads compose itself (a strict subset: unknown keys are errors). Reference: [reference/compose.md](reference/compose.md).
-- Networking: services of a project reach each other by name (`db`); any project reaches any other one at `<service>.<project reversed>` (e.g. `db.api.shop`).
+- Networking like compose: services reach each other by name, custom and `internal` networks, aliases, static ips. On top of that, a shared network where any project reaches any other one at `<service>.<project reversed>` (e.g. `db.api.shop`), opt-out per service.
+- `depends_on` conditions, including `service_completed_successfully` jobs (migrations) that gate the services depending on them; `profiles` via `COMPOSE_PROFILES`.
 - Rolling releases for routed services: new replica, readiness check, switch traffic, drain, remove old. A failed readiness check keeps the old version serving. Everything else is recreated (stop, then start).
 - Env vars per project, write-only: set from the cli or the dashboard, used for `${VAR}` and `environment: [VAR]`, never shown again.
 - Disable/enable a project without deleting it; removing its dir from git removes its containers (volumes and data dirs stay).
@@ -74,6 +88,21 @@ git add -A && git commit -m site && vops sync
 
 ### Logs
 - Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts.
+
+## Limitations
+
+Know these before putting something important on it:
+
+- **Compose is a subset, run by vops itself** (not podman-compose): it translates each service into `podman run`. Unsupported keys are errors, never silently ignored. Not supported: `secrets`, `configs`, `extends`, `links`, `container_name`, `depends_on.restart`, `network_mode: service:x`, most of `deploy`. Full list: [reference/compose.md](reference/compose.md).
+- **Semantics that differ from compose:** containers are named `vops-...` (so `podman compose ps` doesn't see them), `restart` defaults to `unless-stopped`, every `depends_on` waits for readiness, and during a rolling release two versions run side by side for a few seconds.
+- **One host.** No clustering, no failover; the daemon, proxy and registry run on the same machine as the containers.
+- **Podman only, netavark only.** CNI setups can't resolve service names.
+- **Env values are hidden from the api and dashboard, not from the host:** anyone with a shell on the host can see them with `podman inspect`.
+- **Recreate means downtime:** services with published `ports`, without `x-vops.port`, or on a network whose definition changed are stopped before the new container starts.
+- **No rollback command yet** (git revert + sync works) and no btrfs snapshots of data dirs yet.
+- **Logs are journald's:** retention and disk use follow its config (`/etc/systemd/journald.conf`); no long-term log store.
+- **Third-party images are not re-pulled** on their own: `postgres:16` stays at the version first pulled until you change the tag.
+- **Not yet run on a real cloud VPS** (see State above).
 
 ## Commands
 

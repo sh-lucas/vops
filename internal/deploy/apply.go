@@ -85,16 +85,26 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 	}
 	var errs []error
 	if len(pp.specs) > 0 && !pp.Gone && !pp.Disabled {
-		if err := e.ensureNetworks(ctx, pp.Path); err != nil {
+		if err := e.ensureNetworks(ctx, w, pp, len(opts.Services) == 0); err != nil {
 			return err
 		}
 	}
+	failed := map[string]bool{}
 	for _, a := range pp.Actions {
 		if a.Kind == "none" || !opts.wants(pp.Path, a.Service) {
 			continue
 		}
 		log := func(format string, args ...any) {
 			fmt.Fprintf(w, "%s/%s: %s\n", pp.Path, a.Service, fmt.Sprintf(format, args...))
+		}
+		// actions come in dependency order: never deploy on top of a dependency that just failed
+		if d := pp.specs[a.Service]; d != nil {
+			if i := slices.IndexFunc(d.spec.DependsOn, func(dep string) bool { return failed[dep] }); i >= 0 {
+				failed[a.Service] = true
+				log("skipped: %s failed", d.spec.DependsOn[i])
+				errs = append(errs, fmt.Errorf("%s: skipped, dependency %s failed", a.Service, d.spec.DependsOn[i]))
+				continue
+			}
 		}
 		var err error
 		switch a.Kind {
@@ -115,6 +125,7 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 			err = e.deploy(ctx, log, pp.specs[a.Service], pp.actual[a.Service])
 		}
 		if err != nil {
+			failed[a.Service] = true
 			log("✗ %v", err)
 			errs = append(errs, fmt.Errorf("%s: %w", a.Service, err))
 			continue
@@ -127,23 +138,61 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 	if len(opts.Services) > 0 {
 		return nil // a partial apply doesn't mean the project matches the commit
 	}
+	// networks this project created and no longer uses (all of them when the project is gone or disabled)
+	var keep []string
+	if !pp.Gone && !pp.Disabled {
+		for _, n := range pp.nets {
+			keep = append(keep, n.Name)
+		}
+	}
+	if names, err := podman.Run(ctx, "network", "ls", "--format", "{{.Name}}", "--filter", "label="+LProject+"="+pp.Path); err == nil {
+		for _, n := range strings.Fields(names) {
+			if !slices.Contains(keep, n) {
+				podman.Run(ctx, "network", "rm", n)
+			}
+		}
+	}
 	if pp.Gone {
-		podman.Run(ctx, "network", "rm", compose.NetworkName(pp.Path))
 		e.DB.DeleteProject(pp.Path)
 		return nil
 	}
 	return e.DB.SetApplied(pp.Path, plan.Commit)
 }
 
-func (e *Engine) ensureNetworks(ctx context.Context, project string) error {
-	for _, n := range []struct{ name, label string }{
-		{compose.SharedNetwork, "vops.shared=1"},
-		{compose.NetworkName(project), LProject + "=" + project},
-	} {
-		if _, err := podman.Run(ctx, "network", "exists", n.name); err == nil {
+// ensureNetworks creates the shared network and the project's networks. A network whose definition
+// changed is recreated (its containers of this project are removed first; the deploys that follow bring them back).
+func (e *Engine) ensureNetworks(ctx context.Context, w io.Writer, pp *ProjectPlan, recreate bool) error {
+	if _, err := podman.Run(ctx, "network", "exists", compose.SharedNetwork); err != nil {
+		if _, err := podman.Run(ctx, "network", "create", "--label", "vops.shared=1", compose.SharedNetwork); err != nil && !strings.Contains(err.Error(), "already exists") {
+			return err
+		}
+	}
+	for _, n := range pp.nets {
+		old, exists := networkHash(ctx, n.Name)
+		if n.External {
+			if !exists {
+				return fmt.Errorf("external network %s does not exist (podman network create %s)", n.Name, n.Name)
+			}
 			continue
 		}
-		if _, err := podman.Run(ctx, "network", "create", "--label", n.label, n.name); err != nil && !strings.Contains(err.Error(), "already exists") {
+		if exists && (old == n.Hash() || old == "" && n.Plain()) {
+			continue
+		}
+		if exists {
+			if !recreate {
+				continue
+			}
+			fmt.Fprintf(w, "%s: network %s changed, recreating it\n", pp.Path, n.Name)
+			out, _ := podman.Run(ctx, "ps", "-aq", "--filter", "network="+n.Name, "--filter", "label="+LProject+"="+pp.Path)
+			for _, id := range strings.Fields(out) {
+				podman.Run(ctx, "rm", "-f", "-t", "10", id)
+			}
+			if _, err := podman.Run(ctx, "network", "rm", n.Name); err != nil {
+				return fmt.Errorf("network %s changed but can't be removed (other containers use it?): %w", n.Name, err)
+			}
+		}
+		args := append([]string{"network", "create", "--label", LProject + "=" + pp.Path, "--label", LNetHash + "=" + n.Hash()}, n.CreateArgs()...)
+		if _, err := podman.Run(ctx, append(args, n.Name)...); err != nil {
 			return err
 		}
 	}
@@ -352,11 +401,11 @@ func (e *Engine) start(ctx context.Context, d *desired) (replica, error) {
 	if len(sp.Domains) > 0 {
 		args = append(args, "--label", LDomains+"="+strings.Join(sp.Domains, ","))
 	}
-	if sp.Networks {
-		args = append(args,
-			"--network", compose.NetworkName(sp.Project)+":alias="+strings.ToLower(sp.Service),
-			"--network", compose.SharedNetwork+":alias="+strings.ToLower(strings.ReplaceAll(sp.Service, "_", "-"))+"."+compose.DNSName(sp.Project),
-		)
+	if sp.Job {
+		args = append(args, "--label", LJob+"=1")
+	}
+	for _, n := range sp.Networks {
+		args = append(args, "--network", n.Flag())
 	}
 	if sp.Port > 0 {
 		p, err := freePort(ctx)
@@ -399,10 +448,19 @@ func (e *Engine) waitReady(ctx context.Context, sp *compose.Spec, r replica) err
 		if err != nil {
 			return err
 		}
-		if status, code, _ := strings.Cut(state, " "); status != "running" {
+		status, code, _ := strings.Cut(state, " ")
+		if sp.Job && status == "exited" {
+			if code == "0" {
+				return nil
+			}
+			return fmt.Errorf("%s failed (exit %s)", r.name, code)
+		}
+		if status != "running" && !(sp.Job && (status == "created" || status == "initialized")) {
 			return fmt.Errorf("%s exited (code %s) before becoming ready", r.name, code)
 		}
 		switch {
+		case sp.Job:
+			last = "still running"
 		case sp.Healthcheck:
 			_, err := podman.Run(ctx, "healthcheck", "run", r.id)
 			if err == nil {
@@ -482,7 +540,7 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 	}
 	flags, _ := e.DB.Projects()
 	for _, c := range cs {
-		if c.State == "running" || flags[c.Labels[LProject]].Disabled {
+		if c.State == "running" || flags[c.Labels[LProject]].Disabled || c.Labels[LJob] != "" {
 			continue
 		}
 		fmt.Fprintf(w, "starting %s\n", c.Name())

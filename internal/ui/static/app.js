@@ -77,6 +77,8 @@ const ago = (unix) => {
   return Math.floor(s / 86400) + "d ago";
 };
 const size = (n) => n >= 1 << 30 ? (n / (1 << 30)).toFixed(1) + " GB" : n >= 1 << 20 ? (n / (1 << 20)).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B";
+// a finished job (exit 0) is fine, not an error
+const stateOf = (c) => (c.Labels && c.Labels["vops.job"] && c.State === "exited" && c.ExitCode === 0 ? "done" : c.State);
 const short = (s, n = 12) => (s || "").replace("sha256:", "").slice(0, n);
 const enc = encodeURIComponent;
 
@@ -119,7 +121,7 @@ document.getElementById("logout").onclick = async () => {
 // ---- projects overview: the tree of the host
 
 function dots(containers) {
-  return h("span", { class: "dots" }, containers.length ? containers.map((c) => h("span", { class: "dot " + c.State, title: c.Names[0] + ": " + c.Status })) : h("span", { class: "dot", title: "no containers" }));
+  return h("span", { class: "dots" }, containers.length ? containers.map((c) => h("span", { class: "dot " + stateOf(c), title: c.Names[0] + ": " + c.Status })) : h("span", { class: "dot", title: "no containers" }));
 }
 
 function projectTree(projects, domain) {
@@ -211,7 +213,7 @@ async function projectPage(path) {
     p.services.map((s) => h("tr", {},
       h("td", {}, h("div", { class: "mono" }, s.name), s.domains.map((d) => h("div", { class: "small" }, h("a", { href: (st.domain ? "https://" : "http://") + d, target: "_blank", rel: "noopener" }, d))),
         s.pending ? h("span", { class: "tag warn" }, "pending " + s.pending + (s.reason ? ": " + s.reason : "")) : null),
-      h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "row small" }, h("span", { class: "dot " + c.State }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
+      h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "row small" }, h("span", { class: "dot " + stateOf(c) }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
       h("td", { class: "mono small" }, s.image),
       h("td", {}, h("div", { class: "row" },
         h("a", { class: "btn", href: "#/logs/" + enc(path) + "?service=" + enc(s.name) }, "Logs"),

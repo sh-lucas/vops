@@ -24,6 +24,8 @@ type Project struct {
 	Dir      string // absolute dir on disk
 	Services map[string]*Service
 	Volumes  map[string]*Volume
+	Networks map[string]*Network
+	Inactive []string // services left out by COMPOSE_PROFILES
 	Warnings []string
 }
 
@@ -64,10 +66,14 @@ type Service struct {
 	MemLimit        string            `yaml:"mem_limit"`
 	Cpus            float64           `yaml:"cpus"`
 	NetworkMode     string            `yaml:"network_mode"`
+	Networks        ServiceNetworks   `yaml:"networks"`
+	Profiles        []string          `yaml:"profiles"`
 	Deploy          *Deploy           `yaml:"deploy"`
 	Platform        string            `yaml:"platform"`
 	PullPolicy      string            `yaml:"pull_policy"`
 	Vops            Vops              `yaml:"x-vops"`
+
+	job bool // a dependency with condition service_completed_successfully: runs to completion
 }
 
 // Vops is the `x-vops` block of a service.
@@ -116,6 +122,74 @@ type Deploy struct {
 			Pids   int    `yaml:"pids"`
 		} `yaml:"limits"`
 	} `yaml:"resources"`
+}
+
+// Network is a top-level network.
+type Network struct {
+	Name       string            `yaml:"name"`
+	External   bool              `yaml:"external"`
+	Internal   bool              `yaml:"internal"` // no route to the outside world
+	Driver     string            `yaml:"driver"`
+	DriverOpts map[string]string `yaml:"driver_opts"`
+	Labels     Env               `yaml:"labels"`
+	EnableIPv6 bool              `yaml:"enable_ipv6"`
+	Attachable bool              `yaml:"attachable"` // accepted; every podman network is attachable
+	IPAM       struct {
+		Driver string `yaml:"driver"`
+		Config []struct {
+			Subnet  string `yaml:"subnet"`
+			Gateway string `yaml:"gateway"`
+			IPRange string `yaml:"ip_range"`
+		} `yaml:"config"`
+	} `yaml:"ipam"`
+}
+
+// ServiceNetworks is the networks of a service: a list of names or a map of name -> options.
+type ServiceNetworks map[string]*NetOptions
+
+type NetOptions struct {
+	Aliases     []string `yaml:"aliases"`
+	IPv4Address string   `yaml:"ipv4_address"`
+	IPv6Address string   `yaml:"ipv6_address"`
+}
+
+func (sn *ServiceNetworks) UnmarshalYAML(n *yaml.Node) error {
+	*sn = ServiceNetworks{}
+	switch n.Kind {
+	case yaml.SequenceNode:
+		for _, item := range n.Content {
+			(*sn)[item.Value] = &NetOptions{}
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			o := &NetOptions{}
+			if v := n.Content[i+1]; v.Tag != "!!null" {
+				if err := strictKeys(v, "aliases", "ipv4_address", "ipv6_address"); err != nil {
+					return err
+				}
+				if err := v.Decode(o); err != nil {
+					return err
+				}
+			}
+			(*sn)[n.Content[i].Value] = o
+		}
+	default:
+		return fmt.Errorf("line %d: networks must be a list or a map", n.Line)
+	}
+	return nil
+}
+
+// strictKeys rejects unknown keys in mappings decoded by custom unmarshalers.
+func strictKeys(n *yaml.Node, allowed ...string) error {
+	if n.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i < len(n.Content); i += 2 {
+		if k := n.Content[i].Value; !slices.Contains(allowed, k) {
+			return fmt.Errorf("line %d: %q is not supported here (supported: %s)", n.Content[i].Line, k, strings.Join(allowed, ", "))
+		}
+	}
+	return nil
 }
 
 type Volume struct {
@@ -218,16 +292,57 @@ func (e *Env) UnmarshalYAML(n *yaml.Node) error {
 	return nil
 }
 
-type DependsOn []string
+// Dep is one depends_on entry.
+type Dep struct {
+	Name      string
+	Condition string // service_started | service_healthy | service_completed_successfully
+	Required  bool
+}
+
+type DependsOn []Dep
 
 func (d *DependsOn) UnmarshalYAML(n *yaml.Node) error {
-	if n.Kind == yaml.MappingNode {
-		for i := 0; i < len(n.Content); i += 2 {
-			*d = append(*d, n.Content[i].Value)
+	if n.Kind == yaml.SequenceNode {
+		for _, item := range n.Content {
+			*d = append(*d, Dep{item.Value, "service_started", true})
 		}
 		return nil
 	}
-	return n.Decode((*[]string)(d))
+	if n.Kind != yaml.MappingNode {
+		return fmt.Errorf("line %d: depends_on must be a list or a map", n.Line)
+	}
+	for i := 0; i+1 < len(n.Content); i += 2 {
+		v := n.Content[i+1]
+		if err := strictKeys(v, "condition", "required"); err != nil {
+			return err
+		}
+		var o struct {
+			Condition string `yaml:"condition"`
+			Required  *bool  `yaml:"required"`
+		}
+		if err := v.Decode(&o); err != nil {
+			return err
+		}
+		dep := Dep{n.Content[i].Value, o.Condition, o.Required == nil || *o.Required}
+		switch dep.Condition {
+		case "":
+			dep.Condition = "service_started"
+		case "service_started", "service_healthy", "service_completed_successfully":
+		default:
+			return fmt.Errorf("line %d: unknown depends_on condition %q", v.Line, dep.Condition)
+		}
+		*d = append(*d, dep)
+	}
+	return nil
+}
+
+// Names of the dependencies.
+func (d DependsOn) Names() []string {
+	out := make([]string, len(d))
+	for i, x := range d {
+		out[i] = x.Name
+	}
+	return out
 }
 
 // Port is a published host port.
@@ -375,7 +490,7 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 	if err := ValidProjectPath(path); err != nil {
 		return nil, err
 	}
-	p := &Project{Path: path, Dir: dir, Services: map[string]*Service{}, Volumes: map[string]*Volume{}}
+	p := &Project{Path: path, Dir: dir, Services: map[string]*Service{}, Volumes: map[string]*Volume{}, Networks: map[string]*Network{}}
 	for _, f := range files {
 		raw, err := os.ReadFile(filepath.Join(dir, f))
 		if err != nil {
@@ -403,6 +518,7 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 			Name     string              `yaml:"name"`
 			Services map[string]*Service `yaml:"services"`
 			Volumes  map[string]*Volume  `yaml:"volumes"`
+			Networks map[string]*Network `yaml:"networks"`
 		}
 		dec := yaml.NewDecoder(bytes.NewReader(clean))
 		dec.KnownFields(true)
@@ -424,6 +540,25 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 				v = &Volume{}
 			}
 			p.Volumes[name] = v
+		}
+		for name, n := range file.Networks {
+			if n == nil {
+				n = &Network{}
+			}
+			p.Networks[name] = n
+		}
+	}
+	if err := p.applyProfiles(env["COMPOSE_PROFILES"]); err != nil {
+		return nil, err
+	}
+	if err := p.checkNetworks(); err != nil {
+		return nil, err
+	}
+	for _, s := range p.Services {
+		for _, d := range s.DependsOn {
+			if dep := p.Services[d.Name]; dep != nil && d.Condition == "service_completed_successfully" {
+				dep.job = true
+			}
 		}
 	}
 	for _, s := range p.Services {
@@ -497,15 +632,51 @@ func (p *Project) check(s *Service, env map[string]string) error {
 	switch s.Restart {
 	case "":
 		s.Restart = "unless-stopped"
+		if s.job {
+			s.Restart = "no"
+		}
 	case "no", "always", "on-failure", "unless-stopped":
 	default:
 		if !strings.HasPrefix(s.Restart, "on-failure:") {
 			return fmt.Errorf("invalid restart %q", s.Restart)
 		}
 	}
+	if s.job {
+		if s.Restart == "always" || s.Restart == "unless-stopped" {
+			return fmt.Errorf("it runs to completion (another service waits for service_completed_successfully), so restart: %s would loop it forever", s.Restart)
+		}
+		if s.Vops.Port > 0 || s.Vops.Replicas > 1 {
+			return errors.New("it runs to completion (another service waits for service_completed_successfully): no x-vops.port or replicas")
+		}
+		if s.Vops.Timeout == 0 {
+			s.Vops.Timeout = Duration(10 * time.Minute)
+		}
+	}
 	for _, d := range s.DependsOn {
-		if _, ok := p.Services[d]; !ok {
-			return fmt.Errorf("depends_on unknown service %q", d)
+		if _, ok := p.Services[d.Name]; !ok {
+			return fmt.Errorf("depends_on unknown service %q", d.Name)
+		}
+	}
+	if len(s.Networks) > 0 && s.NetworkMode != "" {
+		return errors.New("networks and network_mode can't be used together")
+	}
+	if s.NetworkMode == "" && len(s.Networks) == 0 {
+		s.Networks = ServiceNetworks{"default": {}, SharedKey: {}}
+	}
+	for key := range s.Networks {
+		if key != "default" && key != SharedKey && p.Networks[key] == nil {
+			return fmt.Errorf("network %q is not declared in the top-level networks", key)
+		}
+	}
+	if (s.Vops.Port > 0 || len(s.Ports) > 0) && s.NetworkMode == "" {
+		reachable := false
+		for key := range s.Networks {
+			if n := p.Networks[key]; n == nil || !n.Internal {
+				reachable = true
+			}
+		}
+		if !reachable {
+			return errors.New("routed services and published ports need at least one network that is not internal")
 		}
 	}
 	for i, m := range s.Volumes {
@@ -584,6 +755,60 @@ func (p *Project) check(s *Service, env map[string]string) error {
 
 var domainRe = regexp.MustCompile(`^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$|^localhost$`)
 
+// SharedKey is the network key that means "the shared vops network" (reachable from every project).
+const SharedKey = "vops"
+
+func (p *Project) checkNetworks() error {
+	for key, n := range p.Networks {
+		if key == SharedKey {
+			return fmt.Errorf("%s: network %q is reserved (it is the shared network every project can join; attach services to it without declaring it)", p.Path, key)
+		}
+		if !netNameRe.MatchString(key) || n.Name != "" && !netNameRe.MatchString(n.Name) {
+			return fmt.Errorf("%s: invalid network name %q", p.Path, key)
+		}
+		switch n.Driver {
+		case "", "bridge", "macvlan", "ipvlan":
+		default:
+			return fmt.Errorf("%s: network %s: driver %q not supported (bridge, macvlan, ipvlan)", p.Path, key, n.Driver)
+		}
+		if n.External && (n.Internal || n.Driver != "" || len(n.DriverOpts) > 0 || len(n.IPAM.Config) > 0) {
+			return fmt.Errorf("%s: network %s is external: vops doesn't manage it, so it can't configure it", p.Path, key)
+		}
+	}
+	return nil
+}
+
+var netNameRe = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
+
+// applyProfiles drops services whose profiles are not active (COMPOSE_PROFILES, comma separated).
+func (p *Project) applyProfiles(profiles string) error {
+	active := strings.FieldsFunc(profiles, func(r rune) bool { return r == ',' || r == ' ' })
+	dropped := map[string][]string{}
+	for name, s := range p.Services {
+		if len(s.Profiles) > 0 && !slices.ContainsFunc(s.Profiles, func(x string) bool { return slices.Contains(active, x) || slices.Contains(active, "*") }) {
+			delete(p.Services, name)
+			dropped[name] = s.Profiles
+			p.Inactive = append(p.Inactive, name)
+		}
+	}
+	slices.Sort(p.Inactive)
+	for _, s := range p.Services {
+		var keep DependsOn
+		for _, d := range s.DependsOn {
+			if slices.Contains(p.Inactive, d.Name) {
+				if d.Required {
+					return fmt.Errorf("%s: service %s depends on %s, which is only in profile(s) %s: add one to COMPOSE_PROFILES (vops env set %s COMPOSE_PROFILES=...) or mark the dependency required: false",
+						p.Path, s.Name, d.Name, strings.Join(dropped[d.Name], ","), p.Path)
+				}
+				continue
+			}
+			keep = append(keep, d)
+		}
+		s.DependsOn = keep
+	}
+	return nil
+}
+
 // Order returns service names so that dependencies come first.
 func (p *Project) Order() ([]string, error) {
 	var out []string
@@ -597,7 +822,7 @@ func (p *Project) Order() ([]string, error) {
 			return nil
 		}
 		state[n] = 1
-		for _, d := range p.Services[n].DependsOn {
+		for _, d := range p.Services[n].DependsOn.Names() {
 			if err := visit(d, append(chain, n)); err != nil {
 				return err
 			}

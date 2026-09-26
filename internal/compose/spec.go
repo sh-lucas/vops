@@ -2,6 +2,8 @@ package compose
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -51,7 +53,9 @@ type Spec struct {
 	Build       *Build
 	Args        []string // podman run flags that come from the compose file
 	Cmd         []string
-	Networks    bool // join the project + shared networks (false with network_mode)
+	Networks    []SpecNet // empty with network_mode
+	Job         bool      // runs to completion; ready = exited 0
+	DependsOn   []string
 	Port        int
 	Domains     []string
 	Health      string
@@ -92,10 +96,29 @@ func (p *Project) Specs(rootDomain string, env map[string]string) ([]*Spec, erro
 func (p *Project) spec(s *Service, rootDomain string, onlyRouted bool, projectEnv map[string]string) (*Spec, error) {
 	sp := &Spec{
 		Project: p.Path, Service: s.Name, Image: s.Image, Build: s.Build, Cmd: s.Command,
-		Networks: s.NetworkMode == "", Port: s.Vops.Port, Health: s.Vops.Health,
+		Job: s.job, DependsOn: s.DependsOn.Names(), Port: s.Vops.Port, Health: s.Vops.Health,
 		Replicas: s.Vops.Replicas, Strategy: s.Vops.Strategy, Watch: s.Vops.Watch == nil || *s.Vops.Watch,
 		Timeout: time.Duration(s.Vops.Timeout), StopWait: 10 * time.Second,
 		Healthcheck: s.Healthcheck != nil && !s.Healthcheck.Disable && len(s.Healthcheck.Test) > 0 && s.Healthcheck.Test[0] != "NONE",
+	}
+	for _, key := range sortedKeys(s.Networks) {
+		o := s.Networks[key]
+		if o == nil {
+			o = &NetOptions{}
+		}
+		n := SpecNet{Name: p.netName(key), IP: o.IPv4Address, IP6: o.IPv6Address}
+		if key == SharedKey {
+			n.Aliases = append(n.Aliases, dnsLabel(s.Name)+"."+DNSName(p.Path))
+		} else {
+			n.Aliases = append(n.Aliases, strings.ToLower(s.Name))
+			n.Hash = p.networkDef(key).Hash()
+		}
+		for _, a := range o.Aliases {
+			if !slices.Contains(n.Aliases, a) {
+				n.Aliases = append(n.Aliases, a)
+			}
+		}
+		sp.Networks = append(sp.Networks, n)
 	}
 	if s.Build != nil {
 		sp.Image = ""
@@ -335,4 +358,152 @@ func readEnvFile(path string) (map[string]string, error) {
 		out[k] = v
 	}
 	return out, sc.Err()
+}
+
+// ---- networks
+
+// SpecNet is one network a container joins.
+type SpecNet struct {
+	Name    string // podman network name
+	Aliases []string
+	IP, IP6 string
+	Hash    string // definition hash, so a changed network redeploys its services
+}
+
+// Flag is the value of podman's --network.
+func (n SpecNet) Flag() string {
+	var opts []string
+	for _, a := range n.Aliases {
+		opts = append(opts, "alias="+a)
+	}
+	if n.IP != "" {
+		opts = append(opts, "ip="+n.IP)
+	}
+	if n.IP6 != "" {
+		opts = append(opts, "ip6="+n.IP6)
+	}
+	if len(opts) == 0 {
+		return n.Name
+	}
+	return n.Name + ":" + strings.Join(opts, ",")
+}
+
+// NetworkDef is a network vops creates, or expects to exist when External.
+type NetworkDef struct {
+	Key, Name string
+	External  bool
+	Internal  bool
+	IPv6      bool
+	Driver    string
+	Opts      map[string]string
+	Labels    map[string]string
+	Subnets   [][3]string // subnet, gateway, ip range
+}
+
+// Hash identifies the definition; a different hash means the network must be recreated.
+func (d NetworkDef) Hash() string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%s|%v|%v|%v|%s|", d.Name, d.External, d.Internal, d.IPv6, d.Driver)
+	for _, k := range sortedKeys(d.Opts) {
+		fmt.Fprintf(h, "o:%s=%s|", k, d.Opts[k])
+	}
+	for _, k := range sortedKeys(d.Labels) {
+		fmt.Fprintf(h, "l:%s=%s|", k, d.Labels[k])
+	}
+	for _, sn := range d.Subnets {
+		fmt.Fprintf(h, "s:%v|", sn)
+	}
+	return hex.EncodeToString(h.Sum(nil))[:12]
+}
+
+// Plain is a default bridge network: what vops created before networks were configurable.
+func (d NetworkDef) Plain() bool {
+	return !d.External && !d.Internal && !d.IPv6 && (d.Driver == "" || d.Driver == "bridge") && len(d.Opts) == 0 && len(d.Labels) == 0 && len(d.Subnets) == 0
+}
+
+// CreateArgs are the podman network create flags (without the name).
+func (d NetworkDef) CreateArgs() []string {
+	var a []string
+	if d.Internal {
+		a = append(a, "--internal")
+	}
+	if d.IPv6 {
+		a = append(a, "--ipv6")
+	}
+	if d.Driver != "" {
+		a = append(a, "--driver", d.Driver)
+	}
+	for _, k := range sortedKeys(d.Opts) {
+		a = append(a, "--opt", k+"="+d.Opts[k])
+	}
+	for _, k := range sortedKeys(d.Labels) {
+		a = append(a, "--label", k+"="+d.Labels[k])
+	}
+	for _, sn := range d.Subnets {
+		if sn[0] != "" {
+			a = append(a, "--subnet", sn[0])
+		}
+		if sn[1] != "" {
+			a = append(a, "--gateway", sn[1])
+		}
+		if sn[2] != "" {
+			a = append(a, "--ip-range", sn[2])
+		}
+	}
+	return a
+}
+
+func (p *Project) netName(key string) string {
+	if key == SharedKey {
+		return SharedNetwork
+	}
+	n := p.Networks[key]
+	switch {
+	case n != nil && n.Name != "":
+		return n.Name
+	case n != nil && n.External:
+		return key
+	case key == "default":
+		return NetworkName(p.Path)
+	}
+	return NetworkName(p.Path) + "-" + key
+}
+
+func (p *Project) networkDef(key string) NetworkDef {
+	d := NetworkDef{Key: key, Name: p.netName(key)}
+	n := p.Networks[key]
+	if n == nil {
+		return d
+	}
+	d.External, d.Internal, d.IPv6, d.Driver = n.External, n.Internal, n.EnableIPv6, n.Driver
+	if len(n.DriverOpts) > 0 {
+		d.Opts = n.DriverOpts
+	}
+	for _, l := range n.Labels {
+		if d.Labels == nil {
+			d.Labels = map[string]string{}
+		}
+		d.Labels[l.Key] = l.Value
+	}
+	for _, c := range n.IPAM.Config {
+		d.Subnets = append(d.Subnets, [3]string{c.Subnet, c.Gateway, c.IPRange})
+	}
+	return d
+}
+
+// NetworkDefs lists the networks the project's services use (not the shared one), sorted by name.
+func (p *Project) NetworkDefs() []NetworkDef {
+	used := map[string]bool{}
+	for _, s := range p.Services {
+		for key := range s.Networks {
+			if key != SharedKey {
+				used[key] = true
+			}
+		}
+	}
+	var out []NetworkDef
+	for _, key := range sortedKeys(used) {
+		out = append(out, p.networkDef(key))
+	}
+	return out
 }

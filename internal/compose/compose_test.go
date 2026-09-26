@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func load(t *testing.T, path, yml string, env map[string]string, extra ...string) (*Project, error) {
@@ -220,5 +221,133 @@ func TestSplitWords(t *testing.T) {
 	}
 	if _, err := SplitWords(`"open`); err == nil {
 		t.Error("unterminated quote")
+	}
+}
+
+func TestNetworks(t *testing.T) {
+	p, err := load(t, "shop", `
+services:
+  web:
+    image: x
+    networks: [default, backend, vops]
+    x-vops: {port: 80}
+  db:
+    image: x
+    networks:
+      backend:
+        aliases: [database]
+        ipv4_address: 10.99.0.10
+  plain:
+    image: x
+networks:
+  backend:
+    internal: true
+    driver_opts: {mtu: "1400"}
+    ipam:
+      config: [{subnet: 10.99.0.0/24}]
+  ext:
+    external: true
+    name: legacy-net
+`, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	specs, err := p.Specs("", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flags := map[string][]string{}
+	for _, s := range specs {
+		for _, n := range s.Networks {
+			flags[s.Service] = append(flags[s.Service], n.Flag())
+		}
+	}
+	want := map[string][]string{
+		"web":   {"vops-shop-backend:alias=web", "vops-shop:alias=web", "vops:alias=web.shop"},
+		"db":    {"vops-shop-backend:alias=db,alias=database,ip=10.99.0.10"},
+		"plain": {"vops-shop:alias=plain", "vops:alias=plain.shop"},
+	}
+	for svc, w := range want {
+		if !slices.Equal(flags[svc], w) {
+			t.Errorf("%s: got %v want %v", svc, flags[svc], w)
+		}
+	}
+	defs := p.NetworkDefs()
+	if len(defs) != 2 || defs[0].Key != "backend" || defs[1].Key != "default" {
+		t.Fatalf("defs %+v", defs)
+	}
+	if got := strings.Join(defs[0].CreateArgs(), " "); got != "--internal --opt mtu=1400 --subnet 10.99.0.0/24" {
+		t.Errorf("create args %q", got)
+	}
+	if !defs[1].Plain() || defs[0].Plain() {
+		t.Error("plain")
+	}
+
+	for name, c := range map[string]struct{ yml, want string }{
+		"undeclared":    {"services:\n  a:\n    image: x\n    networks: [nope]\n", "not declared"},
+		"reserved":      {"services:\n  a:\n    image: x\nnetworks:\n  vops: {}\n", "reserved"},
+		"internal only": {"services:\n  a:\n    image: x\n    networks: [b]\n    x-vops: {port: 80}\nnetworks:\n  b: {internal: true}\n", "not internal"},
+		"with mode":     {"services:\n  a:\n    image: x\n    network_mode: host\n    networks: [default]\n", "together"},
+		"external+conf": {"services:\n  a:\n    image: x\nnetworks:\n  b: {external: true, internal: true}\n", "external"},
+		"bad option":    {"services:\n  a:\n    image: x\n    networks: {default: {priority: 3}}\n", "priority"},
+		"bad driver":    {"services:\n  a:\n    image: x\nnetworks:\n  b: {driver: overlay}\n", "overlay"},
+	} {
+		if _, err := load(t, "p", c.yml, nil); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", name, err, c.want)
+		}
+	}
+}
+
+func TestProfilesAndJobs(t *testing.T) {
+	yml := `
+services:
+  web:
+    image: x
+    depends_on:
+      migrate: {condition: service_completed_successfully}
+      cache: {condition: service_started, required: false}
+  migrate:
+    image: x
+  cache:
+    image: x
+    profiles: [cache]
+  debug:
+    image: x
+    profiles: [debug, tools]
+`
+	p, err := load(t, "p", yml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.Services["debug"]; ok || !slices.Equal(p.Inactive, []string{"cache", "debug"}) {
+		t.Fatalf("inactive %v", p.Inactive)
+	}
+	specs, _ := p.Specs("", nil)
+	byName := map[string]*Spec{}
+	for _, s := range specs {
+		byName[s.Service] = s
+	}
+	m := byName["migrate"]
+	if !m.Job || m.Timeout != 10*time.Minute || !strings.Contains(strings.Join(m.Args, " "), "--restart no") || byName["web"].Job {
+		t.Fatalf("migrate %+v", m)
+	}
+	if !slices.Equal(byName["web"].DependsOn, []string{"migrate"}) {
+		t.Fatalf("web deps %v", byName["web"].DependsOn)
+	}
+	p, err = load(t, "p", yml, map[string]string{"COMPOSE_PROFILES": "tools, cache"})
+	if err != nil || len(p.Services) != 4 {
+		t.Fatalf("profiles on: %v %d", err, len(p.Services))
+	}
+	if _, err := load(t, "p", "services:\n  a:\n    image: x\n    depends_on: [b]\n  b:\n    image: x\n    profiles: [x]\n", nil); err == nil || !strings.Contains(err.Error(), "profile(s) x") {
+		t.Fatalf("required dep in profile: %v", err)
+	}
+	for name, c := range map[string]struct{ yml, want string }{
+		"job restart": {"services:\n  a:\n    image: x\n    depends_on: {b: {condition: service_completed_successfully}}\n  b:\n    image: x\n    restart: always\n", "loop"},
+		"condition":   {"services:\n  a:\n    image: x\n    depends_on: {b: {condition: whenever}}\n  b:\n    image: x\n", "whenever"},
+		"restart key": {"services:\n  a:\n    image: x\n    depends_on: {b: {restart: true}}\n  b:\n    image: x\n", "restart"},
+	} {
+		if _, err := load(t, "p", c.yml, nil); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", name, err, c.want)
+		}
 	}
 }

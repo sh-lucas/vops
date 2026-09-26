@@ -154,8 +154,8 @@ func cmdInstall(g globals, args []string) error {
 	}
 	bin := *binary
 	if bin == "" {
-		if arch != runtime.GOARCH {
-			return fmt.Errorf("the host is %s but this vops is %s: build one with GOARCH=%s and pass --binary", lines[0], runtime.GOARCH, arch)
+		if arch != runtime.GOARCH || runtime.GOOS != "linux" {
+			return fmt.Errorf("the host is linux/%s but this vops is %s/%s: get one with `GOOS=linux GOARCH=%s go install github.com/sh-lucas/vops/cmd/vops@latest` and pass --binary $(go env GOPATH)/bin/linux_%s/vops", arch, runtime.GOOS, runtime.GOARCH, arch, arch)
 		}
 		if bin, err = os.Executable(); err != nil {
 			return err

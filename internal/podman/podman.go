@@ -49,15 +49,16 @@ func first(args []string) string {
 
 // Container is the subset of `podman ps --format json` that vops uses.
 type Container struct {
-	ID      string            `json:"Id"`
-	Names   []string          `json:"Names"`
-	Image   string            `json:"Image"`
-	ImageID string            `json:"ImageID"`
-	State   string            `json:"State"`
-	Status  string            `json:"Status"`
-	Created int64             `json:"Created"`
-	Labels  map[string]string `json:"Labels"`
-	Exited  bool              `json:"Exited"`
+	ID       string            `json:"Id"`
+	Names    []string          `json:"Names"`
+	Image    string            `json:"Image"`
+	ImageID  string            `json:"ImageID"`
+	State    string            `json:"State"`
+	Status   string            `json:"Status"`
+	Created  int64             `json:"Created"`
+	Labels   map[string]string `json:"Labels"`
+	Exited   bool              `json:"Exited"`
+	ExitCode int               `json:"ExitCode"`
 }
 
 func (c Container) Name() string {
