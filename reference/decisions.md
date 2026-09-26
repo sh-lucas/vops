@@ -6,7 +6,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 
 - **One binary, `vops`.** Same binary is the local CLI, the remote CLI and the daemon (`vops daemon`). Install = copy the binary over ssh. No scp, no rsync: `ssh host 'cat > file' < binary`.
 - **Go deps: 3.** `modernc.org/sqlite` (pure Go, keeps the binary static so it can be copied anywhere), `go.yaml.in/yaml/v3` (compose files; writing a YAML parser is not worth it), `golang.org/x/crypto/acme/autocert` (Let's Encrypt). Everything else is stdlib.
-- **Runtime deps on the host:** linux, systemd, podman (netavark backend), git. btrfs is not required yet (see "Not done yet").
+- **Runtime deps on the host:** linux, systemd, podman (netavark backend), git. btrfs (+ btrfs-progs) enables snapshots and rollback; without it everything else works and the dashboard says why snapshots are off.
 - **The daemon is the reverse proxy.** No Caddy/Traefik/nginx. Rolling releases need to flip traffic the moment a new replica is ready; doing that in-process is a map swap instead of a config reload. TLS comes from autocert (HTTP-01 + TLS-ALPN-01).
 - **Local CLI talks to the host through ssh only.** `vops status` locally runs `ssh host ~/.vops/bin/vops status` there; the remote vops talks to the daemon over a unix socket (`~/.vops/vops.sock`). ssh is the auth. There is no public API besides the web UI.
 
@@ -92,6 +92,25 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - When a service fails, its dependents are skipped in that apply instead of deployed against a broken dependency.
 - Active profiles come from `COMPOSE_PROFILES` in the project env: the compose-standard variable, set the vops way. `depends_on.restart` is rejected: vops never restarts dependents behind your back.
 
+## Snapshots and rollback
+
+- btrfs subvolume snapshots, not copies or dumps: O(1), atomic per volume, copy-on-write, and database-agnostic. Anything with a journal (postgres, mysql/innodb, sqlite) recovers from a crash-consistent snapshot like from a power cut.
+- Data dirs become subvolumes when vops creates them (empty volume `_data`, missing bind dir). A non-empty plain dir is never moved: it shows as "not covered".
+- Rootless: files belong to subuids, and btrfs only lets the owner snapshot or remove a subvolume. Every btrfs op runs in `podman unshare` (the namespace podman itself uses). Deleting uses `property set ro false` + `rm -rf`, which unprivileged users may do since linux 4.18. No root, no `user_subvol_rm_allowed`.
+- Snapshots live in `~/.vops/snapshots/<project>/<time>`, same filesystem as the data (btrfs can't snapshot across filesystems). Metadata in sqlite: `snapshots` (one moment) + `snapshot_volumes` (one row per volume).
+- Pre-deploy snapshot whenever a project gets a create/update, of all its data, not only of the changed service: a migration job changes the db's data without redeploying the db. Running containers that use the data are paused (milliseconds) so all volumes are captured at the same instant. A failed pre-deploy snapshot aborts that project's deploy: deploying without the safety net must be a decision (`snapshots: off`).
+- Data is found from both the containers' mounts (what runs) and compose (what should run), so a disabled project can still be snapshotted.
+- Rollback stops the project's containers, snapshots the current data as `pre-rollback` (undo point), restores each volume (the live one is moved aside and put back if the restore fails), starts what was running. `rollback` without an id skips `pre-rollback` snapshots, so running it twice doesn't ping-pong.
+- Retention: newest `snapshot_keep` (5) automatic snapshots per project; manual ones are never pruned.
+- Rollback restores data only. Code rollback stays a git operation (revert + sync), so git remains the single source of truth.
+
+## SQL: sqlc, migrations, triggers
+
+- sqlc (same config as golang-tmpl): SQL in `internal/store/queries.sql`, schema in `internal/store/migrations/*.sql`, generated Go committed in `internal/store/queries/`. The store package keeps only what SQL can't do (encryption, hashing, json repos) and the friendlier types. sqlc is a dev tool only: `go install` and the binary don't need it.
+- Migrations run in name order, each once, in a transaction, tracked in `schema_migrations` (the golang-tmpl runner).
+- The audit log is written by triggers on every table, so no code path can forget it. Triggers never copy secrets: env values, token hashes, the admin hash and session ids are left out (sessions show 8 chars of the id hash). Retention is a trigger too (20k rows audit, 5k events).
+- `events` (human-readable, written by code) and `audit_log` (every db write, written by triggers) are separate on purpose: one says "deployed shop/api", the other "projects.commit changed".
+
 ## Small ones
 
 - Nothing deploys without an explicit apply: env changes, enable/disable and plain `git push` only show up as "pending" (cli `status`, dashboard banner). The exception is the registry push trigger, which is the point of it.
@@ -112,6 +131,6 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 
 ## Not done yet
 
-- btrfs snapshots of `data/` dirs before deploys (the reason btrfs is on the list).
+- Preview environments / database branching (TODO.md).
 - Re-pulling third-party tags (`postgres:16`) on a schedule.
 - Daemon pulling the repo from somewhere else (GitHub → server).

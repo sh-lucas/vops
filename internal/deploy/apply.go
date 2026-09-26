@@ -89,6 +89,13 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 			return err
 		}
 	}
+	if slices.ContainsFunc(pp.Actions, func(a Action) bool {
+		return (a.Kind == "create" || a.Kind == "update") && opts.wants(pp.Path, a.Service)
+	}) {
+		if err := e.preDeploy(ctx, w, pp, plan.Commit); err != nil {
+			return err
+		}
+	}
 	failed := map[string]bool{}
 	for _, a := range pp.Actions {
 		if a.Kind == "none" || !opts.wants(pp.Path, a.Service) {
@@ -268,17 +275,8 @@ func (e *Engine) deploy(ctx context.Context, log func(string, ...any), d *desire
 	if err := e.prepare(ctx, log, d); err != nil {
 		return err
 	}
-	for _, v := range sp.Volumes {
-		if _, err := podman.Run(ctx, "volume", "exists", v); err != nil {
-			if _, err := podman.Run(ctx, "volume", "create", "--label", LProject+"="+sp.Project, v); err != nil {
-				return err
-			}
-		}
-	}
-	for _, b := range sp.Binds {
-		if err := os.MkdirAll(b, 0o755); err != nil {
-			return err
-		}
+	if err := e.ensureData(ctx, log, sp); err != nil {
+		return err
 	}
 	key := proxy.Key{Project: sp.Project, Service: sp.Service}
 	rolling := sp.Strategy == "rolling" && len(old) > 0

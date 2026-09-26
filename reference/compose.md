@@ -78,6 +78,10 @@ vops env set shop COMPOSE_PROFILES=debug,workers && vops apply
 
 Depending on a service whose profile is off is an error unless the dependency has `required: false`.
 
+## Data
+
+Named volumes and bind mounts inside the project dir are created as btrfs subvolumes (when the host is on btrfs), so vops can snapshot them before deploys and roll them back. Existing non-empty dirs are never moved. Rootless tip: a container running as a non-root user needs `:U` on its volumes (`data:/var/lib/x:U`) to own them, same as plain podman.
+
 ## x-vops
 
 ```yaml

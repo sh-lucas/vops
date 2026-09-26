@@ -41,8 +41,11 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   env ls|set|rm <project> [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given)
   user ls | add <name> [--pattern re] [--repo r]... | rm <name> | token <name>
   registry ls [repo] | rm <repo:tag> | gc
+  snapshot ls [project] | create <project> [-m note] | rm <id>
+  rollback <project> [snapshot-id] [-y]   put a snapshot's data back (undoable)
   admin password                     set the dashboard password
-  events [project]
+  events [project]                   what happened (deploys, pushes, config)
+  audit [-n N]                       every write to the host's state
   version
 
 on the host:
@@ -90,7 +93,9 @@ func Main(args []string) int {
 		err = cmdEnv(g, rest)
 	case "admin":
 		err = cmdAdmin(g, rest)
-	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events":
+	case "rollback":
+		err = cmdRollback(g, rest)
+	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)

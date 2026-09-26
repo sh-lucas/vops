@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/sh-lucas/vops/internal/podman"
+	"github.com/sh-lucas/vops/internal/snapshot"
 	"github.com/sh-lucas/vops/internal/testenv"
 )
 
@@ -152,6 +153,9 @@ func (w *world) startDaemon() {
 	w.t.Cleanup(func() {
 		cmd.Process.Signal(os.Interrupt)
 		cmd.Wait()
+		// read-only snapshots and subvolumes: t.TempDir can't remove them by itself
+		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "snapshots"))
+		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, "vops"))
 		if w.t.Failed() {
 			w.t.Logf("daemon logs:\n%s", logs.String())
 		}
@@ -324,6 +328,9 @@ func TestEndToEnd(t *testing.T) {
 	if code != 200 || json.Unmarshal([]byte(body), &st) != nil || len(st.Projects) != 2 {
 		t.Fatalf("status: %d %s", code, body)
 	}
+	if code, body := call("GET", "/api/audit", "", false); code != 200 || !strings.Contains(body, `"tbl":"env"`) {
+		t.Fatalf("audit api: %d %s", code, body)
+	}
 	if code, _ := call("POST", "/api/env", `{"project":"shop","key":"X","value":"y"}`, false); code != 403 {
 		t.Fatalf("post without X-Vops: %d", code)
 	}
@@ -339,6 +346,40 @@ func TestEndToEnd(t *testing.T) {
 	req, _ := http.NewRequest("GET", "http://"+w.uiAddr+"/api/status", nil)
 	if resp, _ := client.Do(req); resp.StatusCode != 401 {
 		t.Fatalf("status without session: %d", resp.StatusCode)
+	}
+
+	// data safety from the cli: a project with a volume, a manual snapshot, a deploy (pre-deploy snapshot), a rollback
+	notes := "services:\n  notes:\n    image: APP\n    environment: {V: \"%s\"}\n    volumes: [\"data:/data:U\"]\nvolumes:\n  data:\n"
+	w.write(dev, map[string]string{"notes/compose.yml": fmt.Sprintf(notes, "1")})
+	w.vops(dev, "sync", "--yes")
+	execNotes := func(args ...string) string {
+		cs, _ := podman.PS(ctx, "vops.project=notes")
+		out, err := podman.Run(ctx, append([]string{"exec", cs[0].ID, "/app"}, args...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	execNotes("write", "/data/f", "before")
+	if out := w.vops(dev, "snapshot", "create", "notes", "-m", "by hand"); !strings.Contains(out, "(manual)") {
+		t.Fatalf("snapshot create:\n%s", out)
+	}
+	w.write(dev, map[string]string{"notes/compose.yml": fmt.Sprintf(notes, "2")})
+	if out := w.vops(dev, "sync", "--yes"); !strings.Contains(out, "(pre-deploy)") {
+		t.Fatalf("sync should snapshot first:\n%s", out)
+	}
+	execNotes("write", "/data/f", "after")
+	if ls := w.vops(dev, "snapshot", "ls", "notes"); !strings.Contains(ls, "protected: vops-notes-data") || !strings.Contains(ls, "pre-deploy") || !strings.Contains(ls, "by hand") {
+		t.Fatalf("snapshot ls:\n%s", ls)
+	}
+	if out := w.vops(dev, "rollback", "notes", "--yes"); !strings.Contains(out, "rolled back data to") || !strings.Contains(out, "undo with") {
+		t.Fatalf("rollback:\n%s", out)
+	}
+	if got := execNotes("read", "/data/f"); got != "before" {
+		t.Fatalf("after rollback: %q", got)
+	}
+	if audit := w.vops(dev, "audit"); !strings.Contains(audit, "snapshots insert notes") || !strings.Contains(audit, "env") || strings.Contains(audit, "again") {
+		t.Fatalf("audit:\n%s", audit)
 	}
 
 	// removing a project from git removes its containers

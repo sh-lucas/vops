@@ -30,6 +30,22 @@ func main() {
 		fmt.Print(string(b[:n]))
 		return
 	}
+	if len(os.Args) > 3 && os.Args[1] == "write" {
+		if err := os.WriteFile(os.Args[2], []byte(os.Args[3]), 0o644); err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		return
+	}
+	if len(os.Args) > 2 && os.Args[1] == "read" {
+		b, err := os.ReadFile(os.Args[2])
+		if err != nil {
+			fmt.Println(err)
+			os.Exit(1)
+		}
+		fmt.Print(string(b))
+		return
+	}
 	if len(os.Args) > 1 && os.Args[1] == "exit" {
 		os.Exit(3)
 	}

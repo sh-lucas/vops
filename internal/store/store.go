@@ -1,8 +1,11 @@
-// Package store is the sqlite state of the daemon: env vars, registry users, sessions, events and project flags.
+// Package store is the sqlite state of the daemon: env vars, registry users, sessions, events, snapshots,
+// project flags and the audit log. SQL lives in queries.sql and migrations/ (sqlc generates queries/);
+// this package adds what SQL can't do: encryption, hashing and friendlier types.
 // Containers are not stored here; podman labels are the source of truth for them.
 package store
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/pbkdf2"
@@ -17,32 +20,35 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/store/migrations"
+	"github.com/sh-lucas/vops/internal/store/queries"
+
 	_ "modernc.org/sqlite"
 )
 
 type DB struct {
 	sql *sql.DB
+	q   *queries.Queries
 	gcm cipher.AEAD
 }
 
-const schema = `
-CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS projects(path TEXT PRIMARY KEY, disabled INTEGER NOT NULL DEFAULT 0, commit_sha TEXT NOT NULL DEFAULT '', applied_at INTEGER NOT NULL DEFAULT 0);
-CREATE TABLE IF NOT EXISTS env(project TEXT NOT NULL, key TEXT NOT NULL, value BLOB NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(project, key));
-CREATE TABLE IF NOT EXISTS users(name TEXT PRIMARY KEY, token_hash TEXT NOT NULL, pattern TEXT NOT NULL DEFAULT '', repos TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS sessions(id_hash TEXT PRIMARY KEY, expires INTEGER NOT NULL);
-CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, at INTEGER NOT NULL, project TEXT NOT NULL, kind TEXT NOT NULL, message TEXT NOT NULL);
-`
+// ctx: the store is fast and local; callers don't need to thread contexts through it.
+var ctx = context.Background()
 
-// Open opens (and migrates) the db at path. keyPath holds the AES key for env values; it is created if missing.
+// Open opens and migrates the db at path. keyPath holds the AES key for env values; it is created if missing.
 func Open(path, keyPath string) (*DB, error) {
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)")
+	dsn := "file:" + path + "?" + strings.Join([]string{
+		"_pragma=foreign_keys(1)", "_pragma=busy_timeout(5000)", "_pragma=journal_mode(WAL)", "_pragma=synchronous(NORMAL)",
+	}, "&")
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	if _, err := db.Exec(schema); err != nil {
-		return nil, fmt.Errorf("migrate: %w", err)
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(1)
+	if err := migrations.Run(ctx, db); err != nil {
+		db.Close()
+		return nil, err
 	}
 	key, err := loadKey(keyPath)
 	if err != nil {
@@ -56,7 +62,7 @@ func Open(path, keyPath string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{sql: db, gcm: gcm}, nil
+	return &DB{sql: db, q: queries.New(db), gcm: gcm}, nil
 }
 
 func (d *DB) Close() error { return d.sql.Close() }
@@ -85,197 +91,11 @@ func Hash(s string) string {
 	return hex.EncodeToString(h[:])
 }
 
-// Token returns a random url-safe token.
+// Token returns a random hex token.
 func Token() string {
 	b := make([]byte, 24)
 	rand.Read(b)
 	return hex.EncodeToString(b)
-}
-
-// ---- meta
-
-func (d *DB) Meta(key string) string {
-	var v string
-	d.sql.QueryRow(`SELECT value FROM meta WHERE key=?`, key).Scan(&v)
-	return v
-}
-
-func (d *DB) SetMeta(key, value string) error {
-	_, err := d.sql.Exec(`INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
-	return err
-}
-
-// ---- projects
-
-type Project struct {
-	Path      string `json:"path"`
-	Disabled  bool   `json:"disabled"`
-	Commit    string `json:"commit"`
-	AppliedAt int64  `json:"applied_at"`
-}
-
-func (d *DB) Projects() (map[string]Project, error) {
-	rows, err := d.sql.Query(`SELECT path, disabled, commit_sha, applied_at FROM projects`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]Project{}
-	for rows.Next() {
-		var p Project
-		if err := rows.Scan(&p.Path, &p.Disabled, &p.Commit, &p.AppliedAt); err != nil {
-			return nil, err
-		}
-		out[p.Path] = p
-	}
-	return out, rows.Err()
-}
-
-func (d *DB) SetDisabled(path string, disabled bool) error {
-	_, err := d.sql.Exec(`INSERT INTO projects(path, disabled) VALUES(?,?) ON CONFLICT(path) DO UPDATE SET disabled=excluded.disabled`, path, disabled)
-	return err
-}
-
-func (d *DB) SetApplied(path, commit string) error {
-	_, err := d.sql.Exec(`INSERT INTO projects(path, commit_sha, applied_at) VALUES(?,?,?) ON CONFLICT(path) DO UPDATE SET commit_sha=excluded.commit_sha, applied_at=excluded.applied_at`, path, commit, now())
-	return err
-}
-
-func (d *DB) DeleteProject(path string) error {
-	_, err := d.sql.Exec(`DELETE FROM projects WHERE path=?`, path)
-	return err
-}
-
-// ---- env (values are encrypted and never leave the daemon except into containers)
-
-func (d *DB) SetEnv(project, key, value string) error {
-	nonce := make([]byte, d.gcm.NonceSize())
-	rand.Read(nonce)
-	sealed := d.gcm.Seal(nonce, nonce, []byte(value), []byte(project+"\x00"+key))
-	_, err := d.sql.Exec(`INSERT INTO env(project,key,value,updated_at) VALUES(?,?,?,?) ON CONFLICT(project,key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at`, project, key, sealed, now())
-	return err
-}
-
-func (d *DB) UnsetEnv(project, key string) error {
-	_, err := d.sql.Exec(`DELETE FROM env WHERE project=? AND key=?`, project, key)
-	return err
-}
-
-type EnvKey struct {
-	Key       string `json:"key"`
-	UpdatedAt int64  `json:"updated_at"`
-}
-
-// EnvKeys lists the keys of a project, never the values.
-func (d *DB) EnvKeys(project string) ([]EnvKey, error) {
-	rows, err := d.sql.Query(`SELECT key, updated_at FROM env WHERE project=? ORDER BY key`, project)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []EnvKey{}
-	for rows.Next() {
-		var k EnvKey
-		if err := rows.Scan(&k.Key, &k.UpdatedAt); err != nil {
-			return nil, err
-		}
-		out = append(out, k)
-	}
-	return out, rows.Err()
-}
-
-// Env returns the decrypted env of a project; only the deploy code should call it.
-func (d *DB) Env(project string) (map[string]string, error) {
-	rows, err := d.sql.Query(`SELECT key, value FROM env WHERE project=?`, project)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]string{}
-	for rows.Next() {
-		var k string
-		var sealed []byte
-		if err := rows.Scan(&k, &sealed); err != nil {
-			return nil, err
-		}
-		n := d.gcm.NonceSize()
-		if len(sealed) < n {
-			return nil, fmt.Errorf("env %s/%s: corrupt", project, k)
-		}
-		plain, err := d.gcm.Open(nil, sealed[:n], sealed[n:], []byte(project+"\x00"+k))
-		if err != nil {
-			return nil, fmt.Errorf("env %s/%s: %w", project, k, err)
-		}
-		out[k] = string(plain)
-	}
-	return out, rows.Err()
-}
-
-// ---- registry users
-
-type User struct {
-	Name      string   `json:"name"`
-	Pattern   string   `json:"pattern"`
-	Repos     []string `json:"repos"`
-	CreatedAt int64    `json:"created_at"`
-	tokenHash string
-}
-
-// PutUser creates or updates a user. An empty token keeps the current one.
-func (d *DB) PutUser(u User, token string) error {
-	repos, _ := json.Marshal(u.Repos)
-	if u.Repos == nil {
-		repos = []byte("[]")
-	}
-	if token == "" {
-		res, err := d.sql.Exec(`UPDATE users SET pattern=?, repos=? WHERE name=?`, u.Pattern, string(repos), u.Name)
-		if err != nil {
-			return err
-		}
-		if n, _ := res.RowsAffected(); n == 0 {
-			return fmt.Errorf("user %q not found", u.Name)
-		}
-		return nil
-	}
-	_, err := d.sql.Exec(`INSERT INTO users(name, token_hash, pattern, repos, created_at) VALUES(?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET token_hash=excluded.token_hash, pattern=excluded.pattern, repos=excluded.repos`,
-		u.Name, Hash(token), u.Pattern, string(repos), now())
-	return err
-}
-
-func (d *DB) DeleteUser(name string) error {
-	_, err := d.sql.Exec(`DELETE FROM users WHERE name=?`, name)
-	return err
-}
-
-func (d *DB) Users() ([]User, error) {
-	rows, err := d.sql.Query(`SELECT name, token_hash, pattern, repos, created_at FROM users ORDER BY name`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := []User{}
-	for rows.Next() {
-		var u User
-		var repos string
-		if err := rows.Scan(&u.Name, &u.tokenHash, &u.Pattern, &repos, &u.CreatedAt); err != nil {
-			return nil, err
-		}
-		json.Unmarshal([]byte(repos), &u.Repos)
-		out = append(out, u)
-	}
-	return out, rows.Err()
-}
-
-// CheckUser returns the user if name/token match.
-func (d *DB) CheckUser(name, token string) (User, bool) {
-	var u User
-	var repos string
-	err := d.sql.QueryRow(`SELECT name, token_hash, pattern, repos, created_at FROM users WHERE name=?`, name).Scan(&u.Name, &u.tokenHash, &u.Pattern, &repos, &u.CreatedAt)
-	if err != nil || !equalHash(u.tokenHash, Hash(token)) {
-		return User{}, false
-	}
-	json.Unmarshal([]byte(repos), &u.Repos)
-	return u, true
 }
 
 func equalHash(a, b string) bool {
@@ -289,60 +109,274 @@ func equalHash(a, b string) bool {
 	return v == 0
 }
 
+// ---- meta
+
+func (d *DB) Meta(key string) string {
+	v, _ := d.q.GetMeta(ctx, key)
+	return v
+}
+
+func (d *DB) SetMeta(key, value string) error {
+	return d.q.SetMeta(ctx, queries.SetMetaParams{Key: key, Value: value})
+}
+
+// ---- projects
+
+type Project struct {
+	Path      string `json:"path"`
+	Disabled  bool   `json:"disabled"`
+	Commit    string `json:"commit"`
+	AppliedAt int64  `json:"applied_at"`
+}
+
+func (d *DB) Projects() (map[string]Project, error) {
+	rows, err := d.q.ListProjects(ctx)
+	out := map[string]Project{}
+	for _, r := range rows {
+		out[r.Path] = Project{r.Path, r.Disabled, r.CommitSha, r.AppliedAt}
+	}
+	return out, err
+}
+
+func (d *DB) SetDisabled(path string, disabled bool) error {
+	return d.q.SetProjectDisabled(ctx, queries.SetProjectDisabledParams{Path: path, Disabled: disabled})
+}
+
+func (d *DB) SetApplied(path, commit string) error {
+	return d.q.SetProjectApplied(ctx, queries.SetProjectAppliedParams{Path: path, CommitSha: commit, AppliedAt: now()})
+}
+
+func (d *DB) DeleteProject(path string) error { return d.q.DeleteProject(ctx, path) }
+
+// ---- env (values are encrypted and never leave the daemon except into containers)
+
+func (d *DB) SetEnv(project, key, value string) error {
+	nonce := make([]byte, d.gcm.NonceSize())
+	rand.Read(nonce)
+	sealed := d.gcm.Seal(nonce, nonce, []byte(value), []byte(project+"\x00"+key))
+	return d.q.SetEnv(ctx, queries.SetEnvParams{Project: project, Key: key, Value: sealed, UpdatedAt: now()})
+}
+
+func (d *DB) UnsetEnv(project, key string) error {
+	return d.q.UnsetEnv(ctx, queries.UnsetEnvParams{Project: project, Key: key})
+}
+
+type EnvKey struct {
+	Key       string `json:"key"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+// EnvKeys lists the keys of a project, never the values.
+func (d *DB) EnvKeys(project string) ([]EnvKey, error) {
+	rows, err := d.q.ListEnvKeys(ctx, project)
+	out := []EnvKey{}
+	for _, r := range rows {
+		out = append(out, EnvKey{r.Key, r.UpdatedAt})
+	}
+	return out, err
+}
+
+// Env returns the decrypted env of a project; only the deploy code should call it.
+func (d *DB) Env(project string) (map[string]string, error) {
+	rows, err := d.q.ListEnv(ctx, project)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]string{}
+	n := d.gcm.NonceSize()
+	for _, r := range rows {
+		if len(r.Value) < n {
+			return nil, fmt.Errorf("env %s/%s: corrupt", project, r.Key)
+		}
+		plain, err := d.gcm.Open(nil, r.Value[:n], r.Value[n:], []byte(project+"\x00"+r.Key))
+		if err != nil {
+			return nil, fmt.Errorf("env %s/%s: %w", project, r.Key, err)
+		}
+		out[r.Key] = string(plain)
+	}
+	return out, nil
+}
+
+// ---- registry users
+
+type User struct {
+	Name      string   `json:"name"`
+	Pattern   string   `json:"pattern"`
+	Repos     []string `json:"repos"`
+	CreatedAt int64    `json:"created_at"`
+}
+
+func userFrom(r queries.User) User {
+	u := User{Name: r.Name, Pattern: r.Pattern, CreatedAt: r.CreatedAt, Repos: []string{}}
+	json.Unmarshal([]byte(r.Repos), &u.Repos)
+	return u
+}
+
+// PutUser creates or updates a user. An empty token keeps the current one.
+func (d *DB) PutUser(u User, token string) error {
+	if u.Repos == nil {
+		u.Repos = []string{}
+	}
+	repos, _ := json.Marshal(u.Repos)
+	if token == "" {
+		n, err := d.q.UpdateUserRules(ctx, queries.UpdateUserRulesParams{Pattern: u.Pattern, Repos: string(repos), Name: u.Name})
+		if err == nil && n == 0 {
+			err = fmt.Errorf("user %q not found", u.Name)
+		}
+		return err
+	}
+	return d.q.CreateOrReplaceUser(ctx, queries.CreateOrReplaceUserParams{Name: u.Name, TokenHash: Hash(token), Pattern: u.Pattern, Repos: string(repos), CreatedAt: now()})
+}
+
+func (d *DB) DeleteUser(name string) error { return d.q.DeleteUser(ctx, name) }
+
+func (d *DB) Users() ([]User, error) {
+	rows, err := d.q.ListUsers(ctx)
+	out := []User{}
+	for _, r := range rows {
+		out = append(out, userFrom(r))
+	}
+	return out, err
+}
+
+// CheckUser returns the user if name/token match.
+func (d *DB) CheckUser(name, token string) (User, bool) {
+	r, err := d.q.GetUser(ctx, name)
+	if err != nil || !equalHash(r.TokenHash, Hash(token)) {
+		return User{}, false
+	}
+	return userFrom(r), true
+}
+
 // ---- sessions
 
 func (d *DB) NewSession(ttl time.Duration) (string, error) {
 	id := Token()
-	_, err := d.sql.Exec(`INSERT INTO sessions(id_hash, expires) VALUES(?,?)`, Hash(id), time.Now().Add(ttl).Unix())
-	d.sql.Exec(`DELETE FROM sessions WHERE expires < ?`, now())
-	return id, err
+	d.q.DeleteExpiredSessions(ctx, now())
+	return id, d.q.CreateSession(ctx, queries.CreateSessionParams{IDHash: Hash(id), Expires: time.Now().Add(ttl).Unix()})
 }
 
 func (d *DB) CheckSession(id string) bool {
-	var exp int64
-	err := d.sql.QueryRow(`SELECT expires FROM sessions WHERE id_hash=?`, Hash(id)).Scan(&exp)
+	exp, err := d.q.GetSessionExpiry(ctx, Hash(id))
 	return err == nil && exp > now()
 }
 
-func (d *DB) DeleteSession(id string) {
-	d.sql.Exec(`DELETE FROM sessions WHERE id_hash=?`, Hash(id))
-}
+func (d *DB) DeleteSession(id string) { d.q.DeleteSession(ctx, Hash(id)) }
 
-func (d *DB) DeleteSessions() {
-	d.sql.Exec(`DELETE FROM sessions`)
-}
+func (d *DB) DeleteSessions() { d.q.DeleteAllSessions(ctx) }
 
-// ---- events
+// ---- events (for humans; retention is a trigger)
 
-type Event struct {
-	ID      int64  `json:"id"`
-	At      int64  `json:"at"`
-	Project string `json:"project"`
-	Kind    string `json:"kind"`
-	Message string `json:"message"`
-}
+type Event = queries.Event
 
 func (d *DB) Event(project, kind, format string, args ...any) {
-	d.sql.Exec(`INSERT INTO events(at, project, kind, message) VALUES(?,?,?,?)`, now(), project, kind, fmt.Sprintf(format, args...))
-	d.sql.Exec(`DELETE FROM events WHERE id <= (SELECT max(id) FROM events) - 5000`)
+	d.q.CreateEvent(ctx, queries.CreateEventParams{At: now(), Project: project, Kind: kind, Message: fmt.Sprintf(format, args...)})
 }
 
 func (d *DB) Events(project string, limit int) ([]Event, error) {
-	rows, err := d.sql.Query(`SELECT id, at, project, kind, message FROM events WHERE ?='' OR project=? ORDER BY id DESC LIMIT ?`, project, project, limit)
+	return d.q.ListEvents(ctx, queries.ListEventsParams{Project: project, Lim: int64(limit)})
+}
+
+// ---- audit log (written by triggers only)
+
+type Audit = queries.AuditLog
+
+func (d *DB) Audit(limit int) ([]Audit, error) { return d.q.ListAudit(ctx, int64(limit)) }
+
+// ---- snapshots
+
+type Snapshot struct {
+	ID        int64            `json:"id"`
+	Project   string           `json:"project"`
+	Reason    string           `json:"reason"` // manual | pre-deploy | pre-rollback
+	Note      string           `json:"note"`
+	Commit    string           `json:"commit"`
+	CreatedAt int64            `json:"created_at"`
+	Volumes   []SnapshotVolume `json:"volumes"`
+}
+
+type SnapshotVolume struct {
+	Kind   string `json:"kind"` // volume | bind
+	Name   string `json:"name"`
+	Source string `json:"source"`
+	Path   string `json:"path"`
+}
+
+// AddSnapshot records a snapshot and its volumes atomically and returns its id.
+func (d *DB) AddSnapshot(s Snapshot) (int64, error) {
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	q := d.q.WithTx(tx)
+	id, err := q.CreateSnapshot(ctx, queries.CreateSnapshotParams{Project: s.Project, Reason: s.Reason, Note: s.Note, CommitSha: s.Commit, CreatedAt: now()})
+	if err != nil {
+		return 0, err
+	}
+	for _, v := range s.Volumes {
+		if err := q.AddSnapshotVolume(ctx, queries.AddSnapshotVolumeParams{SnapshotID: id, Kind: v.Kind, Name: v.Name, Source: v.Source, Path: v.Path}); err != nil {
+			return 0, err
+		}
+	}
+	return id, tx.Commit()
+}
+
+func (d *DB) snapshotFrom(r queries.Snapshot) (Snapshot, error) {
+	s := Snapshot{ID: r.ID, Project: r.Project, Reason: r.Reason, Note: r.Note, Commit: r.CommitSha, CreatedAt: r.CreatedAt, Volumes: []SnapshotVolume{}}
+	vols, err := d.q.ListSnapshotVolumes(ctx, r.ID)
+	for _, v := range vols {
+		s.Volumes = append(s.Volumes, SnapshotVolume{v.Kind, v.Name, v.Source, v.Path})
+	}
+	return s, err
+}
+
+func (d *DB) Snapshot(id int64) (Snapshot, error) {
+	r, err := d.q.GetSnapshot(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Snapshot{}, fmt.Errorf("no snapshot #%d", id)
+	}
+	if err != nil {
+		return Snapshot{}, err
+	}
+	return d.snapshotFrom(r)
+}
+
+// Snapshots lists snapshots, newest first ("" = all projects).
+func (d *DB) Snapshots(project string) ([]Snapshot, error) {
+	rows, err := d.q.ListSnapshots(ctx, project)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-	out := []Event{}
-	for rows.Next() {
-		var e Event
-		if err := rows.Scan(&e.ID, &e.At, &e.Project, &e.Kind, &e.Message); err != nil {
+	out := []Snapshot{}
+	for _, r := range rows {
+		s, err := d.snapshotFrom(r)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, e)
+		out = append(out, s)
 	}
-	return out, rows.Err()
+	return out, nil
 }
+
+// SnapshotsToPrune lists automatic snapshots of a project beyond the newest keep.
+func (d *DB) SnapshotsToPrune(project string, keep int) ([]Snapshot, error) {
+	rows, err := d.q.ListAutoSnapshotsToPrune(ctx, queries.ListAutoSnapshotsToPruneParams{Project: project, Keep: int64(keep)})
+	if err != nil {
+		return nil, err
+	}
+	var out []Snapshot
+	for _, r := range rows {
+		s, err := d.snapshotFrom(r)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, nil
+}
+
+func (d *DB) DeleteSnapshot(id int64) error { return d.q.DeleteSnapshot(ctx, id) }
 
 // ---- admin (dashboard login; can pull every image, push none)
 

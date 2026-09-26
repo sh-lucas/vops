@@ -7,7 +7,7 @@ vops is a cli and a daemon to self-host containers with less pain and overhead t
 
 **v0.1, first usable version.** Everything below "Features" works and is covered by end-to-end tests against real podman (rootless), plus a production-like check (`just vps-test`: a container with systemd, a real sshd and podman as the "VPS", install over real ssh as root, git+ssh sync, daemon restarts, rolling release under load with 0 failed requests). Not yet run on a real cloud VPS with real DNS and Let's Encrypt; that is the last step before calling it production ready.
 
-- Runtime deps on the host: linux, systemd, podman 4+ (netavark), git. btrfs is not used yet.
+- Runtime deps on the host: linux, systemd, podman 4+ (netavark), git. btrfs (+ btrfs-progs) for snapshots and rollback; everything else works without it.
 - The daemon idles at ~16MB RSS. The binary is static, ~13MB.
 - Why things are the way they are: [reference/decisions.md](reference/decisions.md).
 
@@ -75,6 +75,16 @@ git add -A && git commit -m site && vops sync
 - Env vars per project, write-only: set from the cli or the dashboard, used for `${VAR}` and `environment: [VAR]`, never shown again.
 - Disable/enable a project without deleting it; removing its dir from git removes its containers (volumes and data dirs stay).
 
+### Data safety: snapshots and rollback (btrfs)
+- Every named volume and every bind mount inside the project dir is created as a btrfs subvolume, so snapshots are instant and copy-on-write, even for a 50GB database.
+- Before any deploy that changes a project, its data is snapshotted (`pre-deploy`); containers using it are paused for the few milliseconds it takes, so all volumes are captured at the same instant.
+- `vops rollback <project> [id]` stops the project, snapshots the current data (`pre-rollback`, so the rollback itself can be undone), restores, starts again. Code is not touched; the snapshot says which commit its data belongs to.
+- `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `~/.vops/config.yml`); manual ones stay until deleted.
+- Works rootless (through `podman unshare`), no root and no special mount options.
+
+### Audit log
+- Every write to the host's database (env changes, users, logins, snapshots, projects) is recorded by sqlite triggers, so no code path can forget it. Secrets never land there. `vops audit`, or the Events page.
+
 ### Registry
 - Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).
 - Users are simple: a name, a generated token, and a regex and/or a list of repos they may push/pull. `vops user add ci --pattern 'shop/.*'`.
@@ -99,7 +109,9 @@ Know these before putting something important on it:
 - **Podman only, netavark only.** CNI setups can't resolve service names.
 - **Env values are hidden from the api and dashboard, not from the host:** anyone with a shell on the host can see them with `podman inspect`.
 - **Recreate means downtime:** services with published `ports`, without `x-vops.port`, or on a network whose definition changed are stopped before the new container starts.
-- **No rollback command yet** (git revert + sync works) and no btrfs snapshots of data dirs yet.
+- **Snapshots need btrfs** and cover only named volumes and bind mounts inside the project dir (not external volumes or absolute host paths). Data created before vops made it a subvolume (non-empty plain dirs) is left alone and shown as "not covered".
+- **Snapshots are crash-consistent**, like pulling the plug: fine for postgres, mysql/innodb, sqlite, anything with a journal; not a replacement for application-level backups, and they live on the same disk (no off-host copy yet).
+- **Rollback restores data, not code**, and stops the project's containers while it runs (seconds).
 - **Logs are journald's:** retention and disk use follow its config (`/etc/systemd/journald.conf`); no long-term log store.
 - **Third-party images are not re-pulled** on their own: `postgres:16` stays at the version first pulled until you change the tag.
 - **Not yet run on a real cloud VPS** (see State above).
@@ -112,7 +124,8 @@ vops status | plan | apply [-y] [project...]
 vops logs <project> [service] [-f] [-n N] [--grep s]
 vops restart <project> [service] | enable <project> | disable <project>
 vops env ls|set|rm <project> ...         vops user ls|add|rm|token ...
-vops registry ls|rm|gc                    vops admin password | events | version
+vops registry ls|rm|gc                    vops admin password | events | audit | version
+vops snapshot ls|create|rm ...            vops rollback <project> [id] [-y]
 ```
 
 Inside a linked repo commands run on the host over ssh; on the host they talk to the daemon directly.
@@ -123,6 +136,7 @@ Inside a linked repo commands run on the host over ssh; on the host they talk to
 just test       # everything, needs podman; uses an isolated podman storage in ~/.cache/vops-test
 just build      # ./vops for this machine
 just release    # dist/vops-linux-{amd64,arm64}
+just gen        # sqlc generate (after editing internal/store/queries.sql or migrations/)
 just vps-test   # systemd + real sshd + podman in a container as the host (slow, needs network)
 ```
 

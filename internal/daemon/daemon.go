@@ -76,7 +76,8 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	d := &Daemon{Home: vopsHome, Repo: repo, Host: host, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token()}
 	reg.Auth = d.registryAuth
 	reg.OnPush = d.onPush
-	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json")}
+	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
+		SnapshotDir: filepath.Join(vopsHome, "snapshots"), SnapshotKeep: host.SnapshotKeep, SnapshotsOff: host.Snapshots == "off"}
 	auth := fmt.Sprintf(`{"auths":{%q:{"auth":%q}}}`, d.Engine.PullAddr, base64.StdEncoding.EncodeToString([]byte("vops-internal:"+d.pullToken)))
 	if err := os.WriteFile(d.Engine.PullAuthFile, []byte(auth), 0o600); err != nil {
 		return nil, err

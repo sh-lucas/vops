@@ -3,6 +3,9 @@ version := `git describe --tags --always --dirty 2>/dev/null || echo dev`
 build:
     CGO_ENABLED=0 go build -trimpath -ldflags "-s -w -X main.version={{version}}" -o vops ./cmd/vops
 
+gen:
+    sqlc generate
+
 test:
     go vet ./...
     go test ./...

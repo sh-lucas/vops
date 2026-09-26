@@ -30,6 +30,9 @@ type Host struct {
 	HTTPS string `yaml:"https"` // default ":443"
 	UI    string `yaml:"ui"`    // default "127.0.0.1:9984"
 	TLS   string `yaml:"tls"`   // auto (default when a domain is set) | off
+	// Snapshots: "off" disables btrfs snapshots (and the pre-deploy ones). SnapshotKeep: automatic snapshots kept per project.
+	Snapshots    string `yaml:"snapshots,omitempty"`
+	SnapshotKeep int    `yaml:"snapshot_keep,omitempty"`
 	// ACMEDirectory overrides the Let's Encrypt directory (staging, pebble in tests).
 	ACMEDirectory string `yaml:"acme_directory,omitempty"`
 }

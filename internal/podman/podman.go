@@ -96,3 +96,44 @@ func ImageID(ctx context.Context, ref string) string {
 	}
 	return out
 }
+
+// Mount is a mount of an inspected container.
+type Mount struct {
+	Type        string `json:"Type"` // volume | bind
+	Name        string `json:"Name"`
+	Source      string `json:"Source"`
+	Destination string `json:"Destination"`
+	RW          bool   `json:"RW"`
+}
+
+// Mounts returns the mounts of containers by id.
+func Mounts(ctx context.Context, ids ...string) (map[string][]Mount, error) {
+	out := map[string][]Mount{}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	raw, err := Run(ctx, append([]string{"inspect", "--type", "container", "--format", "json"}, ids...)...)
+	if err != nil {
+		return nil, err
+	}
+	var cs []struct {
+		ID     string  `json:"Id"`
+		Mounts []Mount `json:"Mounts"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cs); err != nil {
+		return nil, fmt.Errorf("podman inspect: %w", err)
+	}
+	for _, c := range cs {
+		out[c.ID] = c.Mounts
+	}
+	return out, nil
+}
+
+// VolumePath returns the mountpoint of a named volume, or "" if it doesn't exist.
+func VolumePath(ctx context.Context, name string) string {
+	out, err := Run(ctx, "volume", "inspect", "--format", "{{.Mountpoint}}", name)
+	if err != nil {
+		return ""
+	}
+	return out
+}

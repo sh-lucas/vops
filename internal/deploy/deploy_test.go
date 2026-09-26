@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/sh-lucas/vops/internal/podman"
 	"github.com/sh-lucas/vops/internal/proxy"
+	"github.com/sh-lucas/vops/internal/snapshot"
 	"github.com/sh-lucas/vops/internal/store"
 	"github.com/sh-lucas/vops/internal/testenv"
 )
@@ -48,7 +50,19 @@ func newEnv(t *testing.T) *env {
 	t.Cleanup(func() { db.Close() })
 	ns := fmt.Sprintf("t%d", time.Now().UnixNano()%1e6)
 	testenv.Cleanup(t, LProject)
-	e := &Engine{Repo: repo, DB: db, Routes: proxy.NewTable()}
+	e := &Engine{Repo: repo, DB: db, Routes: proxy.NewTable(), SnapshotDir: filepath.Join(dir, "snapshots")}
+	// subvolumes and snapshots hold subuid-owned files: remove them from inside the user namespace
+	t.Cleanup(func() {
+		ctx := context.Background()
+		snaps, _ := db.Snapshots("")
+		for _, s := range snaps {
+			for _, v := range s.Volumes {
+				snapshot.Delete(ctx, v.Path)
+			}
+		}
+		snapshot.Delete(ctx, repo)
+		snapshot.Delete(ctx, e.SnapshotDir)
+	})
 	srv := httptest.NewServer(proxy.Handler(e.Routes))
 	t.Cleanup(srv.Close)
 	return &env{t: t, e: e, repo: repo, app: app, proxy: srv, ns: ns}
@@ -288,7 +302,7 @@ func TestProjectsTalkToEachOther(t *testing.T) {
   db:
     image: APP
     environment: {MSG: from-db, PORT: "9000"}
-    volumes: [data:/data, ./files:/files]
+    volumes: ["data:/data:U", "./files:/files:U"]
   server:
     image: APP
     depends_on: [db]
@@ -509,5 +523,140 @@ networks:
 	}
 	if _, err := podman.Run(ctx, "network", "exists", "vops-"+v.ns+".app-backend"); err == nil {
 		t.Fatal("unused network not removed")
+	}
+}
+
+// Data safety: volumes and project binds are subvolumes, every deploy snapshots them first, rollback
+// restores them (and can itself be undone), automatic snapshots are pruned, manual ones kept.
+func TestSnapshotsAndRollback(t *testing.T) {
+	v := newEnv(t)
+	if !snapshot.Supported(v.e.SnapshotDir) {
+		t.Skip("not on btrfs")
+	}
+	ctx := context.Background()
+	v.e.SnapshotKeep = 2
+	p := v.ns + "/db"
+	compose := func(version string) string {
+		return `services:
+  db:
+    image: APP
+    user: "999"
+    environment: {V: "` + version + `"}
+    volumes: ["data:/data:U", "./files:/files:U"]
+volumes:
+  data:
+`
+	}
+	v.commit(map[string]string{p + "/compose.yml": compose("1")})
+	if _, out, err := v.apply(ApplyOpts{}); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if snaps, _ := v.e.DB.Snapshots(p); len(snaps) != 0 {
+		t.Fatal("first deploy has no data to snapshot")
+	}
+	vol := podman.VolumePath(ctx, "vops-"+v.ns+".db-data")
+	bind := filepath.Join(v.repo, p, "files")
+	if !snapshot.IsSubvolume(vol) || !snapshot.IsSubvolume(bind) {
+		t.Fatalf("data is not on subvolumes: %s %s", vol, bind)
+	}
+	exec := func(args ...string) string {
+		t.Helper()
+		cs, _ := podman.PS(ctx, LProject+"="+p)
+		cs = slices.DeleteFunc(cs, func(c podman.Container) bool { return c.State != "running" })
+		if len(cs) == 0 {
+			t.Fatal("db not running")
+		}
+		out, err := podman.Run(ctx, append([]string{"exec", cs[0].ID, "/app"}, args...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	write := func(s string) { exec("write", "/data/f", s); exec("write", "/files/f", s) }
+	read := func() string { return exec("read", "/data/f") + "|" + exec("read", "/files/f") }
+
+	write("A") // written as uid 999: a subuid on the host, like postgres
+	if _, out, err := v.apply(ApplyOpts{}); err != nil || strings.Contains(out, "snapshot") {
+		t.Fatalf("no-op apply must not snapshot: %v\n%s", err, out)
+	}
+	v.commit(map[string]string{p + "/compose.yml": compose("2")})
+	_, out, err := v.apply(ApplyOpts{})
+	if err != nil || !strings.Contains(out, "(pre-deploy)") {
+		t.Fatalf("deploy should snapshot first: %v\n%s", err, out)
+	}
+	snaps, _ := v.e.DB.Snapshots(p)
+	if len(snaps) != 1 || snaps[0].Reason != "pre-deploy" || len(snaps[0].Volumes) != 2 {
+		t.Fatalf("snapshots: %+v", snaps)
+	}
+	preDeploy := snaps[0]
+	write("B") // the "migration" of v2
+
+	// rollback to before v2: data is A again, the db is running, and there is an undo point
+	var buf strings.Builder
+	if err := v.e.Rollback(ctx, &buf, p, preDeploy.ID); err != nil {
+		t.Fatalf("%v\n%s", err, buf.String())
+	}
+	if got := read(); got != "A|A" {
+		t.Fatalf("after rollback: %q\n%s", got, buf.String())
+	}
+	latest, _ := v.e.DB.Snapshots(p)
+	if latest[0].Reason != "pre-rollback" {
+		t.Fatalf("no undo point: %+v", latest[0])
+	}
+	if l, _ := v.e.LatestSnapshot(p); l.ID != preDeploy.ID {
+		t.Fatalf("default rollback target should skip pre-rollback snapshots: #%d", l.ID)
+	}
+	// undo the rollback
+	if err := v.e.Rollback(ctx, &buf, p, latest[0].ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != "B|B" {
+		t.Fatalf("after undo: %q", got)
+	}
+	// still a subvolume, still writable, still snapshottable
+	write("C")
+	if !snapshot.IsSubvolume(vol) || !snapshot.IsSubvolume(bind) {
+		t.Fatal("restore lost the subvolumes")
+	}
+
+	// a manual snapshot survives pruning; automatic ones keep the newest 2
+	manual, err := v.e.Snapshot(ctx, io.Discard, p, "before the big one")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 3; i <= 5; i++ {
+		v.commit(map[string]string{p + "/compose.yml": compose(fmt.Sprint(i))})
+		if _, out, err := v.apply(ApplyOpts{}); err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+	}
+	all, _ := v.e.DB.Snapshots(p)
+	auto := 0
+	for _, s := range all {
+		if s.Reason != "manual" {
+			auto++
+		}
+	}
+	if auto != 2 || !slices.ContainsFunc(all, func(s store.Snapshot) bool { return s.ID == manual.ID }) {
+		t.Fatalf("retention: %d automatic, manual kept=%v", auto, slices.ContainsFunc(all, func(s store.Snapshot) bool { return s.ID == manual.ID }))
+	}
+	if _, err := os.Stat(preDeploy.Volumes[0].Path); !os.IsNotExist(err) {
+		t.Fatal("pruned snapshot still on disk")
+	}
+	// the manual snapshot still restores
+	if err := v.e.Rollback(ctx, io.Discard, p, manual.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != "C|C" {
+		t.Fatalf("manual restore: %q", got)
+	}
+	if err := v.e.DeleteSnapshot(ctx, manual.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manual.Volumes[0].Path); !os.IsNotExist(err) {
+		t.Fatal("deleted snapshot still on disk")
+	}
+	if st := v.e.DataState(ctx, p); !st.Supported || len(st.Protected) != 2 || len(st.Unprotected) != 0 {
+		t.Fatalf("data state %+v", st)
 	}
 }

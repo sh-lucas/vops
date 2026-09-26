@@ -66,6 +66,7 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	var repos multi
 	fs.Var(&repos, "repo", "")
 	fromStdin := fs.Bool("stdin", false, "")
+	note := fs.String("m", "", "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -332,6 +333,103 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			return nil
 		}
 		return fmt.Errorf("registry %s: unknown", sub)
+
+	case "snapshot":
+		sub, err := arg(0, "ls|create|rm")
+		if err != nil {
+			return err
+		}
+		switch sub {
+		case "ls":
+			project, _ := arg(1, "")
+			var res struct {
+				Snapshots []store.Snapshot  `json:"snapshots"`
+				Data      *deploy.DataState `json:"data"`
+			}
+			if err := getJSON(c, "/api/snapshots?project="+url.QueryEscape(project), &res); err != nil {
+				return err
+			}
+			if *asJSON {
+				b, _ := json.Marshal(res)
+				_, err := fmt.Fprintln(out, string(b))
+				return err
+			}
+			if d := res.Data; d != nil {
+				switch {
+				case !d.Supported:
+					fmt.Fprintf(out, "snapshots unavailable: %s\n", d.Reason)
+				case len(d.Protected) > 0:
+					fmt.Fprintf(out, "protected: %s\n", strings.Join(d.Protected, ", "))
+				}
+				if len(d.Unprotected) > 0 {
+					fmt.Fprintf(out, "not covered (not btrfs subvolumes): %s\n", strings.Join(d.Unprotected, ", "))
+				}
+				fmt.Fprintln(out)
+			}
+			tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "ID\tPROJECT\tREASON\tTAKEN\tCOMMIT\tDATA\tNOTE")
+			for _, s := range res.Snapshots {
+				var names []string
+				for _, v := range s.Volumes {
+					names = append(names, v.Name)
+				}
+				fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%.12s\t%s\t%s\n", s.ID, s.Project, s.Reason, ago(s.CreatedAt), s.Commit, strings.Join(names, ","), s.Note)
+			}
+			return tw.Flush()
+		case "create":
+			project, err := arg(1, "project")
+			if err != nil {
+				return err
+			}
+			var res struct {
+				Snapshot store.Snapshot `json:"snapshot"`
+				Log      string         `json:"log"`
+			}
+			if err := post(c, "POST", "/api/snapshots", map[string]string{"project": project, "note": *note}, &res); err != nil {
+				return err
+			}
+			fmt.Fprint(out, res.Log)
+			return nil
+		case "rm":
+			id, err := arg(1, "id")
+			if err != nil {
+				return err
+			}
+			if err := post(c, "DELETE", "/api/snapshots?id="+url.QueryEscape(id), nil, nil); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "snapshot #%s deleted\n", id)
+			return nil
+		}
+		return fmt.Errorf("snapshot %s: unknown", sub)
+
+	case "rollback":
+		if !*yes {
+			return errors.New("rollback on the host needs --yes (the cli shows what it restores first)")
+		}
+		project, err := arg(0, "project")
+		if err != nil {
+			return err
+		}
+		idArg, _ := arg(1, "")
+		var id int64
+		fmt.Sscan(idArg, &id)
+		resp, err := c.do("POST", "/api/rollback", jsonBody(map[string]any{"project": project, "id": id}))
+		if err != nil {
+			return err
+		}
+		return stream(resp, out)
+
+	case "audit":
+		var logs []store.Audit
+		if err := getJSON(c, fmt.Sprintf("/api/audit?n=%d", *n), &logs); err != nil {
+			return err
+		}
+		for i := len(logs) - 1; i >= 0; i-- {
+			l := logs[i]
+			fmt.Fprintf(out, "%s  %-9s %-6s %s  %s\n", time.Unix(l.At, 0).Format("2006-01-02 15:04:05"), l.Tbl, l.Op, l.Key, l.Detail)
+		}
+		return nil
 
 	case "admin":
 		if sub, _ := arg(0, ""); sub != "password" || !*fromStdin {

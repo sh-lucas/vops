@@ -21,6 +21,7 @@ import (
 	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/daemon"
 	"github.com/sh-lucas/vops/internal/deploy"
+	"github.com/sh-lucas/vops/internal/store"
 )
 
 func run(dir string, env []string, name string, args ...string) error {
@@ -396,4 +397,62 @@ func cmdDaemon() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	return d.Run(ctx)
+}
+
+// ---- rollback: show what gets restored, ask, then restore that exact snapshot
+
+func cmdRollback(g globals, args []string) error {
+	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
+	yes := fs.Bool("yes", false, "")
+	fs.BoolVar(yes, "y", false, "")
+	pos, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	if len(pos) == 0 {
+		return errors.New("usage: vops rollback <project> [snapshot-id] [-y]")
+	}
+	project := pos[0]
+	if *yes && len(pos) > 1 {
+		return forward(g, "rollback", []string{project, pos[1], "--yes"}, nil, os.Stdout)
+	}
+	var buf bytes.Buffer
+	if err := forward(g, "snapshot", []string{"ls", project, "--json"}, nil, &buf); err != nil {
+		return err
+	}
+	var res struct {
+		Snapshots []store.Snapshot `json:"snapshots"`
+	}
+	if err := json.Unmarshal(buf.Bytes(), &res); err != nil {
+		return err
+	}
+	var target *store.Snapshot
+	for i, s := range res.Snapshots {
+		if len(pos) > 1 && fmt.Sprint(s.ID) == pos[1] || len(pos) == 1 && s.Reason != "pre-rollback" {
+			target = &res.Snapshots[i]
+			break
+		}
+	}
+	if target == nil {
+		return fmt.Errorf("no such snapshot for %s (vops snapshot ls %s)", project, project)
+	}
+	var vols []string
+	for _, v := range target.Volumes {
+		vols = append(vols, v.Name)
+	}
+	fmt.Printf("restore %s to snapshot #%d (%s, %s, commit %.12s)\n  data: %s\n", project, target.ID, target.Reason, ago(target.CreatedAt), target.Commit, strings.Join(vols, ", "))
+	if target.Note != "" {
+		fmt.Printf("  note: %s\n", target.Note)
+	}
+	fmt.Println("  the project's containers stop while it restores; the current data is snapshotted first, so this can be undone.")
+	fmt.Println("  code is not rolled back: to run the old code too, git revert and vops sync first.")
+	if !*yes {
+		if !isTerminal(os.Stdin) {
+			return errors.New("not a terminal: pass --yes")
+		}
+		if !confirm("roll back?") {
+			return errors.New("aborted")
+		}
+	}
+	return forward(g, "rollback", []string{project, fmt.Sprint(target.ID), "--yes"}, nil, os.Stdout)
 }

@@ -310,6 +310,84 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		return nil
 	})
 
+	// ---- snapshots and rollback
+
+	h("GET /api/snapshots", func(w http.ResponseWriter, r *http.Request) error {
+		project := r.URL.Query().Get("project")
+		snaps, err := d.DB.Snapshots(project)
+		if err != nil {
+			return err
+		}
+		out := map[string]any{"snapshots": snaps}
+		if project != "" {
+			out["data"] = d.Engine.DataState(r.Context(), project)
+		}
+		writeJSON(w, out)
+		return nil
+	})
+	h("POST /api/snapshots", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct{ Project, Note string }
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		var log strings.Builder
+		s, err := d.Engine.Snapshot(context.WithoutCancel(r.Context()), &log, in.Project, in.Note)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, map[string]any{"snapshot": s, "log": log.String()})
+		return nil
+	})
+	h("DELETE /api/snapshots", func(w http.ResponseWriter, r *http.Request) error {
+		id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid id")
+		}
+		if err := d.Engine.DeleteSnapshot(r.Context(), id); err != nil {
+			return err
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+		return nil
+	})
+	// rollback streams progress like apply; id 0 means the latest snapshot that isn't a pre-rollback one
+	h("POST /api/rollback", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct {
+			Project string `json:"project"`
+			ID      int64  `json:"id"`
+		}
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		if in.ID == 0 {
+			s, err := d.Engine.LatestSnapshot(in.Project)
+			if err != nil {
+				return err
+			}
+			in.ID = s.ID
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if err := d.Engine.Rollback(context.WithoutCancel(r.Context()), flushWriter{w}, in.Project, in.ID); err != nil {
+			fmt.Fprintf(w, "==> error: %v\n", err)
+		} else {
+			fmt.Fprintln(w, "==> ok")
+		}
+		return nil
+	})
+
+	h("GET /api/audit", func(w http.ResponseWriter, r *http.Request) error {
+		n, _ := strconv.Atoi(r.URL.Query().Get("n"))
+		if n <= 0 || n > 5000 {
+			n = 200
+		}
+		logs, err := d.DB.Audit(n)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, logs)
+		return nil
+	})
+
 	h("GET /api/routes", func(w http.ResponseWriter, r *http.Request) error {
 		writeJSON(w, d.Routes.Routes())
 		return nil

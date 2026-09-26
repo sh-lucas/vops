@@ -42,7 +42,10 @@ type Engine struct {
 	Routes       *proxy.Table
 	Registry     *registry.Registry // may be nil
 	PullAddr     string             // loopback host:port serving the registry, for pulling our own images
-	PullAuthFile string             // podman authfile (0600) with credentials for PullAddr; not --creds, which shows in ps
+	SnapshotDir  string             // where snapshots live (same btrfs as the data); empty disables snapshots
+	SnapshotKeep int                // automatic snapshots kept per project (default 5)
+	SnapshotsOff bool
+	PullAuthFile string // podman authfile (0600) with credentials for PullAddr; not --creds, which shows in ps
 
 	mu sync.Mutex // one apply at a time
 }

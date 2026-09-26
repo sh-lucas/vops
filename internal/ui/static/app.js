@@ -245,6 +245,8 @@ async function projectPage(path) {
 
   const events = h("div", {});
   api("GET", "/events?project=" + enc(path)).then((evs) => events.replaceChildren(eventTable(evs.slice(0, 15)))).catch(() => {});
+  const snapshots = h("div", {}, h("p", { class: "muted small" }, "Loading…"));
+  loadSnapshots(path, snapshots);
 
   page(path, [p.commit ? "Applied " + short(p.commit, 8) + " " + ago(p.applied_at) : "Never applied", p.disabled ? " · disabled" : ""],
     p.error ? h("pre", { class: "error" }, p.error) : null,
@@ -252,8 +254,55 @@ async function projectPage(path) {
     h("div", { class: "row" }, h("a", { class: "btn", href: "#/logs/" + enc(path) }, "All logs"), h("a", { class: "btn", href: "#/files?dir=" + enc(path) }, "Files"), h("span", { class: "spacer" }), toggle),
     h("h2", {}, "Services"), h("div", { class: "panel" }, services),
     h("h2", {}, "Environment"), h("div", { class: "panel pad" }, envTable, h("div", { style: "margin-top:12px" }, envForm)),
+    h("h2", {}, "Data & snapshots"), snapshots,
     h("h2", {}, "Recent events"), events,
   );
+}
+
+// ---- snapshots: btrfs copies of a project's data; taken before every deploy, restorable
+
+async function loadSnapshots(path, box) {
+  let res;
+  try { res = await api("GET", "/snapshots?project=" + enc(path)); } catch (e) { return box.replaceChildren(h("p", { class: "error" }, e.message)); }
+  const d = res.data;
+  const reload = () => loadSnapshots(path, box);
+  const out = h("pre", { hidden: true });
+  const note = h("input", { placeholder: "note (optional)" });
+  const take = h("form", { class: "inline", onsubmit: async (e) => {
+    e.preventDefault();
+    try {
+      const r = await api("POST", "/snapshots", { project: path, note: note.value });
+      toast("Snapshot #" + r.snapshot.id + " taken");
+      reload();
+    } catch (x) { toast(x.message); }
+  } }, note, h("button", { class: "primary", disabled: !d.supported || !d.protected.length }, "Snapshot now"));
+  const restore = (s) => {
+    if (!confirm(`Restore ${path} to snapshot #${s.id}?\n\nIts containers stop while the data is restored. The current data is snapshotted first, so you can undo this.\nCode is not rolled back.`)) return;
+    out.hidden = false;
+    out.textContent = "";
+    stream("/rollback", out, { method: "POST", body: JSON.stringify({ project: path, id: s.id }), done: reload });
+  };
+  box.replaceChildren(h("div", { class: "panel pad" },
+    d.supported
+      ? h("p", { class: "small" }, d.protected.length ? ["Protected: ", h("span", { class: "mono" }, d.protected.join(", "))] : h("span", { class: "muted" }, "No volumes or data dirs to protect."))
+      : h("p", { class: "small muted" }, "Snapshots unavailable: " + d.reason),
+    d.unprotected && d.unprotected.length ? h("p", { class: "small tag warn" }, "Not covered (not btrfs subvolumes): " + d.unprotected.join(", ")) : null,
+    res.snapshots.length ? h("table", {},
+      h("tr", {}, h("th", {}, "#"), h("th", {}, "Kind"), h("th", {}, "Taken"), h("th", {}, "Commit"), h("th", {}, "Note"), h("th", {})),
+      res.snapshots.map((s) => h("tr", {},
+        h("td", { class: "mono" }, s.id),
+        h("td", {}, h("span", { class: "tag" }, s.reason)),
+        h("td", { class: "muted", title: new Date(s.created_at * 1000).toLocaleString() }, ago(s.created_at)),
+        h("td", { class: "mono small" }, short(s.commit, 8)),
+        h("td", { class: "small" }, s.note),
+        h("td", {}, h("div", { class: "row", style: "justify-content:end" },
+          h("button", { onclick: () => restore(s) }, "Restore"),
+          h("button", { class: "danger", onclick: async () => {
+            if (!confirm("Delete snapshot #" + s.id + "?")) return;
+            try { await api("DELETE", "/snapshots?id=" + s.id); reload(); } catch (x) { toast(x.message); }
+          } }, "Delete")))))) : h("p", { class: "muted small" }, "No snapshots yet. One is taken automatically before every deploy that changes this project."),
+    h("div", { style: "margin-top:12px" }, take),
+    out));
 }
 
 // ---- logs
@@ -392,7 +441,17 @@ function eventTable(evs) {
 }
 
 async function eventsPage() {
-  try { page("Events", "Deploys, config changes, pushes and logins.", eventTable(await api("GET", "/events"))); } catch (e) { failed(e); }
+  try {
+    const [evs, audit] = await Promise.all([api("GET", "/events"), api("GET", "/audit?n=200")]);
+    page("Events", "Deploys, config changes, pushes and logins.", eventTable(evs),
+      h("h2", {}, "Audit log"), h("p", { class: "muted small" }, "Every write to the host's database, recorded by sqlite triggers. Secrets are never recorded."),
+      audit.length ? h("div", { class: "panel" }, h("table", {}, audit.map((a) => h("tr", {},
+        h("td", { class: "muted small", title: new Date(a.at * 1000).toLocaleString() }, ago(a.at)),
+        h("td", { class: "mono small" }, a.tbl),
+        h("td", {}, h("span", { class: "tag" }, a.op)),
+        h("td", { class: "mono small" }, a.key),
+        h("td", { class: "small" }, a.detail))))) : h("p", { class: "muted" }, "Empty."));
+  } catch (e) { failed(e); }
 }
 
 // ---- router
