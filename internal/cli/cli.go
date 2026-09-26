@@ -39,7 +39,7 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   restart <project> [service]
   enable|disable <project>
   env ls|set|rm <project> [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given)
-  user ls | add <name> [--pattern re] [--repo r]... | rm <name> | token <name>
+  user ls | add <name> [--pattern re] [--repo r]... [--token-stdin] | rm <name> | token <name>
   registry ls [repo] | rm <repo:tag> | gc
   snapshot ls [project] | create <project> [-m note] | rm <id>
   rollback <project> [snapshot-id] [-y]   put a snapshot's data back (undoable)

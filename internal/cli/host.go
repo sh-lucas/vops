@@ -66,6 +66,7 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	var repos multi
 	fs.Var(&repos, "repo", "")
 	fromStdin := fs.Bool("stdin", false, "")
+	tokenStdin := fs.Bool("token-stdin", false, "")
 	note := fs.String("m", "", "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
@@ -247,6 +248,15 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 				return err
 			}
 			body := map[string]any{"name": name, "pattern": *pattern, "repos": []string(repos), "new_token": sub == "token"}
+			chosen := ""
+			if *tokenStdin {
+				b, err := io.ReadAll(stdin)
+				if err != nil {
+					return err
+				}
+				chosen = strings.TrimRight(string(b), "\r\n")
+				body["token"] = chosen
+			}
 			if sub == "token" {
 				var users []store.User
 				getJSON(c, "/api/users", &users)
@@ -268,6 +278,10 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			}
 			if res.Token == "" {
 				fmt.Fprintf(out, "updated %s (token unchanged)\n", name)
+				return nil
+			}
+			if chosen != "" {
+				fmt.Fprintf(out, "user %s saved with the token you gave\n", name)
 				return nil
 			}
 			fmt.Fprintf(out, "user:  %s\ntoken: %s\n\nshown once. log in with:\n  podman login -u %s registry.<your domain>\n", name, res.Token, name)

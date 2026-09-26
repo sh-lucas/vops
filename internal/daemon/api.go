@@ -210,6 +210,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Pattern  string   `json:"pattern"`
 			Repos    []string `json:"repos"`
 			NewToken bool     `json:"new_token"`
+			Token    string   `json:"token"` // optional: keep an existing password (migrations); generated otherwise
 		}
 		if err := readJSON(r, &in); err != nil {
 			return err
@@ -236,6 +237,12 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		token := ""
 		if !exists || in.NewToken {
 			token = store.Token()
+		}
+		if in.Token != "" {
+			if len(in.Token) < 12 {
+				return errors.New("a chosen token needs at least 12 characters")
+			}
+			token = in.Token
 		}
 		if err := d.DB.PutUser(store.User{Name: in.Name, Pattern: in.Pattern, Repos: repos}, token); err != nil {
 			return err

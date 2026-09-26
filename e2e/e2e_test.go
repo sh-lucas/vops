@@ -271,6 +271,13 @@ func TestEndToEnd(t *testing.T) {
 	if err := push("nope", "admin:"+adminPW); err == nil {
 		t.Fatal("admin must not push")
 	}
+	// migrating from another registry: keep the password CI already has
+	if out, err := w.try(dev, "legacy-password-123\n", "user", "add", "legacy", "--pattern", "shop/.*", "--token-stdin"); err != nil || strings.Contains(out, "legacy-password-123") {
+		t.Fatalf("token-stdin: %v\n%s", err, out)
+	}
+	if err := push("pushed-1", "legacy:legacy-password-123"); err != nil {
+		t.Fatal("chosen token rejected:", err)
+	}
 	w.write(dev, map[string]string{"api/compose.yml": "services:\n  api:\n    image: UI/shop/api:v1\n    x-vops: {port: 8080}\n"})
 	w.vops(dev, "sync", "--yes")
 	if code, body := w.get("api.vops.test"); code != 200 || body != "pushed-1" {
