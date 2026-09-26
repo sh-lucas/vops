@@ -96,7 +96,7 @@ func cmdSetup(args []string) error {
 		warn("podman uses the %q network backend: containers can't resolve each other by name. switch to netavark (containers.conf: network_backend = \"netavark\", then podman system reset)", b)
 	}
 	if fsType, _ := output(home, "stat", "-f", "-c", "%T", repo); fsType != "btrfs" {
-		warn("filesystem is %s: snapshots and rollback need btrfs (everything else works)", fsType)
+		warn("%s is not on btrfs: snapshots and rollback are off (everything else works)", repo)
 	} else if _, err := exec.LookPath("btrfs"); err != nil {
 		warn("btrfs-progs is missing: install it for snapshots and rollback")
 	} else {

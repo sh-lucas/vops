@@ -5,7 +5,7 @@ vops is a cli and a daemon to self-host containers with less pain and overhead t
 
 ## State, development, lifecycle
 
-**v0.1, first usable version.** Everything below "Features" works and is covered by end-to-end tests against real podman (rootless), plus a production-like check (`just vps-test`: a container with systemd, a real sshd and podman as the "VPS", install over real ssh as root, git+ssh sync, daemon restarts, rolling release under load with 0 failed requests). Not yet run on a real cloud VPS with real DNS and Let's Encrypt; that is the last step before calling it production ready.
+**v0.3, in production on one real server.** Everything below "Features" is covered by end-to-end tests against real podman (rootless) and by a production-like check (`just vps-test`: systemd + real sshd + podman in a container, rolling release under load with 0 failed requests). It also runs a real VPS (Ubuntu 24.04, ext4, rootless as a normal user with linger, real DNS and Let's Encrypt), migrated from docker compose + caddy + registry:2 + watchtower with about 1m20s of downtime: [reference/migrating.md](reference/migrating.md).
 
 - Runtime deps on the host: linux, systemd, podman 4+ (netavark), git. btrfs (+ btrfs-progs) for snapshots and rollback; everything else works without it.
 - The daemon idles at ~16MB RSS. The binary is static, ~13MB.

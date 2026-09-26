@@ -36,7 +36,9 @@ Phase 1 is done: data lives on btrfs subvolumes, snapshots before every deploy, 
 
 ## Other
 
-- validate on a real cloud VPS (real dns + let's encrypt, a non-root user with linger), then tag v0.2. root + real sshd + systemd is covered by `just vps-test`.
+- conmon (podman's per-container monitor) runs inside `vops.service`'s cgroup: harmless with `KillMode=process`, but systemd attributes image-pull page cache to the service. Run podman through `systemd-run --user --scope` (or set conmon's cgroup) so each container is fully outside the daemon.
+- test a real reboot of a production host (linger + `StartStopped` should bring everything back; not exercised yet).
+- migration helper: `vops migrate-db` for the dump/restore/verify dance in reference/migrating.md (postgres, mysql).
 - re-pull third-party tags (`postgres:16`) on demand from the dashboard ("update images").
 - prebuilt release binaries (amd64/arm64) so install and CI don't need go.
 - per-container metrics (podman stats) in the dashboard.
