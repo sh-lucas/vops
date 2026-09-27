@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json/v2"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // Bin is the podman executable; VOPS_PODMAN overrides it (tests use a wrapper with an isolated storage).
@@ -27,17 +30,40 @@ func Run(ctx context.Context, args ...string) (string, error) {
 
 // RunIn is Run with stdin.
 func RunIn(ctx context.Context, stdin io.Reader, args ...string) (string, error) {
+	limit := Timeout(args)
+	ctx, cancel := context.WithTimeout(ctx, limit)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, Bin(), args...)
+	cmd.WaitDelay = 5 * time.Second // a child (conmon) holding the pipes open must not hang us either
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr, cmd.Stdin = &out, &errb, stdin
 	if err := cmd.Run(); err != nil {
 		msg := strings.TrimSpace(errb.String())
-		if msg == "" {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			msg = fmt.Sprintf("timed out after %s (podman hung?) %s", limit, msg)
+		} else if msg == "" {
 			msg = err.Error()
 		}
 		return "", fmt.Errorf("podman %s: %s", first(args), msg)
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// Timeout bounds a podman call, so a hung podman (storage lock, dead mount) can't hold the deploy lock forever.
+// pull/build get 30m; stop/rm/restart get their -t grace period on top of 2m.
+func Timeout(args []string) time.Duration {
+	if len(args) > 0 && (args[0] == "pull" || args[0] == "build" || args[0] == "push" || args[0] == "load") {
+		return 30 * time.Minute
+	}
+	d := 2 * time.Minute
+	for i, a := range args[:max(len(args)-1, 0)] {
+		if a == "-t" || a == "--time" {
+			if s, err := strconv.Atoi(args[i+1]); err == nil {
+				d += time.Duration(s) * time.Second
+			}
+		}
+	}
+	return d
 }
 
 func first(args []string) string {

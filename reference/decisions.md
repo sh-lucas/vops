@@ -70,6 +70,9 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 ## Logs
 
 - Containers use podman's `journald` log driver with tag `vops.<project>.<service>`. journald already does aggregation, rotation, compression, indexing and history across replicas. Reading = `journalctl`, falling back to `podman logs`.
+- Search is `journalctl --grep` (PCRE2 builds; the text is regex-escaped, case-insensitive): it reads backwards until n matches, so it covers the whole history without loading it. Without PCRE2, go filters the last 20k lines.
+- Paging: every response carries `X-Vops-Before`, the journald cursor of its oldest line; `?before=<cursor>` returns the n lines before it (`journalctl -r --after-cursor`). The dashboard loads them when scrolled to the top. No header = start of logs. Following = read history to the end, then `-f --after-cursor=<newest>` (no gap, no "silence means caught up" guess).
+- The dashboard keeps at most 5000 lines while following; older ones are dropped (Reload to browse history again), so a tab left open doesn't grow forever.
 - DuckDB/parquet was proposed; rejected for now: it needs cgo and a ~30MB library, which breaks "static binary, few resources". Revisit if searching logs across months becomes a real need.
 
 ## Web UI
@@ -130,6 +133,8 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Dashboard logins are serialized and a failed attempt costs 1s (plus pbkdf2 600k): slow for brute force, no lockout to abuse.
 - Registry basic-auth results are cached for 5 minutes (pbkdf2 per blob request would be slow); changing users or the admin password clears the cache.
 - HTTPS listens even before a domain exists (the domain arrives with the first sync); until then port 80 serves plain http.
+- Every `podman.Run` has a timeout (2m + the `-t` grace period; 30m for pull/build): a hung podman (storage lock, dead mount) would otherwise hold the deploy lock forever and block every apply and restart. Log streams are exempt.
+- The daemon crashing doesn't touch containers (`KillMode=process`, systemd restarts it in 2s, routes are rebuilt from labels), but the proxy lives in it: sites are down for those seconds.
 - Tests share one isolated podman storage (`~/.cache/vops-test`) guarded by a file lock, so `go test ./...` runs packages in parallel safely.
 - The daemon idles at ~16MB RSS.
 - The systemd unit sets `HOME` explicitly (system units have none) and `StartLimitIntervalSec=0` (never give up restarting). `setup` waits 2s before trusting `is-active`.

@@ -101,7 +101,7 @@ git add -A && git commit -m site && vops sync
 - Tree of projects/services/containers, pending changes + apply, logs (live, filter), restart, enable/disable, env vars, registry images and users, git-tracked files (text only), events.
 
 ### Logs
-- Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts.
+- Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts; search covers all of it, and the dashboard loads older lines as you scroll up.
 
 ## Limitations
 

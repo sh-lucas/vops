@@ -147,7 +147,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	h("GET /api/logs", func(w http.ResponseWriter, r *http.Request) error {
 		q := r.URL.Query()
 		n, _ := strconv.Atoi(q.Get("n"))
-		return d.logs(r.Context(), w, q.Get("project"), q.Get("service"), n, q.Get("follow") == "1", q.Get("grep"))
+		return d.logs(r.Context(), w, q.Get("project"), q.Get("service"), logQuery{N: n, Follow: q.Get("follow") == "1", Grep: q.Get("grep"), Before: q.Get("before")})
 	})
 
 	h("GET /api/events", func(w http.ResponseWriter, r *http.Request) error {

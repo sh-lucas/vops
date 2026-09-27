@@ -51,6 +51,7 @@ function stream(path, pre, opts = {}) {
     try {
       const res = await fetch("/api" + path, { method: opts.method || "GET", headers: { "X-Vops": "1", "Content-Type": "application/json" }, body: opts.body, signal: ctl.signal });
       if (!res.ok) { pre.append(await res.text()); return; }
+      opts.response && opts.response(res);
       const reader = res.body.getReader();
       const dec = new TextDecoder();
       for (;;) {
@@ -58,7 +59,10 @@ function stream(path, pre, opts = {}) {
         if (done) break;
         const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
         pre.append(dec.decode(value, { stream: true }));
-        if (stick) pre.scrollTop = pre.scrollHeight;
+        if (stick) {
+          opts.stuck && opts.stuck();
+          pre.scrollTop = pre.scrollHeight;
+        }
       }
       opts.done && opts.done();
     } catch (e) {
@@ -67,6 +71,9 @@ function stream(path, pre, opts = {}) {
   })();
   return () => ctl.abort();
 }
+
+// "repo@sha256:<64 hex>" → "repo@sha256:<12 hex>…" (the full ref goes in the title)
+const shortImage = (ref) => ref.replace(/@sha256:([0-9a-f]{12})[0-9a-f]+/, "@sha256:$1…");
 
 const ago = (unix) => {
   if (!unix) return "never";
@@ -213,9 +220,9 @@ async function projectPage(path) {
     p.services.map((s) => h("tr", {},
       h("td", {}, h("div", { class: "mono" }, s.name), s.domains.map((d) => h("div", { class: "small" }, h("a", { href: (st.domain ? "https://" : "http://") + d, target: "_blank", rel: "noopener" }, d))),
         s.pending ? h("span", { class: "tag warn" }, "pending " + s.pending + (s.reason ? ": " + s.reason : "")) : null),
-      h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "row small" }, h("span", { class: "dot " + stateOf(c) }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
-      h("td", { class: "mono small" }, s.image),
-      h("td", {}, h("div", { class: "row" },
+      h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "ctr small" }, h("span", { class: "dot " + stateOf(c) }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
+      h("td", { class: "mono small wrap", title: s.image }, shortImage(s.image)),
+      h("td", { class: "actions" }, h("div", { class: "row" },
         h("a", { class: "btn", href: "#/logs/" + enc(path) + "?service=" + enc(s.name) }, "Logs"),
         s.containers.length ? h("button", { onclick: async (e) => {
           e.target.disabled = true;
@@ -252,7 +259,7 @@ async function projectPage(path) {
     p.error ? h("pre", { class: "error" }, p.error) : null,
     planBanner(st, reload),
     h("div", { class: "row" }, h("a", { class: "btn", href: "#/logs/" + enc(path) }, "All logs"), h("a", { class: "btn", href: "#/files?dir=" + enc(path) }, "Files"), h("span", { class: "spacer" }), toggle),
-    h("h2", {}, "Services"), h("div", { class: "panel" }, services),
+    h("h2", {}, "Services"), h("div", { class: "panel scroll" }, services),
     h("h2", {}, "Environment"), h("div", { class: "panel pad" }, envTable, h("div", { style: "margin-top:12px" }, envForm)),
     h("h2", {}, "Data & snapshots"), snapshots,
     h("h2", {}, "Recent events"), events,
@@ -307,22 +314,68 @@ async function loadSnapshots(path, box) {
 
 // ---- logs
 
+// Lines stream at the bottom; scrolling to the top loads older ones (X-Vops-Before is the journald cursor to continue from).
+// While following, the view keeps the last maxLines lines so a tab left open doesn't grow forever.
 function logsPage(path, service) {
+  const maxLines = 5000;
   const pre = h("pre", { class: "logs" });
-  const grep = h("input", { placeholder: "filter", value: "" });
+  const grep = h("input", { placeholder: "search all history", value: "" });
   const follow = h("input", { type: "checkbox", checked: true });
-  let cancel = () => {};
+  const status = h("span", { class: "muted small" });
+  const more = h("button", { type: "button", class: "ghost", hidden: true, onclick: () => older() }, "Load older");
+  let cancel = () => {}, before = null, loading = false, gen = 0;
+  const query = (extra) => "/logs?" + new URLSearchParams({ project: path, service: service || "", n: "500", grep: grep.value, ...extra });
+  const setBefore = (c) => {
+    before = c;
+    more.hidden = !c;
+    status.textContent = c ? "" : "start of logs";
+  };
+  const trim = () => {
+    if (pre.childNodes.length < 50) return; // one text node per chunk: check every ~50 chunks, not on each
+    pre.normalize();
+    const lines = pre.textContent.split("\n");
+    if (lines.length <= maxLines) return;
+    pre.textContent = lines.slice(-maxLines).join("\n");
+    setBefore(null);
+    status.textContent = "older lines dropped while following; Reload to browse history";
+  };
+  const older = async () => {
+    if (!before || loading) return;
+    loading = true;
+    const g = gen;
+    status.textContent = "loading…";
+    try {
+      const res = await fetch("/api" + query({ before }));
+      const text = await res.text();
+      if (g !== gen) return;
+      if (!res.ok) { status.textContent = text; return; }
+      const h0 = pre.scrollHeight;
+      pre.prepend(text);
+      pre.scrollTop += pre.scrollHeight - h0;
+      setBefore(res.headers.get("X-Vops-Before"));
+    } catch (e) {
+      status.textContent = e.message;
+    } finally {
+      loading = false;
+    }
+  };
+  pre.addEventListener("scroll", () => { if (pre.scrollTop < 80) older(); });
   const start = () => {
     cancel();
+    gen++;
     pre.textContent = "";
-    const q = new URLSearchParams({ project: path, service: service || "", n: "500", grep: grep.value });
-    if (follow.checked) q.set("follow", "1");
-    cancel = stream("/logs?" + q, pre);
+    setBefore(null);
+    status.textContent = "";
+    const q = follow.checked ? { follow: "1" } : {};
+    cancel = stream(query(q), pre, {
+      response: (res) => setBefore(res.headers.get("X-Vops-Before")),
+      stuck: trim,
+    });
   };
   stopCurrent = () => cancel();
   page("Logs", [h("a", { href: "#/p/" + enc(path) }, path), service ? " / " + service : ""],
     h("form", { class: "inline", onsubmit: (e) => { e.preventDefault(); start(); } },
-      grep, h("label", { class: "row" }, follow, "follow"), h("button", {}, "Reload")),
+      grep, h("label", { class: "row" }, follow, "follow"), h("button", {}, "Reload"), more, status),
     pre);
   start();
 }

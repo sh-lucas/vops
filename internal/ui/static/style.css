@@ -45,6 +45,14 @@ table { width: 100%; border-collapse: collapse; }
 th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12px; }
 th, td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
 tr:last-child td { border-bottom: 0; }
+.scroll { overflow-x: auto; }
+td.wrap { overflow-wrap: anywhere; min-width: 16ch; }
+.ctr { display: grid; grid-template-columns: 8px auto; column-gap: 8px; align-items: center; }
+.ctr + .ctr { margin-top: 6px; }
+.ctr .mono { white-space: nowrap; }
+.ctr .muted { grid-column: 2; }
+td.actions { width: 1%; }
+td.actions .row { flex-wrap: nowrap; justify-content: flex-end; }
 .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--idle); flex: none; }
 .dot.running { background: var(--ok); }
 .dot.done { background: var(--ok); opacity: .45; }

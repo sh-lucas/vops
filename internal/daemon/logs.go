@@ -9,8 +9,11 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"regexp"
+	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sh-lucas/vops/internal/compose"
@@ -18,14 +21,22 @@ import (
 	"github.com/sh-lucas/vops/internal/podman"
 )
 
+// logQuery is what /api/logs takes.
+type logQuery struct {
+	N      int
+	Follow bool
+	Grep   string
+	Before string // journald cursor: the n lines older than it (no follow); X-Vops-Before carries the next one
+}
+
 // logs streams container logs from journald (history across replicas), or podman logs as a fallback.
 // Lines look like "2006-01-02 15:04:05 service | message".
-func (d *Daemon) logs(ctx context.Context, w http.ResponseWriter, project, service string, n int, follow bool, grep string) error {
+func (d *Daemon) logs(ctx context.Context, w http.ResponseWriter, project, service string, q logQuery) error {
 	if project == "" {
 		return fmt.Errorf("project is required")
 	}
-	if n <= 0 || n > 10000 {
-		n = 200
+	if q.N <= 0 || q.N > 10000 {
+		q.N = 200
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -49,16 +60,25 @@ func (d *Daemon) logs(ctx context.Context, w http.ResponseWriter, project, servi
 			return nil
 		}
 	}
-	fw := flushWriter{w}
-	if ok := d.journal(ctx, fw, project, services, n, follow, grep); ok {
-		return nil
+	if ok, err := d.journal(ctx, w, project, services, q); ok || err != nil {
+		return err
 	}
-	return podmanLogs(ctx, fw, project, service, n, follow, grep)
+	if q.Before != "" {
+		return nil // podman logs has no cursors: nothing older
+	}
+	return podmanLogs(ctx, flushWriter{w}, project, service, q.N, q.Follow, q.Grep)
 }
 
-func (d *Daemon) journal(ctx context.Context, w io.Writer, project string, services []string, n int, follow bool, grep string) bool {
+var journalGrep = sync.OnceValue(func() bool {
+	out, _ := exec.Command("journalctl", "--version").Output()
+	return strings.Contains(string(out), "+PCRE2")
+})
+
+// journal reads the last n lines (older than q.Before when set), then follows from where they ended.
+// It returns false when journald has nothing for these services, so podman logs is used instead.
+func (d *Daemon) journal(ctx context.Context, w http.ResponseWriter, project string, services []string, q logQuery) (bool, error) {
 	if _, err := exec.LookPath("journalctl"); err != nil {
-		return false
+		return false, nil
 	}
 	var matches []string
 	for _, s := range services {
@@ -79,78 +99,107 @@ func (d *Daemon) journal(ctx context.Context, w io.Writer, project string, servi
 	}
 	if !user {
 		if out, _ := exec.CommandContext(ctx, "journalctl", args(false, "-n", "1")...).Output(); len(out) == 0 {
-			return false
+			return false, nil
 		}
 	}
-	window := n
-	if grep != "" {
-		window = 20000 // filter in go over a bigger window
-	}
-	extra := []string{"-n", strconv.Itoa(window)}
-	if follow {
-		extra = append(extra, "-f")
-	}
-	cmd := exec.CommandContext(ctx, "journalctl", args(user, extra...)...)
-	out, err := cmd.StdoutPipe()
-	if err != nil || cmd.Start() != nil {
-		return false
-	}
-	defer cmd.Wait()
-	sc := bufio.NewScanner(out)
-	sc.Buffer(make([]byte, 64<<10), 4<<20)
-	// until journalctl caught up (history), keep only the last n matches; then stream
-	var hist []string
-	streaming := false
-	flush := func() {
-		if len(hist) > n {
-			hist = hist[len(hist)-n:]
-		}
-		for _, l := range hist {
-			fmt.Fprintln(w, l)
-		}
-		hist, streaming = nil, true
-	}
-	lines := make(chan string)
-	go func() {
-		defer close(lines)
-		for sc.Scan() {
-			if line, ok := journalLine(sc.Bytes(), grep); ok {
-				lines <- line
-			} else {
-				lines <- ""
-			}
-		}
-	}()
-	for {
-		select {
-		case line, ok := <-lines:
-			if !ok {
-				flush()
-				return true
-			}
-			if line == "" {
-				continue
-			}
-			if streaming {
-				fmt.Fprintln(w, line)
-			} else {
-				hist = append(hist, line)
-			}
-		case <-time.After(300 * time.Millisecond):
-			if !streaming {
-				flush()
-			}
-		case <-ctx.Done():
-			return true
+	filter, window := q.Grep, q.N
+	var grep []string
+	if q.Grep != "" {
+		if journalGrep() {
+			// journalctl reads backwards until n matches, so the search covers the whole history
+			grep, filter = []string{"--case-sensitive=false", "--grep=" + regexp.QuoteMeta(q.Grep)}, ""
+		} else {
+			window = 20000 // no PCRE2: filter in go over a bigger window
 		}
 	}
+	// newest first, always: --grep with -n reverses on its own, and "after" a cursor in reverse means older
+	hist := append([]string{"-r", "-n", strconv.Itoa(window)}, grep...)
+	if q.Before != "" {
+		hist = append(hist, "--after-cursor="+q.Before)
+	}
+	var all []jline
+	if err := journalRead(ctx, args(user, hist...), filter, func(l jline) { all = append(all, l) }); err != nil {
+		return true, err
+	}
+	slices.Reverse(all)
+	var shown []jline
+	for _, l := range all {
+		if l.match {
+			shown = append(shown, l)
+		}
+	}
+	// a full window means there may be older lines: tell the client where to continue
+	before := ""
+	if len(shown) > q.N {
+		shown = shown[len(shown)-q.N:]
+		before = shown[0].cursor
+	} else if len(all) == window {
+		before = all[0].cursor
+	}
+	if before != "" {
+		w.Header().Set("X-Vops-Before", before)
+	}
+	fw := flushWriter{w}
+	for _, l := range shown {
+		fmt.Fprintln(fw, l.text)
+	}
+	if !q.Follow || q.Before != "" {
+		return true, nil
+	}
+	http.NewResponseController(w).Flush() // send the headers even when there is no history yet
+	follow := append([]string{"-f"}, grep...)
+	if len(all) > 0 {
+		follow = append(follow, "--after-cursor="+all[len(all)-1].cursor)
+	} else {
+		follow = append(follow, "-n", "0")
+	}
+	journalRead(ctx, args(user, follow...), filter, func(l jline) {
+		if l.match {
+			fmt.Fprintln(fw, l.text)
+		}
+	})
+	return true, nil
 }
 
-func journalLine(raw []byte, grep string) (string, bool) {
+type jline struct {
+	text, cursor string
+	match        bool
+}
+
+// journalRead runs journalctl -o json and calls each for every entry, until it exits or ctx is done.
+func journalRead(ctx context.Context, args []string, grep string, each func(jline)) error {
+	cmd := exec.CommandContext(ctx, "journalctl", args...)
+	var errb strings.Builder
+	cmd.Stderr = &errb
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	sc := bufio.NewScanner(out)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	for sc.Scan() {
+		if l, ok := journalLine(sc.Bytes(), grep); ok {
+			each(l)
+		}
+	}
+	if err := cmd.Wait(); err != nil && ctx.Err() == nil {
+		// --grep exits 1 when nothing matches, with nothing on stderr
+		if msg := strings.TrimSpace(errb.String()); msg != "" {
+			return fmt.Errorf("journalctl: %s", msg)
+		}
+	}
+	return nil
+}
+
+func journalLine(raw []byte, grep string) (jline, bool) {
 	var e map[string]any
 	if json.Unmarshal(raw, &e) != nil {
-		return "", false
+		return jline{}, false
 	}
+	l := jline{cursor: fmt.Sprint(e["__CURSOR"])}
 	msg := ""
 	switch m := e["MESSAGE"].(type) {
 	case string:
@@ -166,14 +215,14 @@ func journalLine(raw []byte, grep string) (string, bool) {
 	}
 	msg = strings.TrimRight(msg, "\n")
 	if grep != "" && !strings.Contains(strings.ToLower(msg), strings.ToLower(grep)) {
-		return "", false
+		return l, true
 	}
 	ts := ""
 	if us, err := strconv.ParseInt(fmt.Sprint(e["__REALTIME_TIMESTAMP"]), 10, 64); err == nil {
 		ts = time.UnixMicro(us).Format("2006-01-02 15:04:05")
 	}
-	name := fmt.Sprint(e["CONTAINER_NAME"])
-	return ts + " " + name + " | " + msg, true
+	l.text, l.match = ts+" "+fmt.Sprint(e["CONTAINER_NAME"])+" | "+msg, true
+	return l, true
 }
 
 func podmanLogs(ctx context.Context, w io.Writer, project, service string, n int, follow bool, grep string) error {
