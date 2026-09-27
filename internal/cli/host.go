@@ -19,6 +19,26 @@ import (
 	"github.com/sh-lucas/vops/internal/store"
 )
 
+// parseLogTime accepts 2006-01-02, "2006-01-02 15:04", RFC3339, or a duration like "2h" (meaning now minus it).
+// Dates without a zone are read in local time. Empty input means unset.
+func parseLogTime(s string) (int64, error) {
+	if s == "" {
+		return 0, nil
+	}
+	if d, err := time.ParseDuration(s); err == nil {
+		return time.Now().Add(-d).Unix(), nil
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t.Unix(), nil
+	}
+	for _, layout := range []string{"2006-01-02 15:04", "2006-01-02"} {
+		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return t.Unix(), nil
+		}
+	}
+	return 0, fmt.Errorf("invalid time %q: want 2006-01-02, \"2006-01-02 15:04\", RFC3339, or a duration like 2h", s)
+}
+
 func jsonBody(v any) io.Reader {
 	b, _ := json.Marshal(v)
 	return bytes.NewReader(b)
@@ -63,6 +83,8 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	follow := fs.Bool("f", false, "")
 	n := fs.Int("n", 200, "")
 	grep := fs.String("grep", "", "")
+	since := fs.String("since", "", "")
+	until := fs.String("until", "", "")
 	pattern := fs.String("pattern", "", "")
 	var repos multi
 	fs.Var(&repos, "repo", "")
@@ -128,9 +150,23 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			return err
 		}
 		service, _ := arg(1, "")
+		sinceU, err := parseLogTime(*since)
+		if err != nil {
+			return err
+		}
+		untilU, err := parseLogTime(*until)
+		if err != nil {
+			return err
+		}
 		q := url.Values{"project": {project}, "service": {service}, "n": {fmt.Sprint(*n)}, "grep": {*grep}}
 		if *follow {
 			q.Set("follow", "1")
+		}
+		if sinceU != 0 {
+			q.Set("since", fmt.Sprint(sinceU))
+		}
+		if untilU != 0 {
+			q.Set("until", fmt.Sprint(untilU))
 		}
 		resp, err := c.do("GET", "/api/logs?"+q.Encode(), nil)
 		if err != nil {

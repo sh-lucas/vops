@@ -35,7 +35,7 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   status                             projects, services, containers
   plan                               what apply would do
   apply [-y] [project...]            make the host match git
-  logs <project> [service] [-f] [-n N] [--grep s]
+  logs <project> [service] [-f] [-n N] [--grep s] [--since t] [--until t]
   restart <project> [service]
   enable|disable <project>
   env ls|set|rm <project> [--preview] [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given;

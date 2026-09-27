@@ -75,11 +75,19 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Search is `journalctl --grep` (PCRE2 builds; the text is regex-escaped, case-insensitive): it reads backwards until n matches, so it covers the whole history without loading it. Without PCRE2, go filters the last 20k lines.
 - Paging: every response carries `X-Vops-Before`, the journald cursor of its oldest line; `?before=<cursor>` returns the n lines before it (`journalctl -r --after-cursor`). The dashboard loads them when scrolled to the top. No header = start of logs. Following = read history to the end, then `-f --after-cursor=<newest>` (no gap, no "silence means caught up" guess).
 - The dashboard keeps at most 5000 lines while following; older ones are dropped (Reload to browse history again), so a tab left open doesn't grow forever.
+- The dashboard filters by time with `since`/`until` (unix seconds; a set "to" means a closed range, so no follow), shows the available range from `X-Vops-First`/`X-Vops-Last` next to the range loaded, and downloads what is in view as `<project>[-<service>]-YYYYMMDD-HHMM.txt`.
+- Date filter: `?since`/`?until` (unix seconds) map straight to `journalctl --since=@n`/`--until=@n`; `until` closes the range so follow is skipped. `X-Vops-First`/`X-Vops-Last` (unix seconds, set only on the first page) give the whole journal's range for these services regardless of grep/since/until, so the UI can show "logs available from X to Y".
+- Lines carry the host's local time as text (the cli runs on the host); `X-Vops-Offset` (host UTC offset, seconds) lets the dashboard rewrite them to the browser's zone, the same zone as its from/to inputs.
 - DuckDB/parquet was proposed; rejected for now: it needs cgo and a ~30MB library, which breaks "static binary, few resources". Revisit if searching logs across months becomes a real need.
 
 ## Web UI
 
 - Plain HTML + CSS + vanilla JS, embedded with `embed`. It uses the same JSON API as the socket.
+- Still no build step, no libraries, no external fonts or CDNs: it works offline. Everything is rendered with `h()` (never `innerHTML`).
+- Layout: fixed sidebar (nav + project tree with a status dot: green running, amber pending/partial, red failing/invalid, grey disabled), a top bar with the host's commit, domain and a "pending changes" badge that opens plan/apply from any page. Below 880px the sidebar is a drawer. Light/dark follow the system.
+- Status is polled every 10s by the shell (sidebar, top bar); pages subscribe instead of polling on their own.
+- Project page = header + tabs (`#/p/<path>/<tab>`: services, logs, env, data, events). A tab is one entry in `TABS` in app.js. Old links (`#/p/<path>`, `#/logs/<path>?service=x`, which is the full-page log view) keep working.
+- Destructive actions ask through an in-page `<dialog>` that states the consequences, not `confirm()`.
 - Served on `ui` listen address (default `127.0.0.1:9984`) and on `vops.<domain>` over HTTPS. The default is loopback because plain HTTP with a password over the internet is bad; `vops ui` opens an ssh tunnel and the browser. Set `ui: ":9984"` in `vops.yml` to expose it.
 - Sessions: random id in an `HttpOnly; SameSite=Strict` cookie, sha256 stored in sqlite. Mutating requests also need the `X-Vops: 1` header (blocks CSRF without tokens).
 - Env values are write-only: the API has no way to read them back.

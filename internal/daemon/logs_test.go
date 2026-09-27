@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os/exec"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -84,5 +85,45 @@ func TestJournalPaging(t *testing.T) {
 	d.journal(ctx, rec, project, []string{"svc"}, logQuery{N: 2, Follow: true})
 	if out := rec.Body.String(); strings.Count(out, "\n") != 3 || !strings.Contains(out, "line 24") || !strings.HasSuffix(out, "| late line\n") {
 		t.Fatalf("follow:\n%s", out)
+	}
+
+	// since/until: bound the window; X-Vops-First/Last describe the whole history regardless of the filter
+	time.Sleep(1100 * time.Millisecond)
+	cut := time.Now().Unix()
+	time.Sleep(1100 * time.Millisecond)
+	postLate := exec.Command("systemd-cat", "-t", "vops."+project+".svc")
+	postLate.Stdin = strings.NewReader("post 00\npost 01\n")
+	if err := postLate.Run(); err != nil {
+		t.Skip("systemd-cat:", err)
+	}
+	var older, newer []string
+	for range 50 {
+		older, _ = get(logQuery{N: 100, Until: cut})
+		newer, _ = get(logQuery{N: 100, Since: cut})
+		if len(older) == 26 && len(newer) == 2 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if strings.Join(older, ",") != strings.Join(lines, ",")+",late line" {
+		t.Fatalf("until %d: %v", cut, older)
+	}
+	if strings.Join(newer, ",") != "post 00,post 01" {
+		t.Fatalf("since %d: %v", cut, newer)
+	}
+
+	rec = httptest.NewRecorder()
+	if _, err := d.journal(context.Background(), rec, project, []string{"svc"}, logQuery{N: 100, Since: cut}); err != nil {
+		t.Fatal(err)
+	}
+	first, last := rec.Header().Get("X-Vops-First"), rec.Header().Get("X-Vops-Last")
+	if first == "" || last == "" {
+		t.Fatalf("first/last headers missing: %q %q", first, last)
+	}
+	if f, _ := strconv.ParseInt(first, 10, 64); f > cut {
+		t.Fatalf("X-Vops-First %s should be before the cut %d (headers ignore since/until)", first, cut)
+	}
+	if l, _ := strconv.ParseInt(last, 10, 64); l < cut {
+		t.Fatalf("X-Vops-Last %s should be at/after the newest line", last)
 	}
 }

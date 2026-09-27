@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json/v2"
 	"fmt"
@@ -27,6 +28,8 @@ type logQuery struct {
 	Follow bool
 	Grep   string
 	Before string // journald cursor: the n lines older than it (no follow); X-Vops-Before carries the next one
+	Since  int64  // unix seconds, 0 means unset
+	Until  int64  // unix seconds, 0 means unset; when set, follow is ignored
 }
 
 // logs streams container logs from journald (history across replicas), or podman logs as a fallback.
@@ -40,6 +43,8 @@ func (d *Daemon) logs(ctx context.Context, w http.ResponseWriter, project, servi
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
+	_, off := time.Now().Zone()
+	w.Header().Set("X-Vops-Offset", strconv.Itoa(off)) // journald lines carry host local time; the dashboard shows browser local time
 	var services []string
 	if service != "" {
 		services = []string{service}
@@ -66,7 +71,7 @@ func (d *Daemon) logs(ctx context.Context, w http.ResponseWriter, project, servi
 	if q.Before != "" {
 		return nil // podman logs has no cursors: nothing older
 	}
-	return podmanLogs(ctx, flushWriter{w}, project, service, q.N, q.Follow, q.Grep)
+	return podmanLogs(ctx, flushWriter{w}, project, service, q)
 }
 
 var journalGrep = sync.OnceValue(func() bool {
@@ -102,6 +107,25 @@ func (d *Daemon) journal(ctx context.Context, w http.ResponseWriter, project str
 			return false, nil
 		}
 	}
+	if q.Before == "" {
+		// whole-journal bounds for these services, ignoring grep/since/until
+		if out, _ := exec.CommandContext(ctx, "journalctl", args(user, "-r", "-n", "1")...).Output(); len(out) > 0 {
+			if ts, ok := journalTimestamp(out); ok {
+				w.Header().Set("X-Vops-Last", strconv.FormatInt(ts, 10))
+			}
+		}
+		if ts, ok := journalOldest(ctx, args(user)); ok {
+			w.Header().Set("X-Vops-First", strconv.FormatInt(ts, 10))
+		}
+	}
+	var since, sinceUntil []string
+	if q.Since != 0 {
+		since = []string{"--since=@" + strconv.FormatInt(q.Since, 10)}
+		sinceUntil = append(sinceUntil, since...)
+	}
+	if q.Until != 0 {
+		sinceUntil = append(sinceUntil, "--until=@"+strconv.FormatInt(q.Until, 10))
+	}
 	filter, window := q.Grep, q.N
 	var grep []string
 	if q.Grep != "" {
@@ -114,6 +138,7 @@ func (d *Daemon) journal(ctx context.Context, w http.ResponseWriter, project str
 	}
 	// newest first, always: --grep with -n reverses on its own, and "after" a cursor in reverse means older
 	hist := append([]string{"-r", "-n", strconv.Itoa(window)}, grep...)
+	hist = append(hist, sinceUntil...)
 	if q.Before != "" {
 		hist = append(hist, "--after-cursor="+q.Before)
 	}
@@ -143,11 +168,12 @@ func (d *Daemon) journal(ctx context.Context, w http.ResponseWriter, project str
 	for _, l := range shown {
 		fmt.Fprintln(fw, l.text)
 	}
-	if !q.Follow || q.Before != "" {
+	if !q.Follow || q.Before != "" || q.Until != 0 {
 		return true, nil
 	}
 	http.NewResponseController(w).Flush() // send the headers even when there is no history yet
 	follow := append([]string{"-f"}, grep...)
+	follow = append(follow, since...)
 	if len(all) > 0 {
 		follow = append(follow, "--after-cursor="+all[len(all)-1].cursor)
 	} else {
@@ -194,6 +220,44 @@ func journalRead(ctx context.Context, args []string, grep string, each func(jlin
 	return nil
 }
 
+// journalTimestamp reads __REALTIME_TIMESTAMP off one "-o json" entry, in unix seconds.
+func journalTimestamp(raw []byte) (int64, bool) {
+	line, _, _ := bytes.Cut(raw, []byte("\n"))
+	var e map[string]any
+	if json.Unmarshal(line, &e) != nil {
+		return 0, false
+	}
+	us, err := strconv.ParseInt(fmt.Sprint(e["__REALTIME_TIMESTAMP"]), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return us / 1_000_000, true
+}
+
+// journalOldest reads the first matching entry forward, then stops journalctl instead of reading the whole journal.
+func journalOldest(ctx context.Context, args []string) (int64, bool) {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "journalctl", args...)
+	out, err := cmd.StdoutPipe()
+	if err != nil {
+		return 0, false
+	}
+	if cmd.Start() != nil {
+		return 0, false
+	}
+	sc := bufio.NewScanner(out)
+	sc.Buffer(make([]byte, 64<<10), 4<<20)
+	var ts int64
+	var ok bool
+	if sc.Scan() {
+		ts, ok = journalTimestamp(sc.Bytes())
+	}
+	cancel()
+	cmd.Wait()
+	return ts, ok
+}
+
 func journalLine(raw []byte, grep string) (jline, bool) {
 	var e map[string]any
 	if json.Unmarshal(raw, &e) != nil {
@@ -225,7 +289,7 @@ func journalLine(raw []byte, grep string) (jline, bool) {
 	return l, true
 }
 
-func podmanLogs(ctx context.Context, w io.Writer, project, service string, n int, follow bool, grep string) error {
+func podmanLogs(ctx context.Context, w io.Writer, project, service string, q logQuery) error {
 	filters := []string{deploy.LProject + "=" + project}
 	if service != "" {
 		filters = append(filters, deploy.LService+"="+service)
@@ -234,9 +298,15 @@ func podmanLogs(ctx context.Context, w io.Writer, project, service string, n int
 	if err != nil {
 		return err
 	}
-	args := []string{"logs", "--names", "--timestamps", "--tail", strconv.Itoa(n)}
-	if follow {
+	args := []string{"logs", "--names", "--timestamps", "--tail", strconv.Itoa(q.N)}
+	if q.Follow && q.Until == 0 {
 		args = append(args, "-f")
+	}
+	if q.Since != 0 {
+		args = append(args, "--since", strconv.FormatInt(q.Since, 10))
+	}
+	if q.Until != 0 {
+		args = append(args, "--until", strconv.FormatInt(q.Until, 10))
 	}
 	for _, c := range cs {
 		args = append(args, c.ID)
@@ -250,7 +320,7 @@ func podmanLogs(ctx context.Context, w io.Writer, project, service string, n int
 	go func() { cmd.Wait(); pw.Close() }()
 	sc := bufio.NewScanner(pr)
 	for sc.Scan() {
-		if grep == "" || strings.Contains(strings.ToLower(sc.Text()), strings.ToLower(grep)) {
+		if q.Grep == "" || strings.Contains(strings.ToLower(sc.Text()), strings.ToLower(q.Grep)) {
 			fmt.Fprintln(w, sc.Text())
 		}
 	}

@@ -105,10 +105,11 @@ git add -A && git commit -m site && vops sync
 
 ### Dashboard
 - `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`.
-- Tree of projects/services/containers, pending changes + apply, logs (live, filter), restart, enable/disable, env vars, registry images and users, git-tracked files (text only), events.
+- Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart), logs (live, search, date range, download), env vars, data snapshots, events. Also registry images and users, git-tracked files (text only), events and audit log. Works on a phone.
 
 ### Logs
 - Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts; search covers all of it, and the dashboard loads older lines as you scroll up.
+- `--since`/`--until` filter by date (`2006-01-02`, `2006-01-02 15:04`, RFC3339, or a duration like `2h` meaning now minus it); the api reports the full available range so the UI knows how far back it can go.
 
 ## Limitations
 
@@ -134,7 +135,7 @@ Know these before putting something important on it:
 ```
 vops init | install user@host | sync [-y] | ui
 vops status | plan | apply [-y] [project...]
-vops logs <project> [service] [-f] [-n N] [--grep s]
+vops logs <project> [service] [-f] [-n N] [--grep s] [--since t] [--until t]
 vops restart <project> [service] | enable <project> | disable <project>
 vops env ls|set|rm <project> [--preview] ...   vops user ls|add|rm|token ...
 vops registry ls|rm|gc                    vops admin password | events | audit | version

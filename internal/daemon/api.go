@@ -147,7 +147,22 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	h("GET /api/logs", func(w http.ResponseWriter, r *http.Request) error {
 		q := r.URL.Query()
 		n, _ := strconv.Atoi(q.Get("n"))
-		return d.logs(r.Context(), w, q.Get("project"), q.Get("service"), logQuery{N: n, Follow: q.Get("follow") == "1", Grep: q.Get("grep"), Before: q.Get("before")})
+		var since, until int64
+		if s := q.Get("since"); s != "" {
+			v, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid since %q: must be unix seconds", s)
+			}
+			since = v
+		}
+		if s := q.Get("until"); s != "" {
+			v, err := strconv.ParseInt(s, 10, 64)
+			if err != nil {
+				return fmt.Errorf("invalid until %q: must be unix seconds", s)
+			}
+			until = v
+		}
+		return d.logs(r.Context(), w, q.Get("project"), q.Get("service"), logQuery{N: n, Follow: q.Get("follow") == "1", Grep: q.Get("grep"), Before: q.Get("before"), Since: since, Until: until})
 	})
 
 	h("GET /api/events", func(w http.ResponseWriter, r *http.Request) error {
