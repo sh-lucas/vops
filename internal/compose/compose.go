@@ -29,6 +29,8 @@ type Project struct {
 	Skipped  []string // services left out of a preview (x-vops.preview.skip)
 	Previews string   // top-level x-vops.previews: registry tags that create previews ("preview-*" when empty, "off")
 	Warnings []string
+	Refs     map[string]bool                // every ${VAR} the files use
+	EnvRefs  map[string]map[string][]string // service -> environment key -> the ${VAR}s its value uses
 }
 
 type Service struct {
@@ -540,7 +542,7 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 		}
 		resolveAliases(doc.Content[0], 0)
 		var warns []string
-		if err := interpolateNode(doc.Content[0], env, &warns); err != nil {
+		if err := p.interpolateDoc(doc.Content[0], env, &warns); err != nil {
 			return nil, fmt.Errorf("%s/%s: %w", path, f, err)
 		}
 		for _, w := range warns {
@@ -625,6 +627,65 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 }
 
 // topVops reads the top-level x-vops block of a compose file (project settings).
+// interpolateDoc interpolates a compose file and records the variables it uses: all of them (Refs) and, per
+// service, those of each environment entry (EnvRefs), so the env view can tell where a variable comes from.
+func (p *Project) interpolateDoc(root *yaml.Node, env map[string]string, warns *[]string) error {
+	if p.Refs == nil {
+		p.Refs, p.EnvRefs = map[string]bool{}, map[string]map[string][]string{}
+	}
+	all := func(name string) { p.Refs[name] = true }
+	pairs := func(n *yaml.Node, fn func(k, v *yaml.Node) error) error {
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if err := fn(n.Content[i], n.Content[i+1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if root.Kind != yaml.MappingNode {
+		return interpolateNode(root, env, warns, all)
+	}
+	return pairs(root, func(k, services *yaml.Node) error {
+		if k.Value != "services" || services.Kind != yaml.MappingNode {
+			return interpolateNode(services, env, warns, all)
+		}
+		return pairs(services, func(name, svc *yaml.Node) error {
+			if svc.Kind != yaml.MappingNode {
+				return interpolateNode(svc, env, warns, all)
+			}
+			return pairs(svc, func(key, val *yaml.Node) error {
+				if key.Value != "environment" {
+					return interpolateNode(val, env, warns, all)
+				}
+				record := func(envKey string) func(string) {
+					return func(v string) {
+						all(v)
+						if p.EnvRefs[name.Value] == nil {
+							p.EnvRefs[name.Value] = map[string][]string{}
+						}
+						if !slices.Contains(p.EnvRefs[name.Value][envKey], v) {
+							p.EnvRefs[name.Value][envKey] = append(p.EnvRefs[name.Value][envKey], v)
+						}
+					}
+				}
+				switch val.Kind {
+				case yaml.MappingNode:
+					return pairs(val, func(k, v *yaml.Node) error { return interpolateNode(v, env, warns, record(k.Value)) })
+				case yaml.SequenceNode:
+					for _, item := range val.Content {
+						k, _, _ := strings.Cut(item.Value, "=")
+						if err := interpolateNode(item, env, warns, record(k)); err != nil {
+							return err
+						}
+					}
+					return nil
+				}
+				return interpolateNode(val, env, warns, all)
+			})
+		})
+	})
+}
+
 func (p *Project) topVops(root *yaml.Node) error {
 	if root.Kind != yaml.MappingNode {
 		return nil

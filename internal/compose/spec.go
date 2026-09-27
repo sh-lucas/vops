@@ -169,28 +169,9 @@ func (p *Project) spec(s *Service, rootDomain string, onlyRouted bool, projectEn
 	var a []string
 	add := func(xs ...string) { a = append(a, xs...) }
 
-	// environment: env_file first, then environment; bare keys come from the project env
-	envs := map[string]string{}
-	for _, f := range s.EnvFile {
-		if !filepath.IsAbs(f) {
-			f = filepath.Join(p.Dir, f)
-		}
-		kv, err := readEnvFile(f)
-		if err != nil {
-			return nil, err
-		}
-		for k, v := range kv {
-			envs[k] = v
-		}
-	}
-	for _, e := range s.Environment {
-		if e.Unset {
-			if v, ok := projectEnv[e.Key]; ok {
-				envs[e.Key] = v
-			}
-			continue
-		}
-		envs[e.Key] = e.Value
+	envs, _, err := p.serviceEnv(s, projectEnv)
+	if err != nil {
+		return nil, err
 	}
 	for _, k := range sortedKeys(envs) {
 		add("-e", k+"="+envs[k])
@@ -534,4 +515,73 @@ func (p *Project) NetworkDefs() []NetworkDef {
 		out = append(out, p.networkDef(key))
 	}
 	return out
+}
+
+// EnvEntry is one variable a service's containers get (or ask for) and where it comes from. Never its value.
+type EnvEntry struct {
+	Key    string   `json:"key"`
+	Source string   `json:"source"`           // compose | env_file | project (bare key from the project env) | missing
+	File   string   `json:"file,omitempty"`   // env_file: the file, as written in compose
+	Vars   []string `json:"vars,omitempty"`   // compose and missing: the ${VAR}s its value uses
+	Secret bool     `json:"secret,omitempty"` // a literal whose key looks secret: it is committed to git
+}
+
+// serviceEnv is a service's environment as podman gets it: env_file first, then environment; bare keys
+// (environment: [KEY]) come from the project env. entries says where each key comes from, sorted by key.
+func (p *Project) serviceEnv(s *Service, projectEnv map[string]string) (map[string]string, []EnvEntry, error) {
+	envs, from := map[string]string{}, map[string]EnvEntry{}
+	for _, f := range s.EnvFile {
+		path := f
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(p.Dir, path)
+		}
+		kv, err := readEnvFile(path)
+		if err != nil {
+			return nil, nil, err
+		}
+		for k, v := range kv {
+			envs[k] = v
+			from[k] = EnvEntry{Key: k, Source: "env_file", File: f}
+		}
+	}
+	for _, e := range s.Environment {
+		if e.Unset {
+			if v, ok := projectEnv[e.Key]; ok {
+				envs[e.Key] = v
+				from[e.Key] = EnvEntry{Key: e.Key, Source: "project"}
+			} else if _, ok := from[e.Key]; !ok {
+				from[e.Key] = EnvEntry{Key: e.Key, Source: "missing"}
+			}
+			continue
+		}
+		envs[e.Key] = e.Value
+		en := EnvEntry{Key: e.Key, Source: "compose", Vars: p.EnvRefs[s.Name][e.Key]}
+		for _, v := range en.Vars {
+			if _, set := projectEnv[v]; !set && e.Value == "" {
+				en.Source = "missing"
+			}
+		}
+		from[e.Key] = en
+	}
+	var entries []EnvEntry
+	for _, k := range sortedKeys(from) {
+		entries = append(entries, from[k])
+	}
+	return envs, entries, nil
+}
+
+// EnvUsage lists, per active service, every env variable its containers get and where it comes from.
+func (p *Project) EnvUsage(projectEnv map[string]string) (map[string][]EnvEntry, error) {
+	out := map[string][]EnvEntry{}
+	for name, s := range p.Services {
+		_, entries, err := p.serviceEnv(s, projectEnv)
+		if err != nil {
+			return nil, fmt.Errorf("service %s: %w", name, err)
+		}
+		if entries == nil {
+			entries = []EnvEntry{}
+		}
+		out[name] = entries
+	}
+	return out, nil
 }

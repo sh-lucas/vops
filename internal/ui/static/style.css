@@ -73,6 +73,7 @@ main.fill .grow { flex: 1; min-height: 0; display: flex; flex-direction: column;
 .section-head .hint { color: var(--muted); font-size: 12.5px; }
 .stack { display: grid; gap: 16px; }
 .stack > .alert { margin: 0; }
+.stack > * { min-width: 0; }
 .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .spacer { flex: 1; }
 .muted { color: var(--muted); }
@@ -271,6 +272,8 @@ dl.kv dd { margin: 0; min-width: 0; }
 .seg a:hover { text-decoration: none; background: var(--hover); }
 .seg a.active { background: color-mix(in srgb, var(--accent) 14%, var(--panel)); color: var(--text); }
 .panel-note { padding: 10px 16px; border-bottom: 1px solid var(--line); }
+tr.grp td { background: color-mix(in srgb, var(--hover) 60%, var(--panel)); font-weight: 600; padding-top: 7px; padding-bottom: 7px; }
+tr.warnrow td { background: color-mix(in srgb, var(--warn) 6%, var(--panel)); }
 
 /* ---- misc */
 pre { background: var(--code); border-radius: 8px; padding: 12px; overflow: auto; margin: 8px 0 0; white-space: pre-wrap; word-break: break-word; max-height: 60vh; }
@@ -338,6 +341,11 @@ dialog.modal form, dialog.modal .inner { display: flex; flex-direction: column; 
   .stats { grid-template-columns: 1fr 1fr; }
   .stat .value { font-size: 20px; }
   .tl-foot .actions { width: 100%; }
+  table.envuse thead { display: none; }
+  table.envuse tr:not(.grp) { display: grid; grid-template-columns: minmax(0, 1fr) auto; border-bottom: 1px solid var(--line); }
+  table.envuse tr:not(.grp) td { border: 0; }
+  table.envuse tr:not(.grp) td:nth-child(3) { grid-column: 1 / -1; padding-top: 0; }
+  table.envuse tr:not(.grp) td:nth-child(3):empty { display: none; }
   .tl-foot form { width: 100%; }
   .tl-foot form input { flex: 1; width: auto; }
 }

@@ -222,6 +222,19 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		writeJSON(w, keys)
 		return nil
 	})
+	// where every variable of every service comes from (never values); preview=1: the previews' env
+	h("GET /api/env/usage", func(w http.ResponseWriter, r *http.Request) error {
+		q := r.URL.Query()
+		if _, err := envScope(q.Get("project"), false); err != nil {
+			return err
+		}
+		u, err := d.Engine.EnvUsage(r.Context(), q.Get("project"), q.Get("preview") == "1")
+		if err != nil {
+			return err
+		}
+		writeJSON(w, u)
+		return nil
+	})
 	h("POST /api/env", func(w http.ResponseWriter, r *http.Request) error {
 		var in struct {
 			Project, Key, Value string

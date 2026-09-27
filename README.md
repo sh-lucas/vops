@@ -73,6 +73,7 @@ git add -A && git commit -m site && vops sync
 - `depends_on` conditions, including `service_completed_successfully` jobs (migrations) that gate the services depending on them; `profiles` via `COMPOSE_PROFILES`.
 - Rolling releases for routed services: new replica, readiness check, switch traffic, drain, remove old. A failed readiness check keeps the old version serving. Everything else is recreated (stop, then start).
 - Env vars per project, write-only: set from the cli or the dashboard, used for `${VAR}` and `environment: [VAR]`, never shown again.
+- What each service gets: `vops env ls <project>` and the Environment tab list, per service, every variable its containers get and where it comes from (`compose` literal, `env_file`, `vops` env directly or through `${VAR}`, or `missing`: referenced but set nowhere), plus vops keys no service uses. Names only, never values. A literal whose name looks secret is flagged "committed to git: move to vops env".
 - Disable/enable a project without deleting it; removing its dir from git removes its containers (volumes and data dirs stay).
 
 ### Data safety: snapshots and rollback (btrfs)

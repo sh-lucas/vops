@@ -8,18 +8,18 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
-// interpolateNode replaces ${VAR} forms in every scalar value (not keys).
-func interpolateNode(n *yaml.Node, env map[string]string, warns *[]string) error {
+// interpolateNode replaces ${VAR} forms in every scalar value (not keys). seen (may be nil) gets every variable name used.
+func interpolateNode(n *yaml.Node, env map[string]string, warns *[]string, seen func(string)) error {
 	switch n.Kind {
 	case yaml.MappingNode:
 		for i := 1; i < len(n.Content); i += 2 {
-			if err := interpolateNode(n.Content[i], env, warns); err != nil {
+			if err := interpolateNode(n.Content[i], env, warns, seen); err != nil {
 				return err
 			}
 		}
 	case yaml.SequenceNode, yaml.DocumentNode:
 		for _, c := range n.Content {
-			if err := interpolateNode(c, env, warns); err != nil {
+			if err := interpolateNode(c, env, warns, seen); err != nil {
 				return err
 			}
 		}
@@ -27,7 +27,7 @@ func interpolateNode(n *yaml.Node, env map[string]string, warns *[]string) error
 		if !strings.Contains(n.Value, "$") {
 			return nil
 		}
-		v, err := Interpolate(n.Value, env, warns)
+		v, err := interpolate(n.Value, env, warns, seen)
 		if err != nil {
 			return fmt.Errorf("line %d: %w", n.Line, err)
 		}
@@ -41,6 +41,10 @@ func interpolateNode(n *yaml.Node, env map[string]string, warns *[]string) error
 
 // Interpolate expands $VAR, ${VAR}, ${VAR:-def}, ${VAR-def}, ${VAR:?err}, ${VAR?err}, ${VAR:+alt}, ${VAR+alt} and $$.
 func Interpolate(s string, env map[string]string, warns *[]string) (string, error) {
+	return interpolate(s, env, warns, nil)
+}
+
+func interpolate(s string, env map[string]string, warns *[]string, seen func(string)) (string, error) {
 	var out strings.Builder
 	for i := 0; i < len(s); i++ {
 		c := s[i]
@@ -58,7 +62,7 @@ func Interpolate(s string, env map[string]string, warns *[]string) (string, erro
 			if end < 0 {
 				return "", fmt.Errorf("unclosed ${ in %q", s)
 			}
-			v, err := expand(s[i+2:end], env, warns)
+			v, err := expand(s[i+2:end], env, warns, seen)
 			if err != nil {
 				return "", err
 			}
@@ -69,7 +73,7 @@ func Interpolate(s string, env map[string]string, warns *[]string) (string, erro
 			for j < len(s) && isNameChar(s[j]) {
 				j++
 			}
-			out.WriteString(lookup(s[i+1:j], env, warns))
+			out.WriteString(lookup(s[i+1:j], env, warns, seen))
 			i = j - 1
 		default:
 			out.WriteByte(c)
@@ -97,7 +101,10 @@ func matchBrace(s string, open int) int {
 func isNameStart(c byte) bool { return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' }
 func isNameChar(c byte) bool  { return isNameStart(c) || c >= '0' && c <= '9' }
 
-func lookup(name string, env map[string]string, warns *[]string) string {
+func lookup(name string, env map[string]string, warns *[]string, seen func(string)) string {
+	if seen != nil {
+		seen(name)
+	}
 	v, ok := env[name]
 	if !ok {
 		w := fmt.Sprintf("variable %s is not set, using an empty string", name)
@@ -108,7 +115,7 @@ func lookup(name string, env map[string]string, warns *[]string) string {
 	return v
 }
 
-func expand(expr string, env map[string]string, warns *[]string) (string, error) {
+func expand(expr string, env map[string]string, warns *[]string, seen func(string)) (string, error) {
 	j := 0
 	for j < len(expr) && isNameChar(expr[j]) {
 		j++
@@ -117,9 +124,12 @@ func expand(expr string, env map[string]string, warns *[]string) (string, error)
 	if name == "" || !isNameStart(name[0]) {
 		return "", fmt.Errorf("invalid variable ${%s}", expr)
 	}
+	if seen != nil {
+		seen(name)
+	}
 	v, set := env[name]
 	if op == "" {
-		return lookup(name, env, warns), nil
+		return lookup(name, env, warns, nil), nil
 	}
 	var word string
 	colon := strings.HasPrefix(op, ":")
@@ -136,17 +146,17 @@ func expand(expr string, env map[string]string, warns *[]string) (string, error)
 		if present {
 			return v, nil
 		}
-		return Interpolate(word, env, warns)
+		return interpolate(word, env, warns, seen)
 	case '+':
 		if present {
-			return Interpolate(word, env, warns)
+			return interpolate(word, env, warns, seen)
 		}
 		return "", nil
 	case '?':
 		if present {
 			return v, nil
 		}
-		msg, _ := Interpolate(word, env, warns)
+		msg, _ := interpolate(word, env, warns, seen)
 		if msg == "" {
 			msg = "is required"
 		}

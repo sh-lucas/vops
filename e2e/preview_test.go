@@ -50,7 +50,7 @@ func TestPreviewsFromRegistry(t *testing.T) {
 	push("shop/api", "v1", "api-prod")
 	w.vops(dev, "env", "set", "shop", "SECRET=prod-secret")
 	w.vops(dev, "env", "set", "shop", "--preview", "PREVIEW_ONLY=yes")
-	if keys := w.vops(dev, "env", "ls", "shop", "--preview"); !strings.Contains(keys, "PREVIEW_ONLY") || strings.Contains(keys, "SECRET") {
+	if keys := w.vops(dev, "env", "ls", "shop", "--preview"); !strings.Contains(keys, "PREVIEW_ONLY\t(set") || strings.Contains(keys, "SECRET\t(set") {
 		t.Fatalf("preview env ls: %s", keys)
 	}
 	compose := `services:
@@ -66,6 +66,10 @@ func TestPreviewsFromRegistry(t *testing.T) {
 	w.vops(dev, "sync", "--yes")
 	if body("web.shop.vops.test") != "web-prod" || body("api.shop.vops.test") != "api-prod" {
 		t.Fatal("production not serving")
+	}
+	// per service: previews don't get production's SECRET, so it is missing there
+	if keys := w.vops(dev, "env", "ls", "shop", "--preview"); !regexp.MustCompile(`(?m)^  SECRET\s+missing\s+not set anywhere`).MatchString(keys) || !regexp.MustCompile(`(?m)^  PREVIEW_ONLY\s+vops`).MatchString(keys) {
+		t.Fatalf("preview env ls per service:\n%s", keys)
 	}
 	prodIDs := func() string {
 		cs, _ := podman.PS(ctx, "vops.project=shop")

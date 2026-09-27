@@ -39,7 +39,8 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   restart <project> [service]
   enable|disable <project>
   env ls|set|rm <project> [--preview] [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given;
-                                     --preview: the secrets of the project's previews, which never get its env)
+                                     --preview: the secrets of the project's previews, which never get its env;
+                                     ls also shows each service's variables and where they come from)
   preview up <project> --name n [--image svc=ref]... [--ref r] [--from snapshot-id]
   preview ls [project] | rm <project> <name>   previews: <service>.<name>.<project>.<domain>, a copy of the data
   user ls | add <name> [--pattern re] [--repo r]... [--token-stdin] | rm <name> | token <name>

@@ -576,12 +576,23 @@ function envTab(ctx, box) {
       refreshStatus().catch(() => {});
     });
   } }, h("label", { class: "field" }, "Name", key), h("label", { class: "field" }, "Value (write-only)", val), setBtn);
+  const prefill = (k) => {
+    key.value = k;
+    form.scrollIntoView({ block: "center", behavior: "smooth" });
+    val.focus({ preventScroll: true });
+  };
   const list = h("div", {}, loading("Loading…", "pad"));
+  const services = h("div", {});
   const load = async () => {
-    let envs;
-    try { envs = await api("GET", "/env?project=" + enc(path) + scope); } catch (e) { return list.replaceChildren(errorBox(e)); }
+    let envs, usage = null, uerr = null;
+    try {
+      [envs, usage] = await Promise.all([api("GET", "/env?project=" + enc(path) + scope), api("GET", "/env/usage?project=" + enc(path) + scope).catch((e) => { uerr = e; return null; })]);
+    } catch (e) { return list.replaceChildren(errorBox(e)); }
+    const unused = new Set(usage ? usage.unused : []);
+    const svcs = usage ? Object.keys(usage.services).sort() : [];
+    const composeOnly = svcs.some((s) => usage.services[s].length);
     list.replaceChildren(envs.length ? table(["Name", "Value", ""], envs.map((e) => h("tr", {},
-      h("td", { class: "mono wrapany" }, e.key),
+      h("td", { class: "mono wrapany" }, e.key, unused.has(e.key) ? [" ", h("span", { class: "tag", title: "No service uses it: not in any environment: [" + e.key + "] or ${" + e.key + "}" }, "unused")] : null),
       h("td", { class: "muted small" }, "••••••••  set ", when(e.updated_at)),
       h("td", { class: "actions-cell" }, h("button", { class: "btn sm danger", onclick: async () => {
         if (!(await confirmDialog({ title: `Remove ${e.key}?`, ok: "Remove", danger: true,
@@ -593,16 +604,37 @@ function envTab(ctx, box) {
           refreshStatus().catch(() => {});
         } catch (x) { toast(x.message); }
       } }, "Remove")))))
-      : empty("No variables", preview ? "Secrets only previews get, on top of preview.env." : "Values are write-only. Use them as ${KEY} in compose.yml or with environment: [KEY]."));
+      : h("div", { class: "panel-body muted small" }, preview ? "No preview secrets set. " : "No secrets set with vops env. ",
+        composeOnly ? "The services still get the variables listed below (from compose and env files)." : preview ? "Previews get preview.env, then these on top." : "Set one below and use it with environment: [KEY] or ${KEY} in compose.yml."));
+    // per service: every variable the containers get, and from where (never values)
+    const hint = (en) => {
+      if (en.source === "missing") {
+        const k = en.vars && en.vars.length ? en.vars[0] : en.key;
+        return [h("span", { class: "warn-text" }, en.vars && en.vars.length ? "${" + k + "} is set nowhere: empty" : "set nowhere: empty"), " ", h("button", { class: "btn sm", onclick: () => prefill(k) }, "Set it")];
+      }
+      if (en.secret) return h("span", { class: "warn-text", title: `Replace the literal with environment: [${en.key}] in compose.yml and set the value with vops env set (or the form above).` }, "committed to git: move to vops env");
+      if (en.file === "builtin") return "set by vops";
+      if (en.file === "preview.env") return "from preview.env in the repo";
+      if (en.vars && en.vars.length) return "via " + en.vars.map((v) => "${" + v + "}").join(", ");
+      return "";
+    };
+    const src = (en) => h("span", { class: "tag" + (en.source === "missing" ? " warn" : en.source === "vops" ? " accent" : "") }, en.source, en.file && en.file !== "builtin" ? " · " + en.file : "");
+    put(services, uerr ? alertBox("warn", "Can't read the compose files", h("span", { class: "small wrapany" }, uerr.message)) : null,
+      usage ? panel(panelHead(h("h2", {}, "What each service gets"), h("span", { class: "muted small" }, preview ? "in previews" : "names and sources only, never values")),
+        svcs.length ? table(["Variable", "Source", ""], svcs.flatMap((svc) => [
+          h("tr", { class: "grp" }, h("td", { colspan: 3 }, h("span", { class: "mono" }, svc), usage.services[svc].length ? null : h("span", { class: "muted small" }, "  no variables"))),
+          ...usage.services[svc].map((en) => h("tr", { class: en.source === "missing" ? "warnrow" : null },
+            h("td", { class: "mono wrapany" }, en.key), h("td", { class: "nowrap" }, src(en)), h("td", { class: "small" }, hint(en))))]), "envuse")
+          : empty("No services", "This project defines no services.")) : null);
   };
   const seg = h("div", { class: "seg", role: "tablist" },
     h("a", { href: projectHref(path, "env"), class: preview ? null : "active" }, "Production"),
     h("a", { href: projectHref(path, "env", "?scope=previews"), class: preview ? "active" : null }, "Previews"));
-  box.replaceChildren(panel(panelHead(h("h2", {}, "Environment variables"), seg, h("span", { class: "muted small" }, "write-only: values are never shown again")),
+  box.replaceChildren(h("div", { class: "stack" }, panel(panelHead(h("h2", {}, preview ? "Preview secrets" : "vops env"), seg, h("span", { class: "muted small" }, "write-only: values are never shown again")),
     h("div", { class: "panel-note small muted" }, preview
       ? ["Previews don't inherit production's env: they read ", mono("preview.env"), " from ", mono(path + "/"), " in the repo, then these secrets on top."]
       : ["Used as ", mono("${KEY}"), " in compose.yml or with ", mono("environment: [KEY]"), ". Changes deploy on the next apply."]),
-    list, h("div", { class: "panel-foot" }, form)));
+    list, h("div", { class: "panel-foot" }, form)), services));
   load();
 }
 

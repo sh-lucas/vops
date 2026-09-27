@@ -8,12 +8,14 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/store"
@@ -234,7 +236,23 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			for _, k := range keys {
 				fmt.Fprintf(out, "%s\t(set %s)\n", k.Key, time.Unix(k.UpdatedAt, 0).Format("2006-01-02 15:04"))
 			}
-			return nil
+			// then what each service gets and from where (values never leave the host)
+			var u deploy.EnvUsage
+			if err := getJSON(c, "/api/env/usage?project="+url.QueryEscape(project)+scope, &u); err != nil {
+				fmt.Fprintf(out, "\n(per-service view unavailable: %v)\n", err)
+				return nil
+			}
+			tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+			for _, svc := range slices.Sorted(maps.Keys(u.Services)) {
+				fmt.Fprintf(tw, "\n%s\t\t\n", svc)
+				for _, en := range u.Services[svc] {
+					fmt.Fprintf(tw, "  %s\t%s\t%s\n", en.Key, strings.TrimSpace(en.Source+" "+en.File), envHint(en, project, *preview))
+				}
+			}
+			if len(u.Unused) > 0 {
+				fmt.Fprintf(tw, "\nunused (set, but no service uses them): %s\t\t\n", strings.Join(u.Unused, ", "))
+			}
+			return tw.Flush()
 		case "set":
 			if !*fromStdin {
 				return errors.New("env set on the host reads KEY=VALUE lines with --stdin")
@@ -631,6 +649,25 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// envHint is the short advice next to a variable in `env ls`.
+func envHint(en compose.EnvEntry, project string, preview bool) string {
+	flag := ""
+	if preview {
+		flag = "--preview "
+	}
+	switch {
+	case en.Source == "missing":
+		return "not set anywhere, empty: vops env set " + project + " " + flag + en.Key
+	case en.Secret:
+		return "committed to git: move to vops env (environment: [" + en.Key + "] + vops env set)"
+	case en.File == "builtin":
+		return "set by vops"
+	case len(en.Vars) > 0:
+		return "via ${" + strings.Join(en.Vars, "}, ${") + "}"
+	}
+	return ""
 }
 
 type multi []string

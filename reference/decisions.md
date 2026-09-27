@@ -92,6 +92,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Served on `ui` listen address (default `127.0.0.1:9984`) and on `vops.<domain>` over HTTPS. The default is loopback because plain HTTP with a password over the internet is bad; `vops ui` opens an ssh tunnel and the browser. Set `ui: ":9984"` in `vops.yml` to expose it.
 - Sessions: random id in an `HttpOnly; SameSite=Strict` cookie, sha256 stored in sqlite. Mutating requests also need the `X-Vops: 1` header (blocks CSRF without tokens).
 - Env values are write-only: the API has no way to read them back.
+- The env view (`/api/env/usage`, `vops env ls`) reports names and sources only, never values, not even of compose literals: it is computed by the same `compose.Load` + env merge the plan uses (the interpolator records which `${VAR}`s each environment entry uses), so it can't drift from what podman gets. A compose literal whose key matches `PASSWORD|SECRET|TOKEN|KEY|PRIVATE` (case-insensitive) is flagged: it is committed to git; the fix is `environment: [KEY]` + `vops env set`. A key nothing references (`environment: [KEY]` or `${KEY}` anywhere in the files; `COMPOSE_PROFILES` counts as used) is shown as unused.
 
 ## Install
 
