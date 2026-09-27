@@ -30,6 +30,7 @@ func TestAuditTriggers(t *testing.T) {
 	db.DeleteSession(id)
 	sid, _ := db.AddSnapshot(Snapshot{Project: "shop", Reason: "manual", Volumes: []SnapshotVolume{{"volume", "v", "/a", "/b"}}})
 	db.DeleteSnapshot(sid)
+	db.AddDeploy(Deploy{Project: "shop", Commit: "abcdef1234567890", Trigger: "rollback", RestoredID: 7, Result: "ok"})
 	db.DeleteProject("shop")
 
 	logs, err := db.Audit(100)
@@ -57,6 +58,7 @@ func TestAuditTriggers(t *testing.T) {
 		"logout",
 		"snapshots insert shop #1 manual",
 		"snapshots delete shop #1 manual",
+		"deploys insert shop #1 rollback commit abcdef123456 ok restored #7",
 		"projects delete shop",
 	} {
 		if !strings.Contains(got, want) {

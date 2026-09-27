@@ -80,6 +80,8 @@ git add -A && git commit -m site && vops sync
 - Before any deploy that changes a project, its data is snapshotted (`pre-deploy`); containers using it are paused for the few milliseconds it takes, so all volumes are captured at the same instant.
 - `vops rollback <project> [id]` stops the project, snapshots the current data (`pre-rollback`, so the rollback itself can be undone), restores, starts again. Code is not touched; the snapshot says which commit its data belongs to.
 - `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `vops.yml`); manual ones stay until deleted.
+- Deploy history: every apply that changes a project (sync, apply, dashboard, registry push) and every rollback is recorded with its commit, the images that ran (by digest when known), its result and the snapshot of the data right before it. `vops history <project>`, or the project's Timeline tab.
+- Timeline (dashboard): newest first, "now" on top. Each point shows its commit and message, image changes (`web: v1 → v2`), result, snapshot and the previews branched from it. "Restore data" puts back the data from right before that point (and tells you the git command if the code differs); "Preview from here" opens a preview of that point: its commit, its images by digest, a copy of its snapshot. After a restore the project shows "Data restored to #N · Undo" until its next deploy.
 - Works rootless (through `podman unshare`), no root and no special mount options.
 
 ### Previews (database branching)
@@ -87,6 +89,7 @@ git add -A && git commit -m site && vops sync
 - `--image web=registry.example.com/shop/web:pr-42` runs another image; `--ref my-branch` another commit (a local branch is pushed to the host first); `--from <snapshot id>` another data point. `vops preview ls [project]`, `vops preview rm shop pr-42`.
 - From the registry: pushing `shop/web:preview-pr-42` creates or updates preview `pr-42` of the projects running `shop/web`, with that image. Pushing `shop/api:preview-pr-42` too lands in the same preview. A preview tag never redeploys production. The pattern is `x-vops: {previews: "preview-*"}` at the top of the compose file (default; `off` disables it).
 - Env: previews never get production's env. They get `preview.env` from the project dir (committed, non-secret overrides like `SMTP_HOST=mailpit`) and preview secrets on top: `vops env set shop --preview STRIPE_KEY`.
+- Dashboard: a Previews tab per project (urls, where it came from, overrides, expiry, logs, delete, new preview), previews in the sidebar under their project, and "Preview from here" on any timeline point.
 - Guardrails by default: previews are off the shared network (they can't reach production, nothing reaches them), services with `x-vops.preview: {skip: true}` (workers, crons) don't run, no host ports, no extra domains. At most `preview_max: 5` at once; a preview not updated for `preview_ttl: 3d` is removed (both in `vops.yml`). `rm` leaves nothing behind: containers, networks, volumes, data, worktree.
 
 ### Audit log
@@ -105,7 +108,7 @@ git add -A && git commit -m site && vops sync
 
 ### Dashboard
 - `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`.
-- Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart), logs (live, search, date range, download), env vars, data snapshots, events. Also registry images and users, git-tracked files (text only), events and audit log. Works on a phone.
+- Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart), timeline (deploys, restores, snapshots; restore data, preview from a point), previews, logs (live, search, date range, download), env vars (production or previews), events. Also registry images and users, git-tracked files (text only), events and audit log. Works on a phone.
 
 ### Logs
 - Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts; search covers all of it, and the dashboard loads older lines as you scroll up.
@@ -123,7 +126,7 @@ Know these before putting something important on it:
 - **Recreate means downtime:** services with published `ports`, without `x-vops.port`, or on a network whose definition changed are stopped before the new container starts.
 - **Snapshots need btrfs** and cover only named volumes and bind mounts inside the project dir (not external volumes or absolute host paths). Data created before vops made it a subvolume (non-empty plain dirs) is left alone and shown as "not covered".
 - **Snapshots are crash-consistent**, like pulling the plug: fine for postgres, mysql/innodb, sqlite, anything with a journal; not a replacement for application-level backups, and they live on the same disk (no off-host copy yet).
-- **Rollback restores data, not code**, and stops the project's containers while it runs (seconds).
+- **Rollback restores data, not code**, and stops the project's containers while it runs (seconds). Code goes back through git (the dashboard shows the command).
 - **Previews hold production data.** Personal data, and whatever the code does with it: a queue of real emails, webhooks, a scheduled charge. Their env is not production's, but the data keeps production's own credentials (db users and passwords), and anything the preview's env doesn't redirect still goes out for real. Skip workers and crons, point SMTP and payment keys at test ones.
 - **Previews need btrfs for data** (without it they start empty) and can't be made of projects with external volumes or fixed-subnet networks. Absolute bind mounts and external networks are shared with production. Registry tags pushed for previews stay until `vops registry rm`.
 - **Logs are journald's:** retention and disk use follow its config (`/etc/systemd/journald.conf`); no long-term log store.
@@ -140,6 +143,7 @@ vops restart <project> [service] | enable <project> | disable <project>
 vops env ls|set|rm <project> [--preview] ...   vops user ls|add|rm|token ...
 vops registry ls|rm|gc                    vops admin password | events | audit | version
 vops snapshot ls|create|rm ...            vops rollback <project> [id] [-y]
+vops history <project> [-n N]
 vops preview up <project> --name n [--image svc=ref]... [--ref r] [--from id]
 vops preview ls [project] | rm <project> <name>
 ```
@@ -156,4 +160,4 @@ just gen        # sqlc generate (after editing internal/store/queries.sql or mig
 just vps-test   # systemd + real sshd + podman in a container as the host (slow, needs network)
 ```
 
-Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api, previews from registry tags), `internal/deploy` checks zero failed requests during a rolling release and runs a destructive migration in a preview of a real postgres, `internal/registry` pushes and pulls with real podman.
+Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api, previews from registry tags, a push recorded in the history and a preview of a past deploy by digest), `internal/deploy` checks zero failed requests during a rolling release, runs a destructive migration in a preview of a real postgres, and walks the deploy history (deploys, a failed one, rollback and undo, a preview from a past deploy), `internal/registry` pushes and pulls with real podman.

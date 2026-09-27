@@ -32,6 +32,47 @@ func (q *Queries) AddSnapshotVolume(ctx context.Context, arg AddSnapshotVolumePa
 	return err
 }
 
+const createDeploy = `-- name: CreateDeploy :one
+INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id
+`
+
+type CreateDeployParams struct {
+	Project    string `json:"project"`
+	CommitSha  string `json:"commit_sha"`
+	Trigger    string `json:"trigger"`
+	Images     string `json:"images"`
+	SnapshotID int64  `json:"snapshot_id"`
+	RestoredID int64  `json:"restored_id"`
+	Undoes     int64  `json:"undoes"`
+	Result     string `json:"result"`
+	Error      string `json:"error"`
+	Summary    string `json:"summary"`
+	StartedAt  int64  `json:"started_at"`
+	FinishedAt int64  `json:"finished_at"`
+}
+
+func (q *Queries) CreateDeploy(ctx context.Context, arg CreateDeployParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, createDeploy,
+		arg.Project,
+		arg.CommitSha,
+		arg.Trigger,
+		arg.Images,
+		arg.SnapshotID,
+		arg.RestoredID,
+		arg.Undoes,
+		arg.Result,
+		arg.Error,
+		arg.Summary,
+		arg.StartedAt,
+		arg.FinishedAt,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createEvent = `-- name: CreateEvent :exec
 INSERT INTO events (at, project, kind, message) VALUES (?, ?, ?, ?)
 `
@@ -185,6 +226,31 @@ func (q *Queries) DeleteUser(ctx context.Context, name string) error {
 	return err
 }
 
+const getDeploy = `-- name: GetDeploy :one
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at FROM deploys WHERE id = ?
+`
+
+func (q *Queries) GetDeploy(ctx context.Context, id int64) (Deploy, error) {
+	row := q.db.QueryRowContext(ctx, getDeploy, id)
+	var i Deploy
+	err := row.Scan(
+		&i.ID,
+		&i.Project,
+		&i.CommitSha,
+		&i.Trigger,
+		&i.Images,
+		&i.SnapshotID,
+		&i.RestoredID,
+		&i.Undoes,
+		&i.Result,
+		&i.Error,
+		&i.Summary,
+		&i.StartedAt,
+		&i.FinishedAt,
+	)
+	return i, err
+}
+
 const getMeta = `-- name: GetMeta :one
 SELECT value FROM meta WHERE key = ?
 `
@@ -197,7 +263,7 @@ func (q *Queries) GetMeta(ctx context.Context, key string) (string, error) {
 }
 
 const getPreview = `-- name: GetPreview :one
-SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at FROM previews WHERE project = ? AND name = ?
+SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at, deploy_id FROM previews WHERE project = ? AND name = ?
 `
 
 type GetPreviewParams struct {
@@ -218,6 +284,7 @@ func (q *Queries) GetPreview(ctx context.Context, arg GetPreviewParams) (Preview
 		&i.Data,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.DeployID,
 	)
 	return i, err
 }
@@ -266,6 +333,48 @@ func (q *Queries) GetUser(ctx context.Context, name string) (User, error) {
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const latestDeploys = `-- name: LatestDeploys :many
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at FROM deploys WHERE id IN (SELECT max(id) FROM deploys GROUP BY project)
+`
+
+// the newest deploy of every project
+func (q *Queries) LatestDeploys(ctx context.Context) ([]Deploy, error) {
+	rows, err := q.db.QueryContext(ctx, latestDeploys)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Deploy{}
+	for rows.Next() {
+		var i Deploy
+		if err := rows.Scan(
+			&i.ID,
+			&i.Project,
+			&i.CommitSha,
+			&i.Trigger,
+			&i.Images,
+			&i.SnapshotID,
+			&i.RestoredID,
+			&i.Undoes,
+			&i.Result,
+			&i.Error,
+			&i.Summary,
+			&i.StartedAt,
+			&i.FinishedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listAudit = `-- name: ListAudit :many
@@ -330,6 +439,52 @@ func (q *Queries) ListAutoSnapshotsToPrune(ctx context.Context, arg ListAutoSnap
 			&i.Note,
 			&i.CommitSha,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDeploys = `-- name: ListDeploys :many
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at FROM deploys WHERE project = ? ORDER BY id DESC LIMIT ?
+`
+
+type ListDeploysParams struct {
+	Project string `json:"project"`
+	Limit   int64  `json:"limit"`
+}
+
+func (q *Queries) ListDeploys(ctx context.Context, arg ListDeploysParams) ([]Deploy, error) {
+	rows, err := q.db.QueryContext(ctx, listDeploys, arg.Project, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Deploy{}
+	for rows.Next() {
+		var i Deploy
+		if err := rows.Scan(
+			&i.ID,
+			&i.Project,
+			&i.CommitSha,
+			&i.Trigger,
+			&i.Images,
+			&i.SnapshotID,
+			&i.RestoredID,
+			&i.Undoes,
+			&i.Result,
+			&i.Error,
+			&i.Summary,
+			&i.StartedAt,
+			&i.FinishedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -449,7 +604,7 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 }
 
 const listPreviews = `-- name: ListPreviews :many
-SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at FROM previews
+SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at, deploy_id FROM previews
 WHERE ?1 = '' OR project = ?1
 ORDER BY project, name
 `
@@ -473,6 +628,7 @@ func (q *Queries) ListPreviews(ctx context.Context, project interface{}) ([]Prev
 			&i.Data,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.DeployID,
 		); err != nil {
 			return nil, err
 		}
@@ -622,7 +778,7 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 }
 
 const putPreview = `-- name: PutPreview :exec
-INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, deploy_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, updated_at = excluded.updated_at
 `
 
@@ -633,12 +789,13 @@ type PutPreviewParams struct {
 	CommitSha  string `json:"commit_sha"`
 	Images     string `json:"images"`
 	SnapshotID int64  `json:"snapshot_id"`
+	DeployID   int64  `json:"deploy_id"`
 	Data       string `json:"data"`
 	CreatedAt  int64  `json:"created_at"`
 	UpdatedAt  int64  `json:"updated_at"`
 }
 
-// creates a preview or updates it; created_at, snapshot_id and data belong to its creation
+// creates a preview or updates it; created_at, snapshot_id, deploy_id and data belong to its creation
 func (q *Queries) PutPreview(ctx context.Context, arg PutPreviewParams) error {
 	_, err := q.db.ExecContext(ctx, putPreview,
 		arg.Project,
@@ -647,6 +804,7 @@ func (q *Queries) PutPreview(ctx context.Context, arg PutPreviewParams) error {
 		arg.CommitSha,
 		arg.Images,
 		arg.SnapshotID,
+		arg.DeployID,
 		arg.Data,
 		arg.CreatedAt,
 		arg.UpdatedAt,

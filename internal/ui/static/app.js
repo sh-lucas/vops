@@ -37,6 +37,9 @@ const ICONS = {
   info: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM12 11v5M12 8h.01",
   git: "M6 3v12M18 9a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM6 21a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM18 9a9 9 0 0 1-9 9",
   back: "M15 6l-6 6 6 6",
+  camera: "M4 8h3l2-3h6l2 3h3v11H4zM12 16.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z",
+  undo: "M9 14L4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3",
+  external: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
 };
 
 function icon(name) {
@@ -137,9 +140,28 @@ const fmtUnix = (u) => fmtDate(new Date(u * 1000));
 const fullDate = (u) => new Date(u * 1000).toLocaleString();
 const localInput = (u) => { const d = new Date(u * 1000); return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`; };
 const when = (u) => h("span", { class: "nowrap", title: u ? fullDate(u) : null }, ago(u));
+const until = (u) => {
+  const s = u - Date.now() / 1000;
+  if (s <= 0) return "now";
+  if (s < 3600) return "in " + Math.max(1, Math.floor(s / 60)) + "m";
+  if (s < 172800) return "in " + Math.floor(s / 3600) + "h";
+  return "in " + Math.floor(s / 86400) + "d";
+};
 const sep = () => h("span", { class: "faint" }, "·");
 const mono = (s) => h("span", { class: "mono" }, s);
 const domainURL = (st, d) => (st.domain ? "https://" : "http://") + d;
+// images in the history: "registry.x/shop/web:v1" shows as "web:v1"; pinned() is the ref by digest, like the engine's
+const imgName = (ref) => shortImage((ref || "").split("/").pop());
+const pinned = (img) => {
+  if (!img.digest) return img.image;
+  let r = img.image;
+  const at = r.indexOf("@"), c = r.lastIndexOf(":");
+  if (at >= 0) r = r.slice(0, at);
+  else if (c > r.lastIndexOf("/")) r = r.slice(0, c);
+  return r + "@" + img.digest;
+};
+const commitLine = (sha, subjects) => h("span", { class: "cline", title: sha || null }, icon("commit"), mono(short(sha, 8) || "?"), subjects && subjects[sha] ? h("span", { class: "subject" }, subjects[sha]) : null);
+const previewsOf = (st, path) => (st.previews || []).filter((x) => x.project === path);
 
 // project health for its dot: grey disabled, red failing/invalid, amber pending/partial, green all running
 function health(p) {
@@ -224,6 +246,31 @@ function confirmDialog({ title, body, ok = "Confirm", danger = false }) {
   });
 }
 
+// streamDialog runs a streamed POST (rollback, preview up) in a modal that shows its progress; done(ok) runs at the end.
+function streamDialog({ title, intro, path, body, done }) {
+  const out = h("pre", { class: "out" });
+  const result = h("span", { class: "row" }, h("span", { class: "spin" }), h("span", { class: "muted small" }, "Running…"));
+  let running = true;
+  const d = h("dialog", { class: "modal wide" }, h("div", { class: "inner" },
+    h("div", { class: "modal-head" }, h("h3", {}, title)),
+    h("div", { class: "modal-body" }, intro ? h("p", {}, intro) : null, out),
+    h("div", { class: "modal-foot" }, result, h("span", { class: "spacer" }), h("button", { class: "btn", onclick: () => d.close() }, "Close"))));
+  d.addEventListener("close", () => {
+    if (running) toast("It keeps running on the host");
+    d.remove();
+  });
+  document.body.append(d);
+  d.showModal();
+  const finish = (ok) => {
+    running = false;
+    result.replaceChildren(h("span", { class: "tag " + (ok ? "ok" : "bad") }, ok ? "Done" : "Failed"));
+    done && done(ok);
+  };
+  stream(path, preSink(out), { method: "POST", body: JSON.stringify(body),
+    done: () => finish(/==> ok\s*$/.test(out.textContent)),
+    error: (msg) => { out.append("\n" + msg); finish(false); } });
+}
+
 // the plan/apply flow, reachable from anywhere through the "pending changes" badge
 async function openPlan() {
   const st = status || {};
@@ -243,7 +290,7 @@ async function openPlan() {
       toast(ok ? "Applied" : "Apply failed");
       refreshStatus().catch(() => {});
     };
-    stream("/apply", preSink(out), { method: "POST", body: JSON.stringify({ commit: st.commit }),
+    stream("/apply", preSink(out), { method: "POST", body: JSON.stringify({ commit: st.commit, trigger: "ui" }),
       done: () => finish(/==> ok\s*$/.test(out.textContent)),
       error: (msg) => { out.append("\n" + msg); finish(false); } });
   } }, "Apply");
@@ -304,19 +351,20 @@ function renderChrome(st) {
     h("span", { title: "~/vops on the host is at this commit" }, icon("commit"), h("span", { class: "mono" }, short(st.commit, 8) || "no commits")),
     h("span", { class: "dom", title: "domain (vops.yml)" }, icon("globe"), st.domain || "no domain"));
   $pending.hidden = !st.changes;
-  const sig = JSON.stringify(st.projects.map((p) => [p.path, health(p)]));
+  const sig = JSON.stringify([st.projects.map((p) => [p.path, health(p)]), st.previews]);
   if (sig !== sideSig) {
     sideSig = sig;
-    $sideProjects.replaceChildren(...(st.projects.length ? treeRows(st.projects).map((r) => r.project
-      ? h("a", { class: "sp", href: "#/p/" + enc(r.project.path) + "/services", "data-path": r.project.path, style: "--d:" + r.depth, title: r.project.path }, healthDot(r.project), h("span", { class: "name" }, r.name))
-      : h("div", { class: "sp folder", style: "--d:" + r.depth }, r.name + "/")) : [h("div", { class: "side-empty" }, "No projects yet")]));
+    $sideProjects.replaceChildren(...(st.projects.length ? treeRows(st.projects).flatMap((r) => r.project
+      ? [h("a", { class: "sp", href: "#/p/" + enc(r.project.path) + "/services", "data-path": r.project.path, style: "--d:" + r.depth, title: r.project.path }, healthDot(r.project), h("span", { class: "name" }, r.name)),
+        ...previewsOf(st, r.project.path).map((x) => h("a", { class: "sp pv", href: projectHref(x.project, "previews"), style: "--d:" + (r.depth + 1), title: "preview " + x.name + " of " + x.project }, icon("git"), h("span", { class: "name" }, x.name)))]
+      : [h("div", { class: "sp folder", style: "--d:" + r.depth }, r.name + "/")]) : [h("div", { class: "side-empty" }, "No projects yet")]));
   }
   markActive();
 }
 
 function currentProject(path) {
   const m = path.match(PROJECT_RE) || path.match(/^\/logs\/(.+)$/);
-  return m ? dec(m[1]) : null;
+  return m ? dec(m[1]).split("@")[0] : null;
 }
 function markActive() {
   const path = location.hash.slice(1).split("?")[0] || "/";
@@ -375,7 +423,8 @@ function stats(st) {
     card("Projects", st.projects.length, [disabled ? disabled + " disabled" : "", disabled && invalid ? " · " : "", invalid ? h("span", { class: "error" }, invalid + " invalid") : "", !disabled && !invalid ? "all enabled" : ""]),
     card("Containers running", [running, h("span", { class: "of" }, " / " + all.length)], down ? down + " not running" : done ? done + " finished job" + (done > 1 ? "s" : "") : "none down", down ? "bad" : ""),
     card("Pending changes", st.changes ? pending || "yes" : 0, st.changes ? h("button", { class: "linkbtn", onclick: openPlan }, "Review and apply") : "in sync with git", st.changes ? "warn" : ""),
-    card("Last deploy", last ? ago(last.applied_at) : "never", last ? h("a", { href: "#/p/" + enc(last.path) + "/services" }, last.path) : "", "", last ? fullDate(last.applied_at) : null));
+    card("Last deploy", last ? ago(last.applied_at) : "never", last ? h("a", { href: projectHref(last.path, "timeline") }, last.path) : "", "", last ? fullDate(last.applied_at) : null),
+    card("Previews", (st.previews || []).length, (st.previews || []).length ? [...new Set(st.previews.map((x) => x.project))].map((p, i) => [i ? ", " : "", h("a", { href: projectHref(p, "previews") }, p)]) : "none running"));
 }
 
 function dots(containers) {
@@ -393,6 +442,7 @@ function projectList(st) {
     }
     rows.push(h("div", { class: "prow" + (p.services.length ? " has-svc" : ""), style: "--d:" + r.depth },
       healthDot(p), h("a", { class: "pname", href: "#/p/" + enc(p.path) + "/services" }, r.name), projectTags(p),
+      previewsOf(st, p.path).length ? h("a", { class: "tag accent", href: projectHref(p.path, "previews"), title: "previews" }, icon("git"), previewsOf(st, p.path).length) : null,
       h("span", { class: "meta" }, p.commit ? ["applied ", mono(short(p.commit, 8)), " · ", when(p.applied_at)] : "never applied")));
     p.services.forEach((s, i) => rows.push(h("div", { class: "srow" + (i === p.services.length - 1 ? " last" : ""), style: "--d:" + r.depth },
       dots(s.containers),
@@ -421,12 +471,14 @@ async function overview(alive) {
 
 const TABS = [
   { id: "services", label: "Services", live: true, render: servicesTab },
+  { id: "timeline", label: "Timeline", render: timelineTab },
+  { id: "previews", label: "Previews", render: previewsTab, count: (ctx) => previewsOf(ctx.st, ctx.path).length },
   { id: "logs", label: "Logs", fill: true, render: logsTab },
   { id: "env", label: "Environment", render: envTab },
-  { id: "data", label: "Data", render: dataTab },
   { id: "events", label: "Events", render: eventsTab },
 ];
-const PROJECT_RE = new RegExp("^/p/(.+?)(?:/(" + TABS.map((t) => t.id).join("|") + "))?/?$");
+const TAB_ALIASES = { data: "timeline" }; // old links
+const PROJECT_RE = new RegExp("^/p/(.+?)(?:/(" + [...TABS.map((t) => t.id), ...Object.keys(TAB_ALIASES)].join("|") + "))?/?$");
 const projectHref = (path, tab = "services", q = "") => "#/p/" + enc(path) + "/" + tab + q;
 
 async function projectPage(alive, path, tabId, params) {
@@ -435,17 +487,19 @@ async function projectPage(alive, path, tabId, params) {
   if (!alive()) return;
   const find = (st) => st.projects.find((x) => x.path === path);
   if (!find(st)) return page(head({ title: path }), panel(empty("Unknown project", "Nothing at this path in ~/vops. It may have been removed from git.", h("a", { class: "btn", href: "#/" }, "Back to overview"))));
-  const tab = TABS.find((t) => t.id === tabId) || TABS[0];
-  const ctx = { path, p: find(st), st, params };
-  const headBox = h("div", {}), alerts = h("div", {}), body = h("div", { class: tab.fill ? "grow" : "" });
+  const tab = TABS.find((t) => t.id === (TAB_ALIASES[tabId] || tabId)) || TABS[0];
+  const ctx = { path, p: find(st), st, params, reload: null };
+  const headBox = h("div", {}), alerts = h("div", {}), body = h("div", { class: tab.fill ? "grow" : "" }), tabs = h("nav", { class: "tabs" });
   const renderHead = () => {
     headBox.replaceChildren(projectHead(ctx));
-    alerts.replaceChildren(ctx.p.error ? alertBox("bad", "Invalid compose file", h("pre", {}, ctx.p.error)) : "");
+    put(alerts, ctx.p.error ? alertBox("bad", "Invalid compose file", h("pre", {}, ctx.p.error)) : null, restoredBanner(ctx));
+    tabs.replaceChildren(...TABS.map((t) => {
+      const n = t.id === "services" ? ctx.p.services.length : t.count ? t.count(ctx) : null;
+      return h("a", { href: projectHref(path, t.id), class: t === tab ? "active" : null }, t.label, n ? h("span", { class: "count" }, n) : null);
+    }));
   };
   $app.className = tab.fill ? "fill" : "";
-  page(headBox, alerts,
-    h("nav", { class: "tabs" }, TABS.map((t) => h("a", { href: projectHref(path, t.id), class: t === tab ? "active" : null }, t.label, t.id === "services" ? h("span", { class: "count" }, ctx.p.services.length) : null))),
-    body);
+  page(headBox, alerts, tabs, body);
   renderHead();
   tab.render(ctx, body);
   onStatus = (st) => {
@@ -504,16 +558,19 @@ function logsTab(ctx, box) {
   onLeave(lv.stop);
 }
 
+// env vars, write-only. Scope: production, or the previews' secrets (previews never get production's env).
 function envTab(ctx, box) {
   const { path } = ctx;
+  const preview = ctx.params.get("scope") === "previews";
+  const scope = preview ? "&preview=1" : "";
   const key = h("input", { placeholder: "KEY", pattern: "[A-Za-z_][A-Za-z0-9_]*", required: true, class: "mono", autocomplete: "off" });
   const val = h("input", { placeholder: "value", type: "password", autocomplete: "new-password" });
   const setBtn = h("button", { class: "btn primary" }, "Set");
   const form = h("form", { class: "inline", onsubmit: (e) => {
     e.preventDefault();
     busy(setBtn, async () => {
-      await api("POST", "/env", { project: path, key: key.value, value: val.value });
-      toast(key.value + " set. Apply to deploy it.");
+      await api("POST", "/env", { project: path, key: key.value, value: val.value, preview });
+      toast(key.value + (preview ? " set. Previews get it on their next update." : " set. Apply to deploy it."));
       key.value = val.value = "";
       load();
       refreshStatus().catch(() => {});
@@ -522,77 +579,287 @@ function envTab(ctx, box) {
   const list = h("div", {}, loading("Loading…", "pad"));
   const load = async () => {
     let envs;
-    try { envs = await api("GET", "/env?project=" + enc(path)); } catch (e) { return list.replaceChildren(errorBox(e)); }
+    try { envs = await api("GET", "/env?project=" + enc(path) + scope); } catch (e) { return list.replaceChildren(errorBox(e)); }
     list.replaceChildren(envs.length ? table(["Name", "Value", ""], envs.map((e) => h("tr", {},
       h("td", { class: "mono wrapany" }, e.key),
       h("td", { class: "muted small" }, "••••••••  set ", when(e.updated_at)),
       h("td", { class: "actions-cell" }, h("button", { class: "btn sm danger", onclick: async () => {
         if (!(await confirmDialog({ title: `Remove ${e.key}?`, ok: "Remove", danger: true,
-          body: [h("p", {}, "Services of ", h("strong", {}, path), " that use it lose it on the next apply."), "Values are write-only: to restore it you have to set it again."] }))) return;
+          body: [h("p", {}, preview ? "Previews of " : "Services of ", h("strong", {}, path), preview ? " lose it on their next update." : " that use it lose it on the next apply."), "Values are write-only: to restore it you have to set it again."] }))) return;
         try {
-          await api("DELETE", "/env?project=" + enc(path) + "&key=" + enc(e.key));
+          await api("DELETE", "/env?project=" + enc(path) + "&key=" + enc(e.key) + scope);
           toast(e.key + " removed");
           load();
           refreshStatus().catch(() => {});
         } catch (x) { toast(x.message); }
       } }, "Remove")))))
-      : empty("No variables", "Values are write-only. Use them as ${KEY} in compose.yml or with environment: [KEY]."));
+      : empty("No variables", preview ? "Secrets only previews get, on top of preview.env." : "Values are write-only. Use them as ${KEY} in compose.yml or with environment: [KEY]."));
   };
-  box.replaceChildren(panel(panelHead(h("h2", {}, "Environment variables"), h("span", { class: "muted small" }, "write-only: values are never shown again")), list, h("div", { class: "panel-foot" }, form)));
+  const seg = h("div", { class: "seg", role: "tablist" },
+    h("a", { href: projectHref(path, "env"), class: preview ? null : "active" }, "Production"),
+    h("a", { href: projectHref(path, "env", "?scope=previews"), class: preview ? "active" : null }, "Previews"));
+  box.replaceChildren(panel(panelHead(h("h2", {}, "Environment variables"), seg, h("span", { class: "muted small" }, "write-only: values are never shown again")),
+    h("div", { class: "panel-note small muted" }, preview
+      ? ["Previews don't inherit production's env: they read ", mono("preview.env"), " from ", mono(path + "/"), " in the repo, then these secrets on top."]
+      : ["Used as ", mono("${KEY}"), " in compose.yml or with ", mono("environment: [KEY]"), ". Changes deploy on the next apply."]),
+    list, h("div", { class: "panel-foot" }, form)));
   load();
 }
 
-// snapshots: btrfs copies of a project's data; taken before every deploy, restorable
-function dataTab(ctx, box) {
+// ---- data: restore and branch. The history of a project is a list of nodes (deploys, rollbacks, snapshots);
+// a node's snapshot is always the data right before it happened, so "restore" and "preview from here" start there.
+
+// after a restore, until the next deploy: "Data restored to #N · when · Undo"
+function restoredBanner(ctx) {
+  const d = ctx.p.last_deploy;
+  if (!d || d.trigger !== "rollback" || d.result !== "ok" || d.undoes) return null;
+  const undo = h("button", { class: "btn sm", onclick: () => restoreSnapshot(ctx, { id: d.snapshot_id, commit: d.commit, created_at: d.started_at }, "the data from right before this restore") }, icon("undo"), "Undo");
+  return alertBox("warn", `Data restored to snapshot #${d.restored_id}`,
+    h("span", { class: "small" }, when(d.finished_at), " · code was not rolled back · shown until the next deploy of this project"), d.snapshot_id ? undo : null);
+}
+
+// restoreSnapshot asks (stating what happens to containers, data and code), then streams the rollback
+async function restoreSnapshot(ctx, snap, what) {
   const { path } = ctx;
-  const content = h("div", { class: "stack" }, loading());
-  const out = h("pre", { class: "out", hidden: true });
-  box.replaceChildren(content, out);
+  const now = ctx.p.commit;
+  const code = snap.commit && now && snap.commit !== now
+    ? [h("p", {}, "Code is not rolled back: this data belongs to ", mono(short(snap.commit, 8)), ", while ", h("strong", {}, path), " runs ", mono(short(now, 8)), ". To run the matching code, revert it in git and sync:"),
+      h("pre", { class: "cmd" }, `git restore --source=${short(snap.commit)} --staged --worktree -- ${path}/\ngit commit -m "${path}: code back to ${short(snap.commit, 8)}"\nvops sync`)]
+    : h("p", {}, "Code is not touched", snap.commit ? ["; this data belongs to the commit running now (", mono(short(snap.commit, 8)), ")."] : ".");
+  if (!(await confirmDialog({ title: `Restore ${path} data to #${snap.id}?`, ok: "Restore data", danger: true, body: [
+    h("p", {}, "Puts back ", h("strong", {}, what), snap.created_at ? [" (", what.includes("#" + snap.id) ? "" : "snapshot #" + snap.id + ", ", "taken ", when(snap.created_at), ")"] : "", "."),
+    "Its containers stop for a few seconds while the data is put back, then start again.",
+    "The current data is snapshotted first, so this can be undone.",
+    code] }))) return;
+  streamDialog({ title: `Restoring ${path} to #${snap.id}`, path: "/rollback", body: { project: path, id: snap.id },
+    done: (ok) => { if (ok) toast("Data restored"); ctx.reload && ctx.reload(); refreshStatus().catch(() => {}); } });
+}
+
+const nameRe = "[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?";
+const dataWarning = () => alertBox("warn", "Previews hold a copy of production data",
+  h("span", { class: "small" }, "Real personal data, and whatever the code does with it: queued emails, webhooks, scheduled charges. Previews never get production's env (Environment → Previews), but anything they don't redirect still goes out for real."));
+
+// previewUp streams a preview creation from a body the dialogs built
+function previewUp(ctx, body) {
+  streamDialog({ title: `Preview ${body.name} of ${ctx.path}`, path: "/previews", body: { project: ctx.path, ...body },
+    done: (ok) => {
+      if (ok) toast("Preview " + body.name + " is up");
+      refreshStatus().catch(() => {});
+      ctx.reload && ctx.reload();
+    } });
+}
+
+// previewFrom: "Preview from here" on a timeline node: its commit, its images (by digest), its snapshot
+function previewFrom(ctx, n, t) {
+  const dep = n.deploy, s = n.snapshot;
+  const commit = dep ? dep.commit : s.commit;
+  const images = {};
+  for (const [svc, img] of Object.entries(n.images || {})) if (!img.built) images[svc] = pinned(img);
+  const name = h("input", { value: dep ? "at-" + dep.id : "snap-" + s.id, required: true, pattern: nameRe, class: "mono", "aria-label": "name", maxlength: 32 });
+  const d = h("dialog", { class: "modal" }, h("form", { onsubmit: (e) => {
+    e.preventDefault();
+    d.close();
+    previewUp(ctx, { name: name.value, ref: commit, images, from: s ? s.id : 0, deploy: dep ? dep.id : 0 });
+  } },
+    h("div", { class: "modal-head" }, h("h3", {}, dep ? `Preview from #${dep.id}` : `Preview from snapshot #${s.id}`)),
+    h("div", { class: "modal-body" },
+      h("label", { class: "field" }, "Name (its urls are <service>.<name>." + ctx.path.split("/").reverse().join(".") + ".…)", name),
+      h("dl", { class: "kv small" },
+        h("dt", {}, "Code"), h("dd", {}, commit ? commitLine(commit, t.subjects) : "the applied commit"),
+        h("dt", {}, "Images"), h("dd", {}, Object.keys(images).length ? Object.entries(n.images).filter(([, img]) => !img.built).map(([svc, img]) => h("div", { class: "mono wrapany", title: images[svc] }, svc + ": " + imgName(img.image), img.digest ? h("span", { class: "faint" }, " @" + short(img.digest, 7)) : null)) : "as in that commit"),
+        h("dt", {}, "Data"), h("dd", {}, s ? ["a copy of snapshot #" + s.id + " (", n.kind === "snapshot" ? when(s.created_at) : "right before this " + (n.kind === "rollback" ? "restore" : "deploy"), ")", n.kind === "deploy" ? "; its migrations run again on the copy" : ""] : h("span", { class: "warn-text" }, "this point has no snapshot: the preview gets a copy of the current data"))),
+      h("p", { class: "small" }, "The data is a copy of production's: personal data, and whatever the code does with it.")),
+    h("div", { class: "modal-foot" }, h("button", { type: "button", class: "btn", onclick: () => d.close() }, "Cancel"), h("button", { class: "btn primary" }, "Create preview"))));
+  d.addEventListener("close", () => d.remove());
+  document.body.append(d);
+  d.showModal();
+  name.select();
+}
+
+function changeLine(c) {
+  const img = (x) => h("span", { title: x.image + (x.digest ? "@" + x.digest : "") }, imgName(x.image));
+  let what;
+  if (!c.from) what = ["+ ", img(c.to)];
+  else if (!c.to) what = h("span", { class: "faint" }, "removed");
+  else if (c.from.image === c.to.image) what = [img(c.to), " ", h("span", { class: "faint" }, "@" + short(c.from.digest, 7)), " → @" + short(c.to.digest, 7)];
+  else what = [img(c.from), " → ", img(c.to)];
+  return h("div", { class: "chg mono small wrapany" }, h("span", { class: "svc" }, c.service), " ", what);
+}
+
+function timelineTab(ctx, box) {
+  const { path } = ctx;
+  box.replaceChildren(loading());
   const load = async () => {
-    let res;
-    try { res = await api("GET", "/snapshots?project=" + enc(path)); } catch (e) { return content.replaceChildren(errorBox(e)); }
-    const d = res.data;
+    let t;
+    try { t = await api("GET", "/timeline?project=" + enc(path)); } catch (e) { return box.replaceChildren(errorBox(e)); }
+    const d = t.data;
+    const snapBadge = (n) => {
+      const s = n.snapshot;
+      if (!s) return n.kind === "snapshot" ? null : h("span", { class: "tag faint", title: "No data to snapshot then, snapshots off, or pruned (snapshot_keep)" }, "no snapshot");
+      const why = n.kind === "deploy" ? "the data right before this deploy" : n.kind === "rollback" ? "the data right before this restore" : s.reason + " snapshot";
+      return h("span", { class: "tag", title: `snapshot #${s.id}: ${why} (${fullDate(s.created_at)})` }, icon("camera"), "#" + s.id);
+    };
+    // "put back snapshot #40: the data from right before deploy #12"
+    const restoredFrom = (id) => {
+      const o = t.nodes.find((x) => x.snapshot && x.snapshot.id === id);
+      if (!o || o.kind === "snapshot") return o && o.snapshot.note ? " (“" + o.snapshot.note + "”)" : "";
+      return ": the data from right before " + (o.kind === "deploy" ? "deploy #" : "restore #") + o.deploy.id;
+    };
+    const chips = (n) => n.previews.map((name) => h("a", { class: "tag accent", href: projectHref(path, "previews"), title: "preview " + name + " branched from here" }, icon("git"), name));
+    const node = (n) => {
+      const dep = n.deploy, s = n.snapshot;
+      let title, cls = n.kind;
+      if (n.kind === "deploy") {
+        title = ["Deploy ", h("span", { class: "faint" }, "#" + dep.id)];
+        if (dep.result === "failed") cls += " failed";
+      } else if (n.kind === "rollback") {
+        title = dep.undoes ? ["Undo of ", h("span", { class: "faint" }, "#" + dep.undoes)] : ["Data restored ", h("span", { class: "faint" }, "#" + dep.id)];
+        if (dep.result === "failed") cls += " failed";
+      } else title = [s.reason === "manual" ? "Snapshot" : s.reason + " snapshot", " ", h("span", { class: "faint" }, "#" + s.id)];
+      const restore = s ? h("button", { class: "btn sm", title: n.kind === "rollback" ? "Put back the data from right before this restore" : "Put back " + (n.kind === "deploy" ? "the data from right before this deploy" : "this snapshot"),
+        onclick: () => restoreSnapshot(ctx, s, n.kind === "deploy" ? `the data from right before deploy #${dep.id}` : n.kind === "rollback" ? "the data from right before this restore" : `snapshot #${s.id}`) },
+        n.kind === "rollback" ? [icon("undo"), "Undo"] : "Restore data") : null;
+      const del = n.kind === "snapshot" ? h("button", { class: "btn sm danger", onclick: async () => {
+        if (!(await confirmDialog({ title: `Delete snapshot #${s.id}?`, ok: "Delete", danger: true,
+          body: [`${s.reason} snapshot taken ${ago(s.created_at)}${s.note ? ` (${s.note})` : ""}. It can't be recovered.`] }))) return;
+        try { await api("DELETE", "/snapshots?id=" + s.id); toast("Snapshot #" + s.id + " deleted"); load(); } catch (x) { toast(x.message); }
+      } }, "Delete") : null;
+      return h("li", { class: "tl-node " + cls },
+        h("span", { class: "tl-dot" }),
+        h("div", { class: "tl-body" },
+          h("div", { class: "tl-head" }, h("strong", {}, title),
+            dep && n.kind === "deploy" ? h("span", { class: "tag" + (dep.trigger === "push" ? " accent" : "") }, dep.trigger) : null,
+            dep && dep.result === "failed" ? h("span", { class: "tag bad" }, "failed") : null,
+            h("span", { class: "spacer" }), h("span", { class: "muted small" }, when(n.at))),
+          n.kind === "rollback" ? h("div", { class: "small" }, "put back snapshot #" + dep.restored_id, restoredFrom(dep.restored_id), h("span", { class: "muted" }, " · code unchanged")) : null,
+          h("div", { class: "tl-line" }, n.commit ? commitLine(n.commit, t.subjects) : h("span", { class: "faint small" }, "no commit")),
+          n.kind === "deploy" && n.changes.length ? h("div", { class: "tl-changes" }, n.changes.map(changeLine)) : null,
+          n.kind === "deploy" && !n.changes.length && dep.summary ? h("div", { class: "muted small" }, dep.summary) : null,
+          dep && dep.error ? h("div", { class: "small error wrapany" }, dep.error) : null,
+          s && n.kind === "snapshot" && s.note ? h("div", { class: "small muted wrapany" }, "“" + s.note + "”") : null,
+          h("div", { class: "tl-foot" }, snapBadge(n), chips(n), h("span", { class: "spacer" }),
+            h("div", { class: "actions" }, restore,
+              h("button", { class: "btn sm", onclick: () => previewFrom(ctx, n, t), title: "A preview of this point: its commit and images" + (s ? ", on a copy of snapshot #" + s.id : ", on a copy of the current data") }, icon("git"), "Preview from here"),
+              del))));
+    };
+    // now: what runs, the data it has, and a manual snapshot
+    const p = ctx.p;
+    const images = Object.keys(t.images).length ? Object.entries(t.images).map(([svc, img]) => [svc, img.image, img.digest]) : p.services.map((x) => [x.name, x.image, ""]);
     const note = h("input", { placeholder: "note (optional)", "aria-label": "note" });
-    const takeBtn = h("button", { class: "btn primary", disabled: !d.supported || !d.protected.length }, "Snapshot now");
-    const take = h("form", { class: "row", onsubmit: (e) => {
+    const takeBtn = h("button", { class: "btn sm" }, icon("camera"), "Snapshot now");
+    const take = d.supported && d.protected.length ? h("form", { class: "row", onsubmit: (e) => {
       e.preventDefault();
       busy(takeBtn, async () => {
         const r = await api("POST", "/snapshots", { project: path, note: note.value });
         toast("Snapshot #" + r.snapshot.id + " taken");
         load();
       });
-    } }, note, takeBtn);
-    const restore = async (s) => {
-      if (!(await confirmDialog({ title: `Restore ${path} to snapshot #${s.id}?`, ok: "Restore", danger: true, body: [
-        "Its containers stop while the data is restored (seconds), then start again.",
-        "The current data is snapshotted first, so you can undo this.",
-        h("p", {}, "Code is not rolled back. This snapshot belongs to commit ", h("span", { class: "mono" }, short(s.commit, 8) || "?"), "."),
-      ] }))) return;
-      out.hidden = false;
-      out.textContent = "";
-      stream("/rollback", preSink(out), { method: "POST", body: JSON.stringify({ project: path, id: s.id }), done: () => { load(); refreshStatus().catch(() => {}); } });
-    };
-    const del = async (s) => {
-      if (!(await confirmDialog({ title: `Delete snapshot #${s.id}?`, ok: "Delete", danger: true,
-        body: [`${s.reason} snapshot taken ${ago(s.created_at)}${s.note ? ` (${s.note})` : ""}. It can't be recovered.`] }))) return;
-      try { await api("DELETE", "/snapshots?id=" + s.id); toast("Snapshot #" + s.id + " deleted"); load(); } catch (x) { toast(x.message); }
-    };
-    put(content,
-      !d.supported ? alertBox("warn", "Snapshots unavailable", h("span", { class: "small" }, d.reason)) : null,
+    } }, note, takeBtn) : null;
+    const pending = p.services.some((x) => x.pending);
+    const now = h("li", { class: "tl-node now" },
+      h("span", { class: "tl-dot" }),
+      h("div", { class: "tl-body" },
+        h("div", { class: "tl-head" }, h("strong", {}, "Now"), pending ? h("button", { class: "tag warn", onclick: openPlan }, "pending changes") : null,
+          h("span", { class: "spacer" }), t.applied_at ? h("span", { class: "muted small" }, "applied ", when(t.applied_at)) : null),
+        h("div", { class: "tl-line" }, t.commit ? commitLine(t.commit, t.subjects) : h("span", { class: "faint small" }, "never applied")),
+        images.length ? h("div", { class: "tl-imgs" }, images.map(([svc, image, digest]) => h("span", { class: "tag mono", title: svc + ": " + image + (digest ? "@" + digest : "") }, imgName(image).startsWith(svc + ":") ? imgName(image) : [h("span", { class: "faint" }, svc), " " + imgName(image)]))) : null,
+        h("div", { class: "tl-foot" },
+          h("span", { class: "small muted" }, d.supported ? (d.protected.length ? ["Data: ", mono(d.protected.join(", "))] : "No data to snapshot") : "Snapshots unavailable"),
+          h("span", { class: "spacer" }), take)));
+    put(box,
+      !d.supported ? alertBox("warn", "Snapshots unavailable", h("span", { class: "small" }, d.reason + ". Deploys are still recorded; restoring data and branching from a point need snapshots.")) : null,
       d.unprotected && d.unprotected.length ? alertBox("warn", "Not covered by snapshots", h("span", { class: "small" }, "Not btrfs subvolumes: ", mono(d.unprotected.join(", ")))) : null,
-      d.supported ? panel(panelHead(h("h2", {}, "Protected data")), h("div", { class: "panel-body row" }, d.protected.length ? d.protected.map((x) => h("span", { class: "tag mono" }, x)) : h("span", { class: "muted small" }, "No volumes or data dirs to protect."))) : null,
-      panel(panelHead(h("h2", {}, "Snapshots"), h("span", { class: "tag" }, res.snapshots.length), h("span", { class: "spacer" }), take),
-        res.snapshots.length ? table(["#", "Kind", "Taken", "Commit", "Note", ""], res.snapshots.map((s) => h("tr", {},
-          h("td", { class: "mono" }, s.id),
-          h("td", {}, h("span", { class: "tag" + (s.reason === "manual" ? " accent" : "") }, s.reason)),
-          h("td", { class: "muted" }, when(s.created_at)),
-          h("td", { class: "mono small" }, short(s.commit, 8)),
-          h("td", { class: "small wrapany" }, s.note),
-          h("td", { class: "actions-cell" }, h("div", { class: "actions" },
-            h("button", { class: "btn sm", onclick: () => restore(s) }, "Restore"),
-            h("button", { class: "btn sm danger", onclick: () => del(s) }, "Delete"))))))
-          : empty("No snapshots yet", "One is taken automatically before every deploy that changes this project.")));
+      panel(h("ol", { class: "tl" }, now, t.nodes.map(node)),
+        t.nodes.length ? null : h("div", { class: "panel-foot muted small" }, "No history yet: every apply that changes this project is recorded here, with a snapshot of its data taken right before.")));
   };
+  ctx.reload = load;
+  load();
+}
+
+// previews of this project: what runs, where it came from, when it expires
+function previewsTab(ctx, box) {
+  const { path, st } = ctx;
+  const formBox = h("div", { hidden: true });
+  const list = h("div", {}, loading("Loading…", "pad"));
+  const newBtn = h("button", { class: "btn primary sm", onclick: () => { formBox.hidden = !formBox.hidden; if (!formBox.hidden) openForm(); } }, "New preview");
+  box.replaceChildren(h("div", { class: "stack" }, dataWarning(), formBox, panel(panelHead(h("h2", {}, "Previews"), h("span", { class: "spacer" }), newBtn), list)));
+
+  const openForm = async () => {
+    const name = h("input", { required: true, pattern: nameRe, class: "mono", placeholder: "pr-42", maxlength: 32 });
+    const ref = h("input", { class: "mono", placeholder: "branch, tag or commit" });
+    const images = h("textarea", { class: "mono", rows: 2, placeholder: "web=registry.example.com/shop/web:pr-42" });
+    const from = h("select", {}, h("option", { value: "0" }, "Copy of the current data"));
+    const go = h("button", { class: "btn primary" }, "Create preview");
+    api("GET", "/snapshots?project=" + enc(path)).then((r) => from.append(...r.snapshots.map((x) =>
+      h("option", { value: x.id }, `Snapshot #${x.id} · ${x.reason} · ${ago(x.created_at)}${x.note ? " · " + x.note : ""}`)))).catch(() => {});
+    put(formBox, panel(panelHead(h("h2", {}, "New preview"), h("span", { class: "muted small" }, "a full copy of " + path + " on its own urls")),
+      h("form", { class: "panel-body pvform", onsubmit: (e) => {
+        e.preventDefault();
+        const imgs = {};
+        for (const line of images.value.split(/[\n,]/).map((x) => x.trim()).filter(Boolean)) {
+          const i = line.indexOf("=");
+          if (i < 1) return toast(`"${line}": expected service=image`);
+          imgs[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+        }
+        formBox.hidden = true;
+        previewUp(ctx, { name: name.value, ref: ref.value.trim(), images: imgs, from: Number(from.value) });
+      } },
+        h("label", { class: "field" }, "Name", name),
+        h("label", { class: "field" }, "Git ref (default: the applied commit)", ref),
+        h("label", { class: "field" }, "Data", from),
+        h("label", { class: "field wide" }, "Image overrides (service=image, one per line)", images),
+        h("div", { class: "row" }, go))));
+    name.focus();
+  };
+
+  const load = async () => {
+    let pvs;
+    try { pvs = await api("GET", "/previews?project=" + enc(path)); } catch (e) { return list.replaceChildren(errorBox(e)); }
+    if (!pvs.length) {
+      const reg = st.domain ? "registry." + st.domain : "registry.<domain>";
+      const own = ctx.p.services.find((x) => x.image.startsWith(reg + "/"));
+      const repo = own ? own.image.slice(reg.length + 1).replace(/[:@].*$/, "") : path + "/" + ((ctx.p.services[0] || {}).name || "web");
+      const dom = ((own && own.domains.length ? own : ctx.p.services.find((x) => x.domains.length)) || { domains: [] }).domains[0];
+      return put(list, h("div", { class: "empty" },
+        h("strong", {}, "No previews"),
+        h("div", { class: "small" }, "Push an image with a ", mono("preview-*"), " tag: vops creates preview ", mono("pr-42"), " with it (pushing the project's other images with the same tag lands in the same preview). Production is never redeployed by these tags."),
+        h("pre", { class: "cmd" }, `podman push ${reg}/${repo}:preview-pr-42`),
+        dom ? h("div", { class: "small" }, "→ ", mono(domainURL(st, dom.replace(/^([^.]+)\./, "$1.pr-42.")))) : null,
+        h("div", { class: "small" }, "Or: New preview above, Preview from here on the Timeline, or ", mono(`vops preview up ${path} --name pr-42`), ".")));
+    }
+    put(list, h("div", { class: "pvlist" }, pvs.map((pv) => {
+      const urls = pv.services.flatMap((x) => x.domains.slice(-1)).map((dm) => domainURL(st, dm));
+      const cs = pv.services.flatMap((x) => x.containers);
+      const del = h("button", { class: "btn sm danger", onclick: async () => {
+        if (!(await confirmDialog({ title: `Delete preview ${pv.name}?`, ok: "Delete preview", danger: true,
+          body: [`Removes its containers, networks and volumes, its copy of the data and its worktree (${pv.path}). Production is not touched.`, "Registry tags pushed for it stay."] }))) return;
+        await busy(del, async () => {
+          await api("DELETE", "/previews?project=" + enc(path) + "&name=" + enc(pv.name));
+          toast("Preview " + pv.name + " deleted");
+          refreshStatus().catch(() => {});
+          load();
+        });
+      } }, "Delete");
+      const origin = [pv.deploy_id ? h("a", { href: projectHref(path, "timeline") }, "deploy #" + pv.deploy_id) : pv.snapshot_id ? "snapshot #" + pv.snapshot_id : null,
+        pv.deploy_id || pv.snapshot_id ? " · " : null, "commit ", mono(short(pv.commit, 8)), pv.ref && !pv.commit.startsWith(pv.ref) ? [" (", mono(pv.ref), ")"] : null];
+      const overrides = Object.entries(pv.images || {});
+      return h("div", { class: "pv" },
+        h("div", { class: "pv-head" }, dots(cs), h("strong", { class: "mono" }, pv.name), pv.error ? h("span", { class: "tag bad", title: pv.error }, "error") : null,
+          h("span", { class: "muted small", title: "removed when not updated for preview_ttl (vops.yml); an update or push resets it · " + fullDate(pv.expires_at) }, "expires " + until(pv.expires_at)),
+          h("span", { class: "spacer" }),
+          h("div", { class: "actions" },
+            urls.length ? h("a", { class: "btn sm", href: urls[0], target: "_blank", rel: "noopener" }, icon("external"), "Open") : null,
+            h("a", { class: "btn sm", href: "#/logs/" + enc(pv.path) }, "Logs"), del)),
+        pv.error ? h("div", { class: "small error wrapany" }, pv.error) : null,
+        h("dl", { class: "kv small" },
+          urls.length ? [h("dt", {}, "URLs"), h("dd", {}, urls.map((u) => h("div", { class: "wrapany" }, h("a", { href: u, target: "_blank", rel: "noopener" }, u))))] : null,
+          h("dt", {}, "From"), h("dd", {}, origin),
+          h("dt", {}, "Data"), h("dd", { class: "wrapany" }, pv.data || "—"),
+          h("dt", {}, "Images"), h("dd", {}, overrides.length ? overrides.map(([svc, ref]) => h("div", { class: "mono wrapany", title: ref }, svc + ": " + imgName(ref))) : h("span", { class: "muted" }, "production's")),
+          h("dt", {}, "Created"), h("dd", {}, when(pv.created_at), " · updated ", when(pv.updated_at))));
+    })));
+  };
+  ctx.reload = load;
   load();
 }
 
@@ -788,11 +1055,17 @@ async function logsPage(alive, path, service) {
   let st;
   try { st = await getStatus(); } catch (e) { return failed(e, alive); }
   if (!alive()) return;
-  const p = st.projects.find((x) => x.path === path);
   const q = service ? "?service=" + enc(service) : "";
-  const lv = logView({ path, service, services: p ? p.services.map((s) => s.name) : [], hrefFor: (svc) => "#/logs/" + enc(path) + (svc ? "?service=" + enc(svc) : "") });
-  page(head({ title: [path, service ? " / " + service : ""], crumbs: "Logs · ", dot: p ? healthDot(p, "lg") : null,
-    actions: h("a", { class: "btn", href: projectHref(path, "logs", q) }, icon("back"), "Project") }), lv.el);
+  // a preview (shop@pr-42) has no status entry: its services come from the previews api, and "back" is its project's Previews tab
+  const [base, preview] = path.split("@");
+  let p = st.projects.find((x) => x.path === path), services = p ? p.services.map((s) => s.name) : [];
+  if (preview) {
+    try { services = ((await api("GET", "/previews?project=" + enc(base))).find((x) => x.name === preview) || { services: [] }).services.map((s) => s.name); } catch {}
+    if (!alive()) return;
+  }
+  const lv = logView({ path, service, services, hrefFor: (svc) => "#/logs/" + enc(path) + (svc ? "?service=" + enc(svc) : "") });
+  page(head({ title: [path, service ? " / " + service : ""], crumbs: preview ? "Preview logs · " : "Logs · ", dot: p ? healthDot(p, "lg") : null,
+    actions: h("a", { class: "btn", href: preview ? projectHref(base, "previews") : projectHref(path, "logs", q) }, icon("back"), preview ? "Previews" : "Project") }), lv.el);
   lv.start();
   onLeave(lv.stop);
 }

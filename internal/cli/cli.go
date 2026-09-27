@@ -46,6 +46,7 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   registry ls [repo] | rm <repo:tag> | gc
   snapshot ls [project] | create <project> [-m note] | rm <id>
   rollback <project> [snapshot-id] [-y]   put a snapshot's data back (undoable)
+  history <project> [-n N]           deploys, rollbacks and snapshots, newest first
   admin password                     set the dashboard password
   events [project]                   what happened (deploys, pushes, config)
   audit [-n N]                       every write to the host's state
@@ -100,7 +101,7 @@ func Main(args []string) int {
 		err = cmdRollback(g, rest)
 	case "preview":
 		err = cmdPreview(g, rest)
-	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit":
+	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit", "history":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)

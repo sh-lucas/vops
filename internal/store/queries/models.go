@@ -13,6 +13,22 @@ type AuditLog struct {
 	Detail string `json:"detail"`
 }
 
+type Deploy struct {
+	ID         int64  `json:"id"`
+	Project    string `json:"project"`
+	CommitSha  string `json:"commit_sha"`
+	Trigger    string `json:"trigger"`
+	Images     string `json:"images"`
+	SnapshotID int64  `json:"snapshot_id"`
+	RestoredID int64  `json:"restored_id"`
+	Undoes     int64  `json:"undoes"`
+	Result     string `json:"result"`
+	Error      string `json:"error"`
+	Summary    string `json:"summary"`
+	StartedAt  int64  `json:"started_at"`
+	FinishedAt int64  `json:"finished_at"`
+}
+
 type Env struct {
 	Project   string `json:"project"`
 	Key       string `json:"key"`
@@ -43,6 +59,7 @@ type Preview struct {
 	Data       string `json:"data"`
 	CreatedAt  int64  `json:"created_at"`
 	UpdatedAt  int64  `json:"updated_at"`
+	DeployID   int64  `json:"deploy_id"`
 }
 
 type Project struct {

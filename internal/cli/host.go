@@ -80,6 +80,7 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	yes := fs.Bool("yes", false, "")
 	fs.BoolVar(yes, "y", false, "")
 	commit := fs.String("commit", "", "")
+	trigger := fs.String("trigger", "apply", "")
 	follow := fs.Bool("f", false, "")
 	n := fs.Int("n", 200, "")
 	grep := fs.String("grep", "", "")
@@ -138,7 +139,7 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		if !*yes {
 			return errors.New("apply on the host needs --yes (the cli shows the plan first)")
 		}
-		resp, err := c.do("POST", "/api/apply", jsonBody(map[string]any{"commit": *commit, "projects": pos}))
+		resp, err := c.do("POST", "/api/apply", jsonBody(map[string]any{"commit": *commit, "projects": pos, "trigger": *trigger}))
 		if err != nil {
 			return err
 		}
@@ -553,6 +554,56 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			return nil
 		}
 		return fmt.Errorf("preview %s: unknown", sub)
+
+	case "history":
+		project, err := arg(0, "project")
+		if err != nil {
+			return err
+		}
+		var t deploy.Timeline
+		if err := getJSON(c, "/api/timeline?project="+url.QueryEscape(project), &t); err != nil {
+			return err
+		}
+		if *asJSON {
+			b, _ := json.Marshal(t)
+			_, err := fmt.Fprintln(out, string(b))
+			return err
+		}
+		fmt.Fprintf(out, "now: %.12s %s\n", orDash(t.Commit), t.Subjects[t.Commit])
+		tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "#\tWHEN\tTRIGGER\tCOMMIT\tRESULT\tDATA BEFORE\tWHAT")
+		shown := 0
+		for _, nd := range t.Nodes {
+			if shown == *n {
+				break
+			}
+			shown++
+			snap := "-"
+			if nd.Snapshot != nil {
+				snap = fmt.Sprintf("snapshot #%d", nd.Snapshot.ID)
+			}
+			if nd.Kind == "snapshot" {
+				s := nd.Snapshot
+				fmt.Fprintf(tw, "\t%s\t%s\t%.12s\t\t%s\t%s\n", ago(s.CreatedAt), s.Reason, s.Commit, snap, s.Note)
+				continue
+			}
+			d := nd.Deploy
+			var what []string
+			for _, ch := range nd.Changes {
+				what = append(what, ch.Text())
+			}
+			if len(what) == 0 || d.Trigger == "rollback" {
+				what = []string{d.Summary}
+			}
+			if d.Error != "" {
+				what = append(what, d.Error)
+			}
+			if len(nd.Previews) > 0 {
+				what = append(what, "previews: "+strings.Join(nd.Previews, ","))
+			}
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%.12s\t%s\t%s\t%s\n", d.ID, ago(d.StartedAt), d.Trigger, d.Commit, d.Result, snap, strings.Join(what, "; "))
+		}
+		return tw.Flush()
 
 	case "audit":
 		var logs []store.Audit

@@ -241,20 +241,21 @@ func (e *Engine) deleteSnapshot(ctx context.Context, s store.Snapshot) error {
 
 // preDeploy snapshots a project's data before a deploy changes it. No data is fine; a failed
 // snapshot aborts the deploy (set snapshots: off in vops.yml to deploy without them).
-func (e *Engine) preDeploy(ctx context.Context, w io.Writer, pp *ProjectPlan, commit string) error {
+// It returns the snapshot id, 0 when none was taken.
+func (e *Engine) preDeploy(ctx context.Context, w io.Writer, pp *ProjectPlan, commit string) (int64, error) {
 	if !e.snapshotsOn() || !snapshot.Supported(e.SnapshotDir) {
-		return nil
+		return 0, nil
 	}
 	vols, _, users, err := e.projectData(ctx, pp.Path)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	current, _ := e.DB.Projects()
-	_, err = e.snap(ctx, w, store.Snapshot{Project: pp.Path, Reason: "pre-deploy", Note: "before " + short(commit), Commit: current[pp.Path].Commit, Volumes: vols}, users)
+	s, err := e.snap(ctx, w, store.Snapshot{Project: pp.Path, Reason: "pre-deploy", Note: "before " + short(commit), Commit: current[pp.Path].Commit, Volumes: vols}, users)
 	if err != nil && !errors.Is(err, errNoData) {
-		return fmt.Errorf("pre-deploy snapshot failed, nothing was deployed (snapshots: off in vops.yml skips them): %w", err)
+		return 0, fmt.Errorf("pre-deploy snapshot failed, nothing was deployed (snapshots: off in vops.yml skips them): %w", err)
 	}
-	return nil
+	return s.ID, nil
 }
 
 func short(s string) string {
@@ -314,7 +315,9 @@ func (e *Engine) LatestSnapshot(project string) (store.Snapshot, error) {
 // Rollback puts a snapshot's data back: stop the project's containers, snapshot the current data
 // (pre-rollback, so this can be undone), restore every volume, start what was running.
 // Code is not touched: the snapshot says which commit its data belongs to.
-func (e *Engine) Rollback(ctx context.Context, w io.Writer, project string, id int64) error {
+// The rollback is a row in the deploy history (trigger rollback); restoring the undo point of the previous
+// rollback marks it as that rollback's undo.
+func (e *Engine) Rollback(ctx context.Context, w io.Writer, project string, id int64) (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if !e.snapshotsOn() {
@@ -336,6 +339,18 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, project string, id i
 	if err != nil {
 		return err
 	}
+	flags, _ := e.DB.Projects()
+	rec := store.Deploy{Project: project, Commit: flags[project].Commit, Trigger: "rollback", RestoredID: id, StartedAt: time.Now().Unix()}
+	rec.Summary = fmt.Sprintf("data restored to #%d", id)
+	recent, _ := e.DB.Deploys(project, historyLimit)
+	for _, d := range recent {
+		if d.Trigger == "rollback" && d.SnapshotID == id {
+			rec.Undoes = d.ID
+			rec.Summary = fmt.Sprintf("undid #%d: data restored to #%d", d.ID, id)
+			break
+		}
+	}
+	defer func() { e.record(ctx, rec, nil, err) }()
 	var running []podman.Container
 	for _, c := range cs {
 		if c.State == "running" {
@@ -371,12 +386,12 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, project string, id i
 			current = append(current, store.SnapshotVolume{Kind: v.Kind, Name: v.Name, Source: src})
 		}
 	}
-	flags, _ := e.DB.Projects()
 	undo, err := e.snap(ctx, w, store.Snapshot{Project: project, Reason: "pre-rollback", Note: fmt.Sprintf("before rolling back to #%d", id), Commit: flags[project].Commit, Volumes: current}, nil)
 	if err != nil && !errors.Is(err, errNoData) {
 		start()
 		return fmt.Errorf("could not snapshot the current data, nothing was restored: %w", err)
 	}
+	rec.SnapshotID = undo.ID
 
 	for _, v := range s.Volumes {
 		target := v.Source

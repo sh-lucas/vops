@@ -223,7 +223,7 @@ func (d *Daemon) onPush(repo, tag, digest string) {
 	if len(keys) == 0 {
 		return
 	}
-	if _, err := d.Engine.Apply(ctx, w, deploy.ApplyOpts{Services: keys}); err != nil {
+	if _, err := d.Engine.Apply(ctx, w, deploy.ApplyOpts{Services: keys, Trigger: "push"}); err != nil {
 		log.Printf("push trigger %s:%s: %v", repo, tag, err)
 	}
 }

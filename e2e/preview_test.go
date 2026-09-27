@@ -2,6 +2,8 @@ package e2e
 
 import (
 	"context"
+	"encoding/json/v2"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -178,4 +180,56 @@ func TestPreviewsFromRegistry(t *testing.T) {
 	if prodIDs() != prod {
 		t.Fatal("production containers changed")
 	}
+
+	// history: a push of the tag production runs is a deploy with trigger push and the new digest
+	push("shop/web", "v1", "web-prod-2")
+	w.eventually("push-triggered redeploy", func() bool { return body("web.shop.vops.test") == "web-prod-2" })
+	var h string
+	w.eventually("the push deploy recorded", func() bool { h = w.vops(dev, "history", "shop"); return strings.Contains(h, "push") })
+	if !regexp.MustCompile(`(?m)^\d+\s+.+?\s+push\s+\w+\s+ok\s+-\s+web: @\w+ → @\w+`).MatchString(h) || !strings.Contains(h, "sync") {
+		t.Fatalf("history:\n%s", h)
+	}
+	type image struct{ Image, Digest string }
+	var tl struct {
+		Nodes []struct {
+			Kind     string
+			Previews []string
+			Deploy   struct {
+				ID      int64
+				Trigger string
+				Commit  string
+				Images  map[string]image
+			}
+		}
+	}
+	_, b := call("GET", "/api/timeline?project=shop", "", cookie)
+	if err := json.Unmarshal([]byte(b), &tl, json.MatchCaseInsensitiveNames(true)); err != nil || len(tl.Nodes) != 2 || tl.Nodes[0].Deploy.Trigger != "push" || tl.Nodes[1].Deploy.Trigger != "sync" {
+		t.Fatalf("timeline: %v %s", err, b)
+	}
+	before, after := tl.Nodes[1].Deploy, tl.Nodes[0].Deploy
+	if before.Images["web"].Digest == "" || before.Images["web"].Digest == after.Images["web"].Digest || before.Images["api"] != after.Images["api"] {
+		t.Fatalf("digests: %+v -> %+v", before.Images, after.Images)
+	}
+	// a preview from the sync deploy runs the web image by the digest it ran then, not what v1 is now
+	pinned := map[string]string{}
+	for svc, img := range before.Images {
+		pinned[svc] = strings.Split(img.Image, ":v1")[0] + "@" + img.Digest
+	}
+	name := fmt.Sprintf("at-%d", before.ID)
+	req, _ := json.Marshal(map[string]any{"project": "shop", "name": name, "ref": before.Commit, "images": pinned, "deploy": before.ID})
+	if code, b := call("POST", "/api/previews", string(req), cookie); code != 200 || !strings.HasSuffix(b, "==> ok\n") {
+		t.Fatalf("preview from a deploy: %d %s", code, b)
+	}
+	if b := body("web." + name + ".shop.vops.test"); b != "web-prod" || body("web.shop.vops.test") != "web-prod-2" {
+		t.Fatalf("preview from deploy #%d serves %q", before.ID, b)
+	}
+	if code, _ := call("GET", "/api/logs?n=5&project=shop@"+name, "", cookie); code != 200 {
+		t.Fatalf("preview logs: %d", code)
+	}
+	_, b = call("GET", "/api/timeline?project=shop", "", cookie)
+	json.Unmarshal([]byte(b), &tl, json.MatchCaseInsensitiveNames(true))
+	if len(tl.Nodes) != 2 || !slices.Equal(tl.Nodes[1].Previews, []string{name}) || len(tl.Nodes[0].Previews) != 0 {
+		t.Fatalf("preview chip: %s", b)
+	}
+	w.vops(dev, "preview", "rm", "shop", name)
 }

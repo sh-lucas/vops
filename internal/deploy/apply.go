@@ -19,6 +19,7 @@ import (
 	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/podman"
 	"github.com/sh-lucas/vops/internal/proxy"
+	"github.com/sh-lucas/vops/internal/store"
 )
 
 // Drain is how long old replicas keep serving in-flight requests after traffic moved away.
@@ -28,7 +29,11 @@ type ApplyOpts struct {
 	Commit   string      // refuse if HEAD is not this commit (what the user confirmed)
 	Projects []string    // only these projects (all if empty)
 	Services []proxy.Key // only these services (all if empty); used by registry push triggers
+	Trigger  string      // for the deploy history: sync | apply | ui | push (default apply)
 }
+
+// Triggers are what can start a deploy, as the history records them.
+var Triggers = []string{"sync", "apply", "ui", "push", "rollback"}
 
 func (o ApplyOpts) wantsProject(project string) bool {
 	if len(o.Projects) > 0 && !slices.Contains(o.Projects, project) {
@@ -83,10 +88,22 @@ func (e *Engine) Apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan,
 	return plan, nil
 }
 
+// applyProject applies one project and records it in the deploy history when it changed something
+// (previews have their own row in the previews table instead).
 func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *ProjectPlan, opts ApplyOpts) error {
 	if !opts.wantsProject(pp.Path) {
 		return nil
 	}
+	rec := store.Deploy{Project: pp.Path, Commit: plan.Commit, Trigger: cmpOr(opts.Trigger, "apply"), StartedAt: time.Now().Unix()}
+	err := e.deployProject(ctx, w, plan, pp, opts, &rec)
+	if compose.IsPreview(pp.Path) || pp.Error == "" && !slices.ContainsFunc(pp.Actions, func(a Action) bool { return a.Kind != "none" && opts.wants(pp.Path, a.Service) }) {
+		return err
+	}
+	e.record(ctx, rec, pp.specs, err)
+	return err
+}
+
+func (e *Engine) deployProject(ctx context.Context, w io.Writer, plan *Plan, pp *ProjectPlan, opts ApplyOpts, rec *store.Deploy) error {
 	if pp.Error != "" {
 		return errors.New(pp.Error)
 	}
@@ -100,10 +117,14 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 	if !compose.IsPreview(pp.Path) && slices.ContainsFunc(pp.Actions, func(a Action) bool {
 		return (a.Kind == "create" || a.Kind == "update") && opts.wants(pp.Path, a.Service)
 	}) {
-		if err := e.preDeploy(ctx, w, pp, plan.Commit); err != nil {
+		id, err := e.preDeploy(ctx, w, pp, plan.Commit)
+		if err != nil {
 			return err
 		}
+		rec.SnapshotID = id
 	}
+	var done []string // summary for the history: "web updated", "db failed"
+	defer func() { rec.Summary = strings.Join(done, ", ") }()
 	failed := map[string]bool{}
 	for _, a := range pp.Actions {
 		if a.Kind == "none" || !opts.wants(pp.Path, a.Service) {
@@ -116,6 +137,7 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 		if d := pp.specs[a.Service]; d != nil {
 			if i := slices.IndexFunc(d.spec.DependsOn, func(dep string) bool { return failed[dep] }); i >= 0 {
 				failed[a.Service] = true
+				done = append(done, a.Service+" skipped")
 				log("skipped: %s failed", d.spec.DependsOn[i])
 				errs = append(errs, fmt.Errorf("%s: skipped, dependency %s failed", a.Service, d.spec.DependsOn[i]))
 				continue
@@ -141,10 +163,12 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 		}
 		if err != nil {
 			failed[a.Service] = true
+			done = append(done, a.Service+" failed")
 			log("✗ %v", err)
 			errs = append(errs, fmt.Errorf("%s: %w", a.Service, err))
 			continue
 		}
+		done = append(done, a.Service+" "+pastTense[a.Kind])
 		e.DB.Event(pp.Path, a.Kind, "%s: %s", a.Service, strings.TrimSpace(a.Kind+" "+a.Reason))
 	}
 	if len(errs) > 0 {
@@ -263,6 +287,9 @@ func (e *Engine) prepare(ctx context.Context, log func(string, ...any), d *desir
 		log("pulling %s from the vops registry", sp.Image)
 		if _, err := podman.Run(ctx, "pull", "-q", "--tls-verify=false", "--authfile", e.PullAuthFile, d.pull); err != nil {
 			return err
+		}
+		if d.image == d.pull {
+			return nil
 		}
 		_, err := podman.Run(ctx, "tag", d.pull, sp.Image)
 		return err

@@ -1,4 +1,4 @@
-// Package store is the sqlite state of the daemon: env vars, registry users, sessions, events, snapshots,
+// Package store is the sqlite state of the daemon: env vars, registry users, sessions, events, snapshots, previews, deploys,
 // project flags and the audit log. SQL lives in queries.sql and migrations/ (sqlc generates queries/);
 // this package adds what SQL can't do: encryption, hashing and friendlier types.
 // Containers are not stored here; podman labels are the source of truth for them.
@@ -412,15 +412,16 @@ type Preview struct {
 	Name       string            `json:"name"`
 	Ref        string            `json:"ref"`
 	Commit     string            `json:"commit"`
-	Images     map[string]string `json:"images"` // service -> image overrides
-	SnapshotID int64             `json:"snapshot_id"`
+	Images     map[string]string `json:"images"`      // service -> image overrides
+	SnapshotID int64             `json:"snapshot_id"` // data copied from this snapshot; 0 = live data
+	DeployID   int64             `json:"deploy_id"`   // the timeline node it branched from; 0 = none
 	Data       string            `json:"data"`
 	CreatedAt  int64             `json:"created_at"`
 	UpdatedAt  int64             `json:"updated_at"`
 }
 
 func previewFrom(r queries.Preview) Preview {
-	p := Preview{Project: r.Project, Name: r.Name, Ref: r.Ref, Commit: r.CommitSha, Images: map[string]string{}, SnapshotID: r.SnapshotID, Data: r.Data, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
+	p := Preview{Project: r.Project, Name: r.Name, Ref: r.Ref, Commit: r.CommitSha, Images: map[string]string{}, SnapshotID: r.SnapshotID, DeployID: r.DeployID, Data: r.Data, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
 	json.Unmarshal([]byte(r.Images), &p.Images)
 	return p
 }
@@ -433,7 +434,7 @@ func (d *DB) PutPreview(p Preview) error {
 	images, _ := json.Marshal(p.Images, json.Deterministic(true))
 	t := now()
 	return d.q.PutPreview(ctx, queries.PutPreviewParams{Project: p.Project, Name: p.Name, Ref: p.Ref, CommitSha: p.Commit, Images: string(images),
-		SnapshotID: p.SnapshotID, Data: p.Data, CreatedAt: t, UpdatedAt: t})
+		SnapshotID: p.SnapshotID, DeployID: p.DeployID, Data: p.Data, CreatedAt: t, UpdatedAt: t})
 }
 
 // Preview returns a preview; found is false when it doesn't exist.
@@ -460,4 +461,92 @@ func (d *DB) Previews(project string) ([]Preview, error) {
 
 func (d *DB) DeletePreview(project, name string) error {
 	return d.q.DeletePreview(ctx, queries.DeletePreviewParams{Project: project, Name: name})
+}
+
+// ---- deploys (history: what ran when, and the data right before it)
+
+type Deploy struct {
+	ID         int64                  `json:"id"`
+	Project    string                 `json:"project"`
+	Commit     string                 `json:"commit"`
+	Trigger    string                 `json:"trigger"`     // sync | apply | ui | push | rollback
+	Images     map[string]DeployImage `json:"images"`      // service -> what runs after this event
+	SnapshotID int64                  `json:"snapshot_id"` // the data right before this event (pre-deploy or pre-rollback); 0 = none
+	RestoredID int64                  `json:"restored_id"` // rollback: the snapshot put back
+	Undoes     int64                  `json:"undoes"`      // rollback: the rollback it undid
+	Result     string                 `json:"result"`      // ok | failed
+	Error      string                 `json:"error"`
+	Summary    string                 `json:"summary"`
+	StartedAt  int64                  `json:"started_at"`
+	FinishedAt int64                  `json:"finished_at"`
+}
+
+type DeployImage struct {
+	Image  string `json:"image"`            // the ref from compose (or a preview override)
+	Digest string `json:"digest,omitempty"` // manifest digest, when known
+	Built  bool   `json:"built,omitempty"`  // built from the repo: the commit reproduces it
+}
+
+// Pinned is the image by digest when the digest is known.
+func (i DeployImage) Pinned() string {
+	if i.Digest == "" {
+		return i.Image
+	}
+	ref := i.Image
+	if at := strings.Index(ref, "@"); at >= 0 {
+		ref = ref[:at]
+	} else if c := strings.LastIndex(ref, ":"); c > strings.LastIndex(ref, "/") {
+		ref = ref[:c]
+	}
+	return ref + "@" + i.Digest
+}
+
+func deployFrom(r queries.Deploy) Deploy {
+	d := Deploy{ID: r.ID, Project: r.Project, Commit: r.CommitSha, Trigger: r.Trigger, Images: map[string]DeployImage{}, SnapshotID: r.SnapshotID,
+		RestoredID: r.RestoredID, Undoes: r.Undoes, Result: r.Result, Error: r.Error, Summary: r.Summary, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt}
+	json.Unmarshal([]byte(r.Images), &d.Images)
+	return d
+}
+
+// AddDeploy records a finished deploy or rollback and returns its id.
+func (d *DB) AddDeploy(x Deploy) (int64, error) {
+	if x.Images == nil {
+		x.Images = map[string]DeployImage{}
+	}
+	images, _ := json.Marshal(x.Images, json.Deterministic(true))
+	return d.q.CreateDeploy(ctx, queries.CreateDeployParams{Project: x.Project, CommitSha: x.Commit, Trigger: x.Trigger, Images: string(images),
+		SnapshotID: x.SnapshotID, RestoredID: x.RestoredID, Undoes: x.Undoes, Result: x.Result, Error: x.Error, Summary: x.Summary,
+		StartedAt: x.StartedAt, FinishedAt: x.FinishedAt})
+}
+
+// Deploy returns one deploy; found is false when it doesn't exist.
+func (d *DB) Deploy(id int64) (x Deploy, found bool, err error) {
+	r, err := d.q.GetDeploy(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Deploy{}, false, nil
+	}
+	if err != nil {
+		return Deploy{}, false, err
+	}
+	return deployFrom(r), true, nil
+}
+
+// Deploys lists the newest limit deploys of a project, newest first.
+func (d *DB) Deploys(project string, limit int) ([]Deploy, error) {
+	rows, err := d.q.ListDeploys(ctx, queries.ListDeploysParams{Project: project, Limit: int64(limit)})
+	out := []Deploy{}
+	for _, r := range rows {
+		out = append(out, deployFrom(r))
+	}
+	return out, err
+}
+
+// LatestDeploys is the newest deploy of every project.
+func (d *DB) LatestDeploys() (map[string]Deploy, error) {
+	rows, err := d.q.LatestDeploys(ctx)
+	out := map[string]Deploy{}
+	for _, r := range rows {
+		out[r.Project] = deployFrom(r)
+	}
+	return out, err
 }

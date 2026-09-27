@@ -4,11 +4,10 @@ Ideas with a design sketch. Done things move to README/reference; decisions to r
 
 ## Data
 
-Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback`, previews (`vops preview`, previews from registry tags). What's left builds on the same pieces.
+Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback`, previews (`vops preview`, previews from registry tags), deploy history with the dashboard timeline and previews tab. What's left builds on the same pieces.
 
 ### Previews, next
 
-- Dashboard page for previews: the api is there (`GET/POST/DELETE /api/previews`, `/api/env` with `preview`).
 - Reset a preview's data without `rm`: `preview up --from <id>` (or `--from live`) on an existing preview; stop it, restore like rollback, start.
 - Delete the registry tags pushed for a preview when it's removed (today they stay until `vops registry rm`): only tags matching the project's `x-vops.previews` pattern.
 - Remove a preview when its branch is deleted or its PR merged: a `vops preview rm` from CI is enough today; maybe a push of an empty/special tag.

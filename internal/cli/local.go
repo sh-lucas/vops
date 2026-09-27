@@ -272,7 +272,7 @@ func cmdSync(g globals, args []string) error {
 		return err
 	}
 	head, _ := output(root, "git", "rev-parse", "HEAD")
-	return applyFlow(g, *yes, head, nil)
+	return applyFlow(g, *yes, head, nil, "sync")
 }
 
 // ---- apply
@@ -282,18 +282,19 @@ func cmdApply(g globals, args []string) error {
 	yes := fs.Bool("yes", false, "")
 	fs.BoolVar(yes, "y", false, "")
 	commit := fs.String("commit", "", "")
+	trigger := fs.String("trigger", "apply", "")
 	projects, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
 	if *yes && *commit != "" {
-		return forward(g, "apply", append([]string{"--yes", "--commit", *commit}, projects...), nil, os.Stdout)
+		return forward(g, "apply", append([]string{"--yes", "--commit", *commit, "--trigger", *trigger}, projects...), nil, os.Stdout)
 	}
-	return applyFlow(g, *yes, *commit, projects)
+	return applyFlow(g, *yes, *commit, projects, *trigger)
 }
 
-// applyFlow shows the plan, asks, then applies exactly the commit that was shown.
-func applyFlow(g globals, yes bool, commit string, projects []string) error {
+// applyFlow shows the plan, asks, then applies exactly the commit that was shown. trigger goes to the deploy history.
+func applyFlow(g globals, yes bool, commit string, projects []string, trigger string) error {
 	var buf bytes.Buffer
 	if err := forward(g, "plan", []string{"--json"}, nil, &buf); err != nil {
 		return err
@@ -308,7 +309,7 @@ func applyFlow(g globals, yes bool, commit string, projects []string) error {
 	plan.Print(os.Stdout)
 	if !plan.Changes() {
 		// nothing changes, but the host should record that it matches this commit
-		return forward(g, "apply", append([]string{"--yes", "--commit", plan.Commit}, projects...), nil, io.Discard)
+		return forward(g, "apply", append([]string{"--yes", "--commit", plan.Commit, "--trigger", trigger}, projects...), nil, io.Discard)
 	}
 	if !yes {
 		if !isTerminal(os.Stdin) {
@@ -318,7 +319,7 @@ func applyFlow(g globals, yes bool, commit string, projects []string) error {
 			return errors.New("aborted")
 		}
 	}
-	return forward(g, "apply", append([]string{"--yes", "--commit", plan.Commit}, projects...), nil, os.Stdout)
+	return forward(g, "apply", append([]string{"--yes", "--commit", plan.Commit, "--trigger", trigger}, projects...), nil, os.Stdout)
 }
 
 // ---- env and admin read secrets here and send them over stdin, never on a command line

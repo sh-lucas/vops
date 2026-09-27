@@ -51,14 +51,20 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return err
 		}
 		flags, _ := d.DB.Projects()
+		last, _ := d.DB.LatestDeploys()
 		type project struct {
-			Path      string                `json:"path"`
-			Disabled  bool                  `json:"disabled"`
-			Gone      bool                  `json:"gone"`
-			Error     string                `json:"error,omitempty"`
-			Commit    string                `json:"commit"`
-			AppliedAt int64                 `json:"applied_at"`
-			Services  []deploy.ServiceState `json:"services"`
+			Path       string                `json:"path"`
+			Disabled   bool                  `json:"disabled"`
+			Gone       bool                  `json:"gone"`
+			Error      string                `json:"error,omitempty"`
+			Commit     string                `json:"commit"`
+			AppliedAt  int64                 `json:"applied_at"`
+			Services   []deploy.ServiceState `json:"services"`
+			LastDeploy *store.Deploy         `json:"last_deploy"` // a rollback here means the data was restored since the last deploy
+		}
+		type preview struct {
+			Project string `json:"project"`
+			Name    string `json:"name"`
 		}
 		out := struct {
 			Domain   string    `json:"domain"`
@@ -66,10 +72,19 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Changes  bool      `json:"changes"`
 			Warnings []string  `json:"warnings"`
 			Projects []project `json:"projects"`
-		}{plan.Domain, plan.Commit, plan.Changes(), plan.Warnings, []project{}}
+			Previews []preview `json:"previews"`
+		}{plan.Domain, plan.Commit, plan.Changes(), plan.Warnings, []project{}, []preview{}}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
-			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services()})
+			var ld *store.Deploy
+			if x, ok := last[pp.Path]; ok {
+				ld = &x
+			}
+			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld})
+		}
+		pvs, _ := d.DB.Previews("")
+		for _, pv := range pvs {
+			out.Previews = append(out.Previews, preview{pv.Project, pv.Name})
 		}
 		writeJSON(w, out)
 		return nil
@@ -94,17 +109,21 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		var opts struct {
 			Commit   string   `json:"commit"`
 			Projects []string `json:"projects"`
+			Trigger  string   `json:"trigger"` // sync | apply | ui, for the history
 		}
 		if r.ContentLength != 0 {
 			if err := readJSON(r, &opts); err != nil {
 				return err
 			}
 		}
+		if !slices.Contains([]string{"sync", "apply", "ui"}, opts.Trigger) {
+			opts.Trigger = "apply"
+		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		// a client that disconnects must not abort a rollout halfway
 		ctx := context.WithoutCancel(r.Context())
-		_, err := d.Engine.Apply(ctx, flushWriter{w}, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects})
+		_, err := d.Engine.Apply(ctx, flushWriter{w}, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects, Trigger: opts.Trigger})
 		if err != nil {
 			fmt.Fprintf(w, "==> error: %v\n", err)
 		} else {
@@ -163,6 +182,20 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			until = v
 		}
 		return d.logs(r.Context(), w, q.Get("project"), q.Get("service"), logQuery{N: n, Follow: q.Get("follow") == "1", Grep: q.Get("grep"), Before: q.Get("before"), Since: since, Until: until})
+	})
+
+	// the project's history: deploys, rollbacks, manual snapshots, previews, newest first
+	h("GET /api/timeline", func(w http.ResponseWriter, r *http.Request) error {
+		project := r.URL.Query().Get("project")
+		if project == "" || strings.Contains(project, "@") {
+			return fmt.Errorf("invalid project %q", project)
+		}
+		t, err := d.Engine.Timeline(r.Context(), project)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, t)
+		return nil
 	})
 
 	h("GET /api/events", func(w http.ResponseWriter, r *http.Request) error {

@@ -86,7 +86,8 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Still no build step, no libraries, no external fonts or CDNs: it works offline. Everything is rendered with `h()` (never `innerHTML`).
 - Layout: fixed sidebar (nav + project tree with a status dot: green running, amber pending/partial, red failing/invalid, grey disabled), a top bar with the host's commit, domain and a "pending changes" badge that opens plan/apply from any page. Below 880px the sidebar is a drawer. Light/dark follow the system.
 - Status is polled every 10s by the shell (sidebar, top bar); pages subscribe instead of polling on their own.
-- Project page = header + tabs (`#/p/<path>/<tab>`: services, logs, env, data, events). A tab is one entry in `TABS` in app.js. Old links (`#/p/<path>`, `#/logs/<path>?service=x`, which is the full-page log view) keep working.
+- Project page = header + tabs (`#/p/<path>/<tab>`: services, timeline, previews, logs, env, events). A tab is one entry in `TABS` in app.js. Old links (`#/p/<path>`, `#/p/<path>/data` → timeline, `#/logs/<path>?service=x`, which is the full-page log view) keep working.
+- Streamed actions started from a dialog (restore, preview up) show their progress in a modal, like apply; closing it doesn't stop them.
 - Destructive actions ask through an in-page `<dialog>` that states the consequences, not `confirm()`.
 - Served on `ui` listen address (default `127.0.0.1:9984`) and on `vops.<domain>` over HTTPS. The default is loopback because plain HTTP with a password over the internet is bad; `vops ui` opens an ssh tunnel and the browser. Set `ui: ":9984"` in `vops.yml` to expose it.
 - Sessions: random id in an `HttpOnly; SameSite=Strict` cookie, sha256 stored in sqlite. Mutating requests also need the `X-Vops: 1` header (blocks CSRF without tokens).
@@ -125,6 +126,20 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Rollback stops the project's containers, snapshots the current data as `pre-rollback` (undo point), restores each volume (the live one is moved aside and put back if the restore fails), starts what was running. `rollback` without an id skips `pre-rollback` snapshots, so running it twice doesn't ping-pong.
 - Retention: newest `snapshot_keep` (5) automatic snapshots per project; manual ones are never pruned.
 - Rollback restores data only. Code rollback stays a git operation (revert + sync), so git remains the single source of truth.
+
+## Deploy history and the timeline
+
+- `deploys` table: one row per project per apply that changes it (any action other than none, or a plan error), and one per rollback. Written by the engine (`applyProject`, `Rollback`), so cli, dashboard and registry pushes are all covered; the caller only names the trigger (`sync`, `apply`, `ui`, `push`; `rollback` is set by the engine). A no-op apply records nothing. Previews have no rows: the previews table is their record.
+- The row is written when the deploy ends (no "running" state that a crash would leave behind). Recording never fails a deploy.
+- `snapshot_id` is always the data right before that event: the pre-deploy snapshot for a deploy, the pre-rollback (undo) snapshot for a rollback. One meaning, so every node's "Restore data" and "Preview from here" start from the same place: the moment before it happened. The alternative (a deploy owns the snapshot taken by the next one, "its data at the end") needs the next row to exist and makes rollbacks a special case.
+- Images: what runs after the event, per service, read back from podman: a service whose containers carry the desired hash runs the desired image (the hash covers our registry's digest); otherwise (a failed update kept the old replicas) the previous row's entry is carried over. Digests: our registry's from the plan, pulled images' from `podman image inspect`, none for `localhost/` and built images (built ones are marked `built`: the commit rebuilds them).
+- Own-registry images referenced by digest (`registry.<domain>/shop/web@sha256:…`, which is how a preview pins a past deploy's image) run the loopback pull ref directly: a digest can't be a local tag. So "Preview from here" gets exactly the bytes that ran, even after the tag moved.
+- A rollback that restores the undo snapshot of an earlier rollback records `undoes` = that rollback. The project banner "Data restored to #N · Undo" shows while the project's newest row is a successful rollback that isn't an undo; the next deploy (or the undo) clears it. It comes from `last_deploy` in `/api/status`, so it shows on every tab and needs no extra polling.
+- Retention: 5000 rows host-wide (a trigger, like events). The timeline shows the newest 100 deploys of a project; snapshots referenced by rows are shown on them, other snapshots (manual, or older pre-deploy/pre-rollback) are their own nodes. Pruned snapshots just disappear from their row ("no snapshot").
+- Previews record `deploy_id`: the node they branched from (the node picked in the dashboard; for live data, the project's newest row at creation; 0 when made from a snapshot, which places them on the node showing that snapshot). The timeline shows them as chips there.
+- The Data tab was folded into the timeline: coverage warnings on top, "Snapshot now" on the "now" node, delete on snapshot nodes. One place for "what happened to my data".
+- Code rollback stays a git operation: the restore dialog shows the data's commit next to the running one and, when they differ, the exact commands (`git restore --source=<sha> --staged --worktree -- <project>/`, commit, `vops sync`). Git stays the single source of truth; a rollback that rewrote the host repo would diverge from every laptop.
+- `/api/timeline?project=` returns everything the tab and `vops history` need in one call (rows, snapshots, image changes vs the previous row, preview chips, commit subjects via one `git log --no-walk`), so both render the same thing.
 
 ## SQL: sqlc, migrations, triggers
 
@@ -166,6 +181,8 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - `rm` removes containers (and their anonymous volumes), networks, volumes, built images and local tags of the overrides, then the worktree with its data, then the row. If a step fails the row stays, so a retry or the ttl finishes the job. Registry tags stay (they're the user's pushes).
 - Removing a container also removes its anonymous volumes (`podman rm -v`), for previews and projects alike: an image's `VOLUME` (postgres has one) left one volume behind per removed job or replica, forever.
 - Preview lifecycle events are recorded under the base project (kind `preview`), so `vops events shop` shows them; deploy lines use the preview path.
+- Dashboard: Previews tab per project, previews as subtle rows under their project in the sidebar and a count on the overview. The "copy of production data" warning is shown once, on top of the tab, not per preview. The empty state explains the `preview-*` push with a command built from the project's own images. Preview logs are `/api/logs?project=shop@pr-42` (same labels and journald tag scheme as projects) on the full-page log view.
+- The Environment tab switches between production and preview secrets (`?scope=previews`), with one line saying previews don't inherit production's env and read `preview.env` from the repo.
 
 ## Not done yet
 

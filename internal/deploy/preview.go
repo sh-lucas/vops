@@ -49,6 +49,7 @@ type PreviewOpts struct {
 	Ref     string            `json:"ref"`    // git ref on the host; empty keeps the preview's commit (a new one gets the project's applied commit)
 	Images  map[string]string `json:"images"` // service -> image, merged into the preview's overrides
 	From    int64             `json:"from"`   // new previews: copy the data of this snapshot instead of the live data
+	Deploy  int64             `json:"deploy"` // new previews: the history node it branches from (default: the newest one, for live data)
 }
 
 // PreviewState is a preview as `preview ls` and the dashboard show it.
@@ -133,6 +134,25 @@ func (e *Engine) PreviewUp(ctx context.Context, w io.Writer, o PreviewOpts) erro
 		pv = store.Preview{Project: o.Project, Name: o.Name, Images: map[string]string{}}
 	} else if o.From != 0 {
 		return fmt.Errorf("preview %s exists and keeps its data: `vops preview rm %s %s` first to start from snapshot #%d", path, o.Project, o.Name, o.From)
+	} else if o.Deploy != 0 {
+		return fmt.Errorf("preview %s exists: pick another name, or remove it first (vops preview rm %s %s)", path, o.Project, o.Name)
+	}
+	if !found {
+		switch {
+		case o.Deploy != 0:
+			d, ok, err := e.DB.Deploy(o.Deploy)
+			if err != nil {
+				return err
+			}
+			if !ok || d.Project != o.Project {
+				return fmt.Errorf("no deploy #%d of %s", o.Deploy, o.Project)
+			}
+			pv.DeployID = d.ID
+		case o.From == 0: // live data: it branches from what runs now
+			if last, _ := e.DB.Deploys(o.Project, 1); len(last) > 0 {
+				pv.DeployID = last[0].ID
+			}
+		}
 	}
 	switch {
 	case o.Ref != "":

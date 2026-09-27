@@ -95,12 +95,13 @@ type Action struct {
 }
 
 type desired struct {
-	spec  *compose.Spec
-	hash  string
-	image string // final image ref to run
-	pull  string // ref to pull from our registry (loopback), when the image is ours
-	own   string // "repo:tag" in our registry, when the image is ours
-	repo  string // the repo of own
+	spec   *compose.Spec
+	hash   string
+	image  string // final image ref to run
+	pull   string // ref to pull from our registry (loopback), when the image is ours
+	own    string // "repo:tag" in our registry, when the image is ours
+	repo   string // the repo of own
+	digest string // manifest digest in our registry, when the image is ours
 }
 
 // Changes reports whether the plan does anything.
@@ -445,7 +446,10 @@ func (e *Engine) resolve(ctx context.Context, root string, sp *compose.Spec, dom
 				}
 			}
 			d.pull = e.PullAddr + "/" + repo + "@" + digest
-			d.own, d.repo = repo+":"+ref, repo
+			d.own, d.repo, d.digest = repo+":"+ref, repo, digest
+			if ref == digest {
+				d.image = d.pull // a digest can't be a local tag: run the pulled ref itself
+			}
 			w("own", digest)
 		}
 		w("image", sp.Image)
@@ -577,7 +581,7 @@ func (pp *ProjectPlan) Services() []ServiceState {
 		}
 		if d := pp.specs[n]; d != nil {
 			st.Image, st.Domains, st.Port = d.image, d.spec.Domains, d.spec.Port
-			if st.Image == "" {
+			if st.Image == "" || st.Image == d.pull {
 				st.Image = d.spec.Image
 			}
 			if st.Domains == nil {

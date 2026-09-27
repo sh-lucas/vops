@@ -102,8 +102,8 @@ DELETE FROM snapshots WHERE id = ?;
 SELECT * FROM audit_log ORDER BY id DESC LIMIT ?;
 
 -- name: PutPreview :exec
--- creates a preview or updates it; created_at, snapshot_id and data belong to its creation
-INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+-- creates a preview or updates it; created_at, snapshot_id, deploy_id and data belong to its creation
+INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, deploy_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, updated_at = excluded.updated_at;
 
 -- name: GetPreview :one
@@ -116,3 +116,18 @@ ORDER BY project, name;
 
 -- name: DeletePreview :exec
 DELETE FROM previews WHERE project = ? AND name = ?;
+
+-- name: CreateDeploy :one
+INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id;
+
+-- name: GetDeploy :one
+SELECT * FROM deploys WHERE id = ?;
+
+-- name: ListDeploys :many
+SELECT * FROM deploys WHERE project = ? ORDER BY id DESC LIMIT ?;
+
+-- name: LatestDeploys :many
+-- the newest deploy of every project
+SELECT * FROM deploys WHERE id IN (SELECT max(id) FROM deploys GROUP BY project);
