@@ -96,7 +96,8 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 			return err
 		}
 	}
-	if slices.ContainsFunc(pp.Actions, func(a Action) bool {
+	// previews are disposable copies: no pre-deploy snapshots of them
+	if !compose.IsPreview(pp.Path) && slices.ContainsFunc(pp.Actions, func(a Action) bool {
 		return (a.Kind == "create" || a.Kind == "update") && opts.wants(pp.Path, a.Service)
 	}) {
 		if err := e.preDeploy(ctx, w, pp, plan.Commit); err != nil {
@@ -166,7 +167,10 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 			}
 		}
 	}
-	if pp.Gone {
+	switch {
+	case compose.IsPreview(pp.Path):
+		return nil // the previews table has its commit
+	case pp.Gone:
 		e.DB.DeleteProject(pp.Path)
 		return nil
 	}
@@ -220,7 +224,8 @@ func (e *Engine) remove(ctx context.Context, cs []podman.Container) error {
 		if c.Labels["vops.stopwait"] != "" {
 			wait = c.Labels["vops.stopwait"]
 		}
-		if _, err := podman.Run(ctx, "rm", "-f", "-t", wait, c.ID); err != nil {
+		// -v: anonymous volumes (an image's VOLUME) belong to the container; named ones are kept
+		if _, err := podman.Run(ctx, "rm", "-f", "-v", "-t", wait, c.ID); err != nil {
 			// podman sometimes removes the container and then fails cleaning up its network: gone is gone
 			if _, exists := podman.Run(ctx, "container", "exists", c.ID); exists != nil {
 				continue

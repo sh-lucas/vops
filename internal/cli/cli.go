@@ -38,7 +38,10 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   logs <project> [service] [-f] [-n N] [--grep s]
   restart <project> [service]
   enable|disable <project>
-  env ls|set|rm <project> [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given)
+  env ls|set|rm <project> [--preview] [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given;
+                                     --preview: the secrets of the project's previews, which never get its env)
+  preview up <project> --name n [--image svc=ref]... [--ref r] [--from snapshot-id]
+  preview ls [project] | rm <project> <name>   previews: <service>.<name>.<project>.<domain>, a copy of the data
   user ls | add <name> [--pattern re] [--repo r]... [--token-stdin] | rm <name> | token <name>
   registry ls [repo] | rm <repo:tag> | gc
   snapshot ls [project] | create <project> [-m note] | rm <id>
@@ -95,6 +98,8 @@ func Main(args []string) int {
 		err = cmdAdmin(g, rest)
 	case "rollback":
 		err = cmdRollback(g, rest)
+	case "preview":
+		err = cmdPreview(g, rest)
 	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:

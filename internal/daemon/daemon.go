@@ -95,7 +95,9 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	reg.OnPush = d.onPush
 	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
 		SnapshotDir: filepath.Join(vopsHome, "snapshots"), SnapshotKeep: host.SnapshotKeep, SnapshotsOff: host.Snapshots == "off",
-		Config: func() config.Config { return *d.cfg.Load() }, ApplyConfig: d.applyConfig}
+		PreviewDir: filepath.Join(vopsHome, "previews"),
+		Config:     func() config.Config { return *d.cfg.Load() }, ApplyConfig: d.applyConfig}
+	d.Engine.PreviewMax, d.Engine.PreviewTTL = host.Previews()
 	auth := fmt.Sprintf(`{"auths":{%q:{"auth":%q}}}`, d.Engine.PullAddr, base64.StdEncoding.EncodeToString([]byte("vops-internal:"+d.pullToken)))
 	if err := os.WriteFile(d.Engine.PullAuthFile, []byte(auth), 0o600); err != nil {
 		return nil, err
@@ -112,6 +114,7 @@ func (d *Daemon) applyConfig(c config.Config, w io.Writer) error {
 	}
 	d.cfg.Store(&c)
 	d.Engine.SnapshotKeep, d.Engine.SnapshotsOff = c.SnapshotKeep, c.Snapshots == "off"
+	d.Engine.PreviewMax, d.Engine.PreviewTTL = c.Previews()
 	d.DB.Event("", "config", "vops.yml applied: %s", strings.Join(old.Diff(c), ", "))
 	if old.Listeners(c) {
 		fmt.Fprintln(w, "vops.yml: listeners changed, the daemon restarts in a second (containers keep running)")
@@ -195,7 +198,7 @@ func UserAllows(u store.User) func(string) bool {
 
 func (d *Daemon) forgetAuth() { d.authCache.Clear() }
 
-// ---- push trigger (the watchtower replacement)
+// ---- push trigger (the watchtower replacement, and previews from tags)
 
 func (d *Daemon) onPush(repo, tag, digest string) {
 	d.DB.Event("", "push", "%s:%s pushed (%.19s)", repo, tag, digest)
@@ -205,6 +208,14 @@ func (d *Daemon) onPush(repo, tag, digest string) {
 		log.Printf("push trigger: %v", err)
 		return
 	}
+	w := &logWriter{prefix: "push " + repo + ":" + tag + ": "}
+	// a preview tag creates or updates a preview; Watching never returns it, so production is not touched
+	for _, t := range plan.PreviewTargets(repo, tag) {
+		if err := d.Engine.PreviewUp(ctx, w, deploy.PreviewOpts{Project: t.Project, Name: t.Name, Images: t.Images}); err != nil {
+			log.Printf("push trigger %s:%s: preview %s of %s: %v", repo, tag, t.Name, t.Project, err)
+			d.DB.Event(t.Project, "error", "preview %s from %s:%s: %v", t.Name, repo, tag, err)
+		}
+	}
 	var keys []proxy.Key
 	for _, sv := range plan.Watching(repo, tag) {
 		keys = append(keys, sv)
@@ -212,7 +223,6 @@ func (d *Daemon) onPush(repo, tag, digest string) {
 	if len(keys) == 0 {
 		return
 	}
-	w := &logWriter{prefix: "push " + repo + ":" + tag + ": "}
 	if _, err := d.Engine.Apply(ctx, w, deploy.ApplyOpts{Services: keys}); err != nil {
 		log.Printf("push trigger %s:%s: %v", repo, tag, err)
 	}
@@ -393,7 +403,8 @@ func (d *Daemon) hostPolicy(_ context.Context, host string) error {
 	return fmt.Errorf("vops: unknown host %q", host)
 }
 
-// housekeeping: daily registry GC of uploads, route refresh in case a container restarted on its own.
+// housekeeping: daily registry GC of uploads, route refresh in case a container restarted on its own,
+// expired previews.
 func (d *Daemon) housekeeping(ctx context.Context) {
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
@@ -406,6 +417,7 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		}
 		n++
 		d.Engine.Lock(func() { d.Engine.RefreshRoutes(ctx) })
+		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
 		if n%(24*60) == 0 {
 			if res, err := d.Reg.GC(time.Hour); err == nil && res.Blobs > 0 {
 				d.DB.Event("", "gc", "registry gc: %d manifests, %d blobs, %d bytes freed", res.Manifests, res.Blobs, res.Freed)

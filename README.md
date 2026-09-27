@@ -82,18 +82,25 @@ git add -A && git commit -m site && vops sync
 - `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `vops.yml`); manual ones stay until deleted.
 - Works rootless (through `podman unshare`), no root and no special mount options.
 
+### Previews (database branching)
+- `vops preview up shop --name pr-42` runs a full copy of project `shop` at `https://web.pr-42.shop.<domain>`: its own containers, networks and volumes, the code of the applied commit (a git worktree in `~/.vops/previews/`), and **a copy-on-write copy of production's data**, made in O(1) even for a 50GB database. A destructive migration in the preview leaves production untouched.
+- `--image web=registry.example.com/shop/web:pr-42` runs another image; `--ref my-branch` another commit (a local branch is pushed to the host first); `--from <snapshot id>` another data point. `vops preview ls [project]`, `vops preview rm shop pr-42`.
+- From the registry: pushing `shop/web:preview-pr-42` creates or updates preview `pr-42` of the projects running `shop/web`, with that image. Pushing `shop/api:preview-pr-42` too lands in the same preview. A preview tag never redeploys production. The pattern is `x-vops: {previews: "preview-*"}` at the top of the compose file (default; `off` disables it).
+- Env: previews never get production's env. They get `preview.env` from the project dir (committed, non-secret overrides like `SMTP_HOST=mailpit`) and preview secrets on top: `vops env set shop --preview STRIPE_KEY`.
+- Guardrails by default: previews are off the shared network (they can't reach production, nothing reaches them), services with `x-vops.preview: {skip: true}` (workers, crons) don't run, no host ports, no extra domains. At most `preview_max: 5` at once; a preview not updated for `preview_ttl: 3d` is removed (both in `vops.yml`). `rm` leaves nothing behind: containers, networks, volumes, data, worktree.
+
 ### Audit log
 - Every write to the host's database (env changes, users, logins, snapshots, projects) is recorded by sqlite triggers, so no code path can forget it. Secrets never land there. `vops audit`, or the Events page.
 
 ### Config
-- Everything is in `vops.yml` at the repo root (`vops init` writes it with comments): domain, email, listeners, tls, snapshots. Changes show up in the plan and take effect on apply, like compose files.
+- Everything is in `vops.yml` at the repo root (`vops init` writes it with comments): domain, email, listeners, tls, snapshots, preview limits. Changes show up in the plan and take effect on apply, like compose files.
 - The host keeps the last applied copy in `~/.vops/config.yml` and always runs from it, so a broken `vops.yml` never breaks the daemon. New listeners restart the daemon in place (containers keep running).
 
 ### Registry
 - Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).
 - Users are simple: a name, a generated token, and a regex and/or a list of repos they may push/pull. `vops user add ci --pattern 'shop/.*'`.
 - The dashboard admin pulls everything and pushes nothing.
-- Pushing a tag that a service runs redeploys it (rolling). No watchtower. Opt out with `x-vops.watch: false`.
+- Pushing a tag that a service runs redeploys it (rolling). No watchtower. Opt out with `x-vops.watch: false`. Tags like `preview-pr-42` create previews instead (see Previews).
 - Garbage collection: dashboard button, `vops registry gc`, and daily.
 
 ### Dashboard
@@ -116,6 +123,8 @@ Know these before putting something important on it:
 - **Snapshots need btrfs** and cover only named volumes and bind mounts inside the project dir (not external volumes or absolute host paths). Data created before vops made it a subvolume (non-empty plain dirs) is left alone and shown as "not covered".
 - **Snapshots are crash-consistent**, like pulling the plug: fine for postgres, mysql/innodb, sqlite, anything with a journal; not a replacement for application-level backups, and they live on the same disk (no off-host copy yet).
 - **Rollback restores data, not code**, and stops the project's containers while it runs (seconds).
+- **Previews hold production data.** Personal data, and whatever the code does with it: a queue of real emails, webhooks, a scheduled charge. Their env is not production's, but the data keeps production's own credentials (db users and passwords), and anything the preview's env doesn't redirect still goes out for real. Skip workers and crons, point SMTP and payment keys at test ones.
+- **Previews need btrfs for data** (without it they start empty) and can't be made of projects with external volumes or fixed-subnet networks. Absolute bind mounts and external networks are shared with production. Registry tags pushed for previews stay until `vops registry rm`.
 - **Logs are journald's:** retention and disk use follow its config (`/etc/systemd/journald.conf`); no long-term log store.
 - **Third-party images are not re-pulled** on their own: `postgres:16` stays at the version first pulled until you change the tag.
 - **Not yet run on a real cloud VPS** (see State above).
@@ -127,9 +136,11 @@ vops init | install user@host | sync [-y] | ui
 vops status | plan | apply [-y] [project...]
 vops logs <project> [service] [-f] [-n N] [--grep s]
 vops restart <project> [service] | enable <project> | disable <project>
-vops env ls|set|rm <project> ...         vops user ls|add|rm|token ...
+vops env ls|set|rm <project> [--preview] ...   vops user ls|add|rm|token ...
 vops registry ls|rm|gc                    vops admin password | events | audit | version
 vops snapshot ls|create|rm ...            vops rollback <project> [id] [-y]
+vops preview up <project> --name n [--image svc=ref]... [--ref r] [--from id]
+vops preview ls [project] | rm <project> <name>
 ```
 
 Inside a linked repo commands run on the host over ssh; on the host they talk to the daemon directly.
@@ -144,4 +155,4 @@ just gen        # sqlc generate (after editing internal/store/queries.sql or mig
 just vps-test   # systemd + real sshd + podman in a container as the host (slow, needs network)
 ```
 
-Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api), `internal/deploy` checks zero failed requests during a rolling release, `internal/registry` pushes and pulls with real podman.
+Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api, previews from registry tags), `internal/deploy` checks zero failed requests during a rolling release and runs a destructive migration in a preview of a real postgres, `internal/registry` pushes and pulls with real podman.

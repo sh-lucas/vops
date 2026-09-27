@@ -93,7 +93,7 @@ func Cleanup(t testing.TB, label string) {
 	t.Helper()
 	clean := func() {
 		ctx := context.Background()
-		podman.Run(ctx, "rm", "-af", "-t", "0", "--filter", "label="+label)
+		podman.Run(ctx, "rm", "-af", "-v", "-t", "0", "--filter", "label="+label)
 		podman.Run(ctx, "network", "prune", "-f", "--filter", "label="+label)
 		podman.Run(ctx, "volume", "prune", "-f", "--filter", "label="+label)
 	}

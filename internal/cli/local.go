@@ -328,6 +328,10 @@ func cmdEnv(g globals, args []string) error {
 		return forward(g, "env", args, os.Stdin, os.Stdout)
 	}
 	project, pairs := args[1], args[2:]
+	var extra []string
+	if i := slices.Index(pairs, "--preview"); i >= 0 {
+		pairs, extra = slices.Delete(slices.Clone(pairs), i, i+1), []string{"--preview"}
+	}
 	var lines bytes.Buffer
 	for _, p := range pairs {
 		if k, _, ok := strings.Cut(p, "="); ok && k != "" {
@@ -348,7 +352,41 @@ func cmdEnv(g globals, args []string) error {
 			return err
 		}
 	}
-	return forward(g, "env", []string{"set", project, "--stdin"}, &lines, os.Stdout)
+	return forward(g, "env", append([]string{"set", project, "--stdin"}, extra...), &lines, os.Stdout)
+}
+
+// ---- previews
+
+// cmdPreview forwards to the host; `up --ref <branch>` of a local branch pushes it to the host first,
+// so the worktree there can check it out.
+func cmdPreview(g globals, args []string) error {
+	fs := flag.NewFlagSet("preview", flag.ContinueOnError)
+	ref := fs.String("ref", "", "")
+	fs.String("name", "", "")
+	fs.Int64("from", 0, "")
+	var images multi
+	fs.Var(&images, "image", "")
+	pos, err := parseFlags(fs, args)
+	if err != nil {
+		return err
+	}
+	r, err := g.remote()
+	if err != nil {
+		return err
+	}
+	root := repoRoot()
+	if len(pos) > 0 && pos[0] == "up" && *ref != "" && *ref != "main" && r != nil && root != "" {
+		if _, err := output(root, "git", "rev-parse", "--verify", "-q", "refs/heads/"+*ref); err == nil {
+			if err := ensureGitRemote(root, r); err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "pushing %s to the host\n", *ref)
+			if err := run(root, []string{"GIT_SSH_COMMAND=" + r.GitSSH()}, "git", "push", "-q", "-f", "vops", *ref+":refs/heads/"+*ref); err != nil {
+				return err
+			}
+		}
+	}
+	return forward(g, "preview", args, nil, os.Stdout)
 }
 
 func cmdAdmin(g globals, args []string) error {

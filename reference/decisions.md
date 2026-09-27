@@ -20,6 +20,8 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 | `~/.vops/bin/vops` | the binary (absolute path, so non-interactive ssh `PATH` doesn't matter) |
 | `~/.vops/vops.db` | sqlite: env vars, users, sessions, events, project flags |
 | `~/.vops/config.yml` | the config lock: copy of the last applied `vops.yml` |
+| `~/.vops/snapshots/` | btrfs snapshots of project data |
+| `~/.vops/previews/<slug>/` | a preview's git worktree (and its bind-mounted data) |
 | `~/.vops/secret.key` | AES key for env values at rest |
 | `~/.vops/certs/` | ACME cache |
 | `~/.vops/vops.sock` | daemon socket |
@@ -97,11 +99,11 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 
 ## Config: vops.yml and its lock
 
-- One config file, `vops.yml`, committed: domain, email, listeners, tls, snapshots. It is desired state like the compose files: a change shows up in the plan (`~ ui: a -> b`) and takes effect on apply.
+- One config file, `vops.yml`, committed: domain, email, listeners, tls, snapshots, preview limits. It is desired state like the compose files: a change shows up in the plan (`~ ui: a -> b`) and takes effect on apply.
 - The host keeps `~/.vops/config.yml`, a copy of the last applied `vops.yml` (the "lock"). The daemon always starts from the lock, never straight from the repo, so a broken or half-pushed `vops.yml` can't stop it: the plan warns "keeping the config in effect" and nothing changes.
 - `vops install` sends the local `vops.yml` to the host as its first lock, so the daemon starts with the right ports and tls before the first sync.
 - A hand edit of the lock is drift: the next plan shows it and apply puts `vops.yml` back.
-- Listener changes (http, https, ui, tls, acme email) need new sockets: after apply the daemon re-execs itself (same pid, systemd doesn't notice; containers keep running, routes are rebuilt from labels). Everything else (domain, snapshots) applies live.
+- Listener changes (http, https, ui, tls, acme email) need new sockets: after apply the daemon re-execs itself (same pid, systemd doesn't notice; containers keep running, routes are rebuilt from labels). Everything else (domain, snapshots, preview limits) applies live.
 - Parsing is strict: a typo in `vops.yml` is an error, not a silently ignored key.
 
 ## Snapshots and rollback
@@ -143,8 +145,21 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Changing only readiness settings (`health`, `timeout`, `strategy`) doesn't recreate containers; they aren't part of the service hash.
 - `just vps-test` is the production-like check: fake ssh in `go test` covers the logic fast, the vps container covers real sshd/systemd/root.
 
+## Previews
+
+- A preview is the synthetic project `<project>@<name>`, run by the same engine (labels, hashes, plan/apply, rolling releases). `@` can't be in a dir name, so it never clashes with a real project. Names: slug `shop--pr-42` for podman objects (a dir could produce that slug, so `preview up` refuses a name whose slug or dns name belongs to an existing project), domain `<service>.pr-42.shop.<domain>`, which autocert already handles.
+- Previews are not in the plan: git doesn't describe them. `Plan` ignores containers of `@` projects (else they'd be "removed from git"); the `previews` table is their desired state (commit, image overrides). No pre-deploy snapshots of them, no `projects` row.
+- Code: a detached git worktree of the host repo in `~/.vops/previews/<slug>`, at the project's applied commit (or `--ref`). It gives each preview its own bind paths, build contexts, `env_file`s and `preview.env` at that commit, with no copying. The commit is pinned: later pushes and syncs don't move it, `preview up --ref` does. `vops preview up --ref <branch>` pushes a local branch to the host first (never `main`), so `--ref` just works from the laptop.
+- Data: copied once, at creation, as writable btrfs snapshots straight from the live subvolumes (the project's containers are paused for the milliseconds it takes, like a pre-deploy snapshot). No snapshot row is recorded, so previews never push pre-deploy snapshots out of retention. `--from <id>` copies a recorded snapshot instead. Updates keep the preview's data; to start over: `rm` + `up`. Volumes map by compose key (`vops-shop-db` → `vops-shop--pr-42-db`), binds by path inside the project dir (into the worktree). Without btrfs a preview starts empty.
+- Env: two layers only, never production's env: `preview.env` in the project dir (committed, not secret: `SMTP_HOST=mailpit`), then preview secrets (`vops env set shop --preview KEY`) on top. The copied data still carries production's own credentials (db passwords): set what the preview needs with `--preview`. Preview secrets live in the `env` table under project `<project>@*`: same encryption, same write-only api, same audit, no new table. `COMPOSE_PROFILES` comes from these layers; `VOPS_PREVIEW` is set.
+- Guardrails are defaults, not options: no shared `vops` network (a service asking for it gets the preview's default network), `x-vops.preview.skip` services don't run (dependencies on them are dropped), no published host ports (they'd clash with production), no `x-vops.domains` (they're production's), `name:` of volumes and networks ignored (it would be production's object), external volumes are an error. External networks and absolute bind mounts are kept (the plan warns about the latter): they are explicit infrastructure.
+- Limits: `preview_max` (5) previews on the host, counted from the table; `preview_ttl` (3d) since the last `up` or push. Housekeeping checks every minute. Both live in `vops.yml` like everything else.
+- Registry trigger: a top-level `x-vops.previews` tag pattern per project (default `preview-*`, `off`). A pushed tag matching it creates or updates the preview named by `*` in every project with a service running that repo; the image keeps its registry host and gets the pushed tag. Overrides accumulate, so `shop/web:preview-pr-42` then `shop/api:preview-pr-42` is one preview with both. A tag that matches the pattern is never a production redeploy, even if production runs that exact tag.
+- `rm` removes containers (and their anonymous volumes), networks, volumes, built images and local tags of the overrides, then the worktree with its data, then the row. If a step fails the row stays, so a retry or the ttl finishes the job. Registry tags stay (they're the user's pushes).
+- Removing a container also removes its anonymous volumes (`podman rm -v`), for previews and projects alike: an image's `VOLUME` (postgres has one) left one volume behind per removed job or replica, forever.
+- Preview lifecycle events are recorded under the base project (kind `preview`), so `vops events shop` shows them; deploy lines use the preview path.
+
 ## Not done yet
 
-- Preview environments / database branching (TODO.md).
 - Re-pulling third-party tags (`postgres:16`) on a schedule.
 - Daemon pulling the repo from somewhere else (GitHub → server).

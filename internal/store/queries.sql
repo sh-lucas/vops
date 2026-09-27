@@ -100,3 +100,19 @@ DELETE FROM snapshots WHERE id = ?;
 
 -- name: ListAudit :many
 SELECT * FROM audit_log ORDER BY id DESC LIMIT ?;
+
+-- name: PutPreview :exec
+-- creates a preview or updates it; created_at, snapshot_id and data belong to its creation
+INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, updated_at = excluded.updated_at;
+
+-- name: GetPreview :one
+SELECT * FROM previews WHERE project = ? AND name = ?;
+
+-- name: ListPreviews :many
+SELECT * FROM previews
+WHERE sqlc.arg(project) = '' OR project = sqlc.arg(project)
+ORDER BY project, name;
+
+-- name: DeletePreview :exec
+DELETE FROM previews WHERE project = ? AND name = ?;

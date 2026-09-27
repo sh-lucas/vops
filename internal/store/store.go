@@ -404,3 +404,60 @@ func (d *DB) CheckAdmin(password string) bool {
 	got, err := pbkdf2.Key(sha256.New, password, s, pbkdf2Iter, 32)
 	return err == nil && equalHash(hex.EncodeToString(got), key)
 }
+
+// ---- previews
+
+type Preview struct {
+	Project    string            `json:"project"`
+	Name       string            `json:"name"`
+	Ref        string            `json:"ref"`
+	Commit     string            `json:"commit"`
+	Images     map[string]string `json:"images"` // service -> image overrides
+	SnapshotID int64             `json:"snapshot_id"`
+	Data       string            `json:"data"`
+	CreatedAt  int64             `json:"created_at"`
+	UpdatedAt  int64             `json:"updated_at"`
+}
+
+func previewFrom(r queries.Preview) Preview {
+	p := Preview{Project: r.Project, Name: r.Name, Ref: r.Ref, Commit: r.CommitSha, Images: map[string]string{}, SnapshotID: r.SnapshotID, Data: r.Data, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
+	json.Unmarshal([]byte(r.Images), &p.Images)
+	return p
+}
+
+// PutPreview creates a preview or updates its ref, commit and images; either way it counts as used now.
+func (d *DB) PutPreview(p Preview) error {
+	if p.Images == nil {
+		p.Images = map[string]string{}
+	}
+	images, _ := json.Marshal(p.Images, json.Deterministic(true))
+	t := now()
+	return d.q.PutPreview(ctx, queries.PutPreviewParams{Project: p.Project, Name: p.Name, Ref: p.Ref, CommitSha: p.Commit, Images: string(images),
+		SnapshotID: p.SnapshotID, Data: p.Data, CreatedAt: t, UpdatedAt: t})
+}
+
+// Preview returns a preview; found is false when it doesn't exist.
+func (d *DB) Preview(project, name string) (p Preview, found bool, err error) {
+	r, err := d.q.GetPreview(ctx, queries.GetPreviewParams{Project: project, Name: name})
+	if errors.Is(err, sql.ErrNoRows) {
+		return Preview{}, false, nil
+	}
+	if err != nil {
+		return Preview{}, false, err
+	}
+	return previewFrom(r), true, nil
+}
+
+// Previews lists previews ("" = of all projects).
+func (d *DB) Previews(project string) ([]Preview, error) {
+	rows, err := d.q.ListPreviews(ctx, project)
+	out := []Preview{}
+	for _, r := range rows {
+		out = append(out, previewFrom(r))
+	}
+	return out, err
+}
+
+func (d *DB) DeletePreview(project, name string) error {
+	return d.q.DeletePreview(ctx, queries.DeletePreviewParams{Project: project, Name: name})
+}

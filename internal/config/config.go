@@ -1,6 +1,6 @@
 // Package config reads the config files of vops.
 //
-//	<repo>/vops.yml        committed: the whole config (domain, email, listeners, tls, snapshots)
+//	<repo>/vops.yml        committed: the whole config (domain, email, listeners, tls, snapshots, previews)
 //	~/.vops/config.yml     on the host: the lock, a copy of the last applied vops.yml
 //	<repo>/vops-lock.yml   gitignored, local only: how to reach the host
 //
@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"go.yaml.in/yaml/v3"
 )
@@ -33,6 +34,8 @@ type Config struct {
 	TLS          string `yaml:"tls"`           // auto (default) | off
 	Snapshots    string `yaml:"snapshots"`     // on (default) | off
 	SnapshotKeep int    `yaml:"snapshot_keep"` // automatic snapshots kept per project, default 5
+	PreviewMax   int    `yaml:"preview_max"`   // previews on this host at once, default 5 (each one is another database)
+	PreviewTTL   string `yaml:"preview_ttl"`   // previews not updated for this long are removed, default 3d
 	// ACMEDirectory overrides the Let's Encrypt directory (staging, pebble in tests).
 	ACMEDirectory string `yaml:"acme_directory,omitempty"`
 }
@@ -63,6 +66,10 @@ func (c Config) Defaults() Config {
 	if c.SnapshotKeep == 0 {
 		c.SnapshotKeep = 5
 	}
+	if c.PreviewMax == 0 {
+		c.PreviewMax = 5
+	}
+	def(&c.PreviewTTL, "3d")
 	c.Domain = strings.ToLower(c.Domain)
 	return c
 }
@@ -93,7 +100,35 @@ func (c Config) Validate() error {
 	if c.SnapshotKeep < 0 {
 		return fmt.Errorf("snapshot_keep must be positive")
 	}
+	if c.PreviewMax < 0 {
+		return fmt.Errorf("preview_max must be positive")
+	}
+	if _, err := ParseTTL(c.PreviewTTL); err != nil {
+		return fmt.Errorf("preview_ttl: %w", err)
+	}
 	return nil
+}
+
+// ParseTTL reads a duration like "3d", "12h" or "90m".
+func ParseTTL(s string) (time.Duration, error) {
+	if days, ok := strings.CutSuffix(s, "d"); ok {
+		n, err := strconv.Atoi(days)
+		if err != nil || n <= 0 {
+			return 0, fmt.Errorf("%q is not a duration (3d, 12h, 90m)", s)
+		}
+		return time.Duration(n) * 24 * time.Hour, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%q is not a duration (3d, 12h, 90m)", s)
+	}
+	return d, nil
+}
+
+// Previews returns the preview limits.
+func (c Config) Previews() (max int, ttl time.Duration) {
+	ttl, _ = ParseTTL(c.Defaults().PreviewTTL)
+	return c.Defaults().PreviewMax, ttl
 }
 
 // Listeners reports whether two configs differ in anything that needs the daemon to restart.
@@ -118,6 +153,8 @@ func (c Config) Diff(o Config) []string {
 	add("tls", c.TLS, o.TLS)
 	add("snapshots", c.Snapshots, o.Snapshots)
 	add("snapshot_keep", c.SnapshotKeep, o.SnapshotKeep)
+	add("preview_max", c.PreviewMax, o.PreviewMax)
+	add("preview_ttl", c.PreviewTTL, o.PreviewTTL)
 	add("acme_directory", c.ACMEDirectory, o.ACMEDirectory)
 	return out
 }
@@ -188,6 +225,8 @@ ui: "127.0.0.1:9984"     # dashboard + registry for "vops ui" tunnels; ":9984" e
 tls: auto                # auto (let's encrypt) | off
 snapshots: on            # btrfs snapshots before every deploy | off
 snapshot_keep: 5         # automatic snapshots kept per project
+preview_max: 5           # previews on this host at once (each one runs its own copy of the databases)
+preview_ttl: 3d          # previews not updated for this long are removed
 `, domain, email)
 }
 

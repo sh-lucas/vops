@@ -50,7 +50,7 @@ func newEnv(t *testing.T) *env {
 	t.Cleanup(func() { db.Close() })
 	ns := fmt.Sprintf("t%d", time.Now().UnixNano()%1e6)
 	testenv.Cleanup(t, LProject)
-	e := &Engine{Repo: repo, DB: db, Routes: proxy.NewTable(), SnapshotDir: filepath.Join(dir, "snapshots")}
+	e := &Engine{Repo: repo, DB: db, Routes: proxy.NewTable(), SnapshotDir: filepath.Join(dir, "snapshots"), PreviewDir: filepath.Join(dir, "previews")}
 	// subvolumes and snapshots hold subuid-owned files: remove them from inside the user namespace
 	t.Cleanup(func() {
 		ctx := context.Background()
@@ -62,6 +62,7 @@ func newEnv(t *testing.T) *env {
 		}
 		snapshot.Delete(ctx, repo)
 		snapshot.Delete(ctx, e.SnapshotDir)
+		snapshot.Delete(ctx, e.PreviewDir)
 	})
 	srv := httptest.NewServer(proxy.Handler(e.Routes))
 	t.Cleanup(srv.Close)

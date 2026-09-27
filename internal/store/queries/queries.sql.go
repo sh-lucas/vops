@@ -135,6 +135,20 @@ func (q *Queries) DeleteExpiredSessions(ctx context.Context, expires int64) erro
 	return err
 }
 
+const deletePreview = `-- name: DeletePreview :exec
+DELETE FROM previews WHERE project = ? AND name = ?
+`
+
+type DeletePreviewParams struct {
+	Project string `json:"project"`
+	Name    string `json:"name"`
+}
+
+func (q *Queries) DeletePreview(ctx context.Context, arg DeletePreviewParams) error {
+	_, err := q.db.ExecContext(ctx, deletePreview, arg.Project, arg.Name)
+	return err
+}
+
 const deleteProject = `-- name: DeleteProject :exec
 DELETE FROM projects WHERE path = ?
 `
@@ -180,6 +194,32 @@ func (q *Queries) GetMeta(ctx context.Context, key string) (string, error) {
 	var value string
 	err := row.Scan(&value)
 	return value, err
+}
+
+const getPreview = `-- name: GetPreview :one
+SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at FROM previews WHERE project = ? AND name = ?
+`
+
+type GetPreviewParams struct {
+	Project string `json:"project"`
+	Name    string `json:"name"`
+}
+
+func (q *Queries) GetPreview(ctx context.Context, arg GetPreviewParams) (Preview, error) {
+	row := q.db.QueryRowContext(ctx, getPreview, arg.Project, arg.Name)
+	var i Preview
+	err := row.Scan(
+		&i.Project,
+		&i.Name,
+		&i.Ref,
+		&i.CommitSha,
+		&i.Images,
+		&i.SnapshotID,
+		&i.Data,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
 }
 
 const getSessionExpiry = `-- name: GetSessionExpiry :one
@@ -408,6 +448,45 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 	return items, nil
 }
 
+const listPreviews = `-- name: ListPreviews :many
+SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at FROM previews
+WHERE ?1 = '' OR project = ?1
+ORDER BY project, name
+`
+
+func (q *Queries) ListPreviews(ctx context.Context, project interface{}) ([]Preview, error) {
+	rows, err := q.db.QueryContext(ctx, listPreviews, project)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Preview{}
+	for rows.Next() {
+		var i Preview
+		if err := rows.Scan(
+			&i.Project,
+			&i.Name,
+			&i.Ref,
+			&i.CommitSha,
+			&i.Images,
+			&i.SnapshotID,
+			&i.Data,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listProjects = `-- name: ListProjects :many
 SELECT path, disabled, commit_sha, applied_at FROM projects ORDER BY path
 `
@@ -540,6 +619,39 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		return nil, err
 	}
 	return items, nil
+}
+
+const putPreview = `-- name: PutPreview :exec
+INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, updated_at = excluded.updated_at
+`
+
+type PutPreviewParams struct {
+	Project    string `json:"project"`
+	Name       string `json:"name"`
+	Ref        string `json:"ref"`
+	CommitSha  string `json:"commit_sha"`
+	Images     string `json:"images"`
+	SnapshotID int64  `json:"snapshot_id"`
+	Data       string `json:"data"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
+}
+
+// creates a preview or updates it; created_at, snapshot_id and data belong to its creation
+func (q *Queries) PutPreview(ctx context.Context, arg PutPreviewParams) error {
+	_, err := q.db.ExecContext(ctx, putPreview,
+		arg.Project,
+		arg.Name,
+		arg.Ref,
+		arg.CommitSha,
+		arg.Images,
+		arg.SnapshotID,
+		arg.Data,
+		arg.CreatedAt,
+		arg.UpdatedAt,
+	)
+	return err
 }
 
 const setEnv = `-- name: SetEnv :exec

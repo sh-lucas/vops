@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/config"
@@ -46,6 +47,9 @@ type Engine struct {
 	SnapshotKeep int                // automatic snapshots kept per project (default 5)
 	SnapshotsOff bool
 	PullAuthFile string
+	PreviewDir   string        // previews' git worktrees (~/.vops/previews), same btrfs as the data
+	PreviewMax   int           // previews at once (default 5)
+	PreviewTTL   time.Duration // previews not updated for this long are removed (default 3 days)
 
 	// Config returns the config in effect (the host lock); ApplyConfig makes a new one take effect.
 	// Both nil means vops.yml is only read for the domain (tests).
@@ -77,9 +81,11 @@ type ProjectPlan struct {
 	Error    string   `json:"error,omitempty"`
 	Actions  []Action `json:"actions"`
 
-	specs  map[string]*desired
-	actual map[string][]podman.Container
-	nets   []compose.NetworkDef
+	specs    map[string]*desired
+	actual   map[string][]podman.Container
+	nets     []compose.NetworkDef
+	previews string // x-vops.previews
+	project  *compose.Project
 }
 
 type Action struct {
@@ -94,6 +100,7 @@ type desired struct {
 	image string // final image ref to run
 	pull  string // ref to pull from our registry (loopback), when the image is ours
 	own   string // "repo:tag" in our registry, when the image is ours
+	repo  string // the repo of own
 }
 
 // Changes reports whether the plan does anything.
@@ -227,6 +234,9 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	actual := map[string]map[string][]podman.Container{}
 	for _, c := range containers {
 		p, s := c.Labels[LProject], c.Labels[LService]
+		if compose.IsPreview(p) {
+			continue // previews live next to git, not in it (see preview.go)
+		}
 		if actual[p] == nil {
 			actual[p] = map[string][]podman.Container{}
 		}
@@ -261,7 +271,12 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			}
 			continue
 		}
-		if err := e.planProject(ctx, pp, files, cfg.Domain, &plan.Warnings); err != nil {
+		env, err := e.DB.Env(p)
+		if err != nil {
+			pp.Error = err.Error()
+			continue
+		}
+		if err := e.planProject(ctx, pp, source{root: e.Repo, files: files, env: env}, cfg.Domain, &plan.Warnings); err != nil {
 			pp.Error = err.Error()
 			continue
 		}
@@ -278,21 +293,38 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	return plan, nil
 }
 
-func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, files []string, domain string, warns *[]string) error {
-	env, err := e.DB.Env(pp.Path)
-	if err != nil {
-		return err
-	}
+// source is where a project's definition comes from: the repo, or a preview's worktree with its own env and images.
+type source struct {
+	root   string            // the git working tree (e.Repo or a preview worktree)
+	files  []string          // compose files in the project dir
+	env    map[string]string // interpolation and pass-through variables
+	images map[string]string // preview image overrides: service -> image
+}
+
+func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, domain string, warns *[]string) error {
+	env := src.env
 	for k, v := range builtinEnv(pp.Path, domain) {
 		if _, set := env[k]; !set {
 			env[k] = v
 		}
 	}
-	proj, err := compose.Load(filepath.Join(e.Repo, filepath.FromSlash(pp.Path)), pp.Path, files, env)
+	base, _, _ := strings.Cut(pp.Path, "@")
+	proj, err := compose.Load(filepath.Join(src.root, filepath.FromSlash(base)), pp.Path, src.files, env)
 	if err != nil {
 		return err
 	}
 	*warns = append(*warns, proj.Warnings...)
+	for _, svc := range sortedKeys(src.images) {
+		s := proj.Services[svc]
+		if s == nil {
+			if slices.Contains(proj.Inactive, svc) || slices.Contains(proj.Skipped, svc) {
+				continue
+			}
+			return fmt.Errorf("image override for %s: no such service", svc)
+		}
+		s.Image, s.Build = src.images[svc], nil
+	}
+	pp.previews, pp.project = proj.Previews, proj
 	specs, err := proj.Specs(domain, env)
 	if err != nil {
 		return err
@@ -307,7 +339,7 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, files []strin
 	}
 	var order []Action
 	for _, sp := range specs {
-		d, err := e.resolve(ctx, sp, domain)
+		d, err := e.resolve(ctx, src.root, sp, domain)
 		if err != nil {
 			return fmt.Errorf("service %s: %w", sp.Service, err)
 		}
@@ -335,6 +367,9 @@ func networkHash(ctx context.Context, name string) (string, bool) {
 // builtinEnv is available for interpolation in every project.
 func builtinEnv(project, domain string) map[string]string {
 	env := map[string]string{"VOPS_PROJECT": project, "VOPS_DOMAIN": domain}
+	if _, name, ok := strings.Cut(project, "@"); ok {
+		env["VOPS_PREVIEW"] = name
+	}
 	if domain != "" {
 		env["VOPS_PROJECT_DOMAIN"] = compose.DNSName(project) + "." + domain
 	}
@@ -372,8 +407,8 @@ func compare(d *desired, actual []podman.Container) Action {
 	return a
 }
 
-// resolve fixes the image of a spec and computes its hash.
-func (e *Engine) resolve(ctx context.Context, sp *compose.Spec, domain string) (*desired, error) {
+// resolve fixes the image of a spec and computes its hash. root is the git working tree the spec comes from.
+func (e *Engine) resolve(ctx context.Context, root string, sp *compose.Spec, domain string) (*desired, error) {
 	d := &desired{spec: sp, image: sp.Image}
 	h := sha256.New()
 	w := func(s ...string) {
@@ -393,7 +428,7 @@ func (e *Engine) resolve(ctx context.Context, sp *compose.Spec, domain string) (
 	w(sp.Domains...)
 	switch {
 	case sp.Build != nil:
-		tree, err := treeHash(ctx, e.Repo, sp.Build.Context)
+		tree, err := treeHash(ctx, root, sp.Build.Context)
 		if err != nil {
 			return nil, fmt.Errorf("build context: %w", err)
 		}
@@ -410,7 +445,7 @@ func (e *Engine) resolve(ctx context.Context, sp *compose.Spec, domain string) (
 				}
 			}
 			d.pull = e.PullAddr + "/" + repo + "@" + digest
-			d.own = repo + ":" + ref
+			d.own, d.repo = repo+":"+ref, repo
 			w("own", digest)
 		}
 		w("image", sp.Image)
@@ -496,10 +531,14 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // Watching lists services that run repo:tag from our registry and want to be redeployed when it is pushed.
+// A tag matching the project's previews pattern is for previews only (PreviewTargets), never production.
 func (p *Plan) Watching(repo, tag string) []proxy.Key {
 	var out []proxy.Key
 	for _, pp := range p.Projects {
 		if pp.Disabled || pp.Gone || pp.Error != "" {
+			continue
+		}
+		if _, preview := compose.PreviewName(pp.previews, tag); preview {
 			continue
 		}
 		for name, d := range pp.specs {

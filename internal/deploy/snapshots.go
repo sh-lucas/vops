@@ -24,8 +24,7 @@ import (
 // snapshotted ("pre-deploy"); `vops rollback` puts a snapshot back (after snapshotting the current
 // state as "pre-rollback", so a rollback can itself be undone).
 //
-// Future (see TODO.md): the same snapshots, restored writable into another project's volumes, are
-// database branching for preview environments.
+// The same subvolumes, copied writable into another project's volumes, are the data of previews (preview.go).
 
 // DefaultSnapshotKeep is how many automatic snapshots per project are kept (manual ones are kept until deleted).
 const DefaultSnapshotKeep = 5
@@ -55,9 +54,8 @@ func (e *Engine) ensureData(ctx context.Context, log func(string, ...any), sp *c
 			}
 		}
 	}
-	projectDir := filepath.Join(e.Repo, filepath.FromSlash(sp.Project))
 	for _, b := range sp.Binds {
-		if e.snapshotsOn() && within(b, projectDir) {
+		if e.snapshotsOn() && within(b, sp.Dir) {
 			if _, err := snapshot.EnsureSubvolume(ctx, b); err != nil {
 				log("%s: can't make it snapshottable: %v", b, err)
 			}
@@ -180,24 +178,14 @@ var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 // snap takes read-only snapshots of vols as one snapshot. Running containers using them are paused
 // meanwhile (milliseconds), so all volumes are captured at the same instant. Caller holds e.mu.
-func (e *Engine) snap(ctx context.Context, w io.Writer, s store.Snapshot, pause []string) (store.Snapshot, error) {
+func (e *Engine) snap(ctx context.Context, w io.Writer, s store.Snapshot, users []string) (store.Snapshot, error) {
 	if len(s.Volumes) == 0 {
 		return s, errNoData
 	}
 	if !snapshot.Supported(e.SnapshotDir) {
 		return s, fmt.Errorf("snapshots need btrfs under %s", e.SnapshotDir)
 	}
-	var paused []string
-	for _, id := range pause {
-		if _, err := podman.Run(ctx, "pause", id); err == nil {
-			paused = append(paused, id)
-		}
-	}
-	defer func() {
-		for _, id := range paused {
-			podman.Run(ctx, "unpause", id)
-		}
-	}()
+	defer pause(ctx, users)()
 	dir := filepath.Join(e.SnapshotDir, compose.Slug(s.Project), time.Now().UTC().Format("20060102-150405")+"-"+randHex(2))
 	for i := range s.Volumes {
 		v := &s.Volumes[i]

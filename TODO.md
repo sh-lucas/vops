@@ -2,29 +2,18 @@
 
 Ideas with a design sketch. Done things move to README/reference; decisions to reference/decisions.md.
 
-## Data: branching and previews
+## Data
 
-Phase 1 is done: data lives on btrfs subvolumes, snapshots before every deploy, `vops rollback`. The pieces below build on it without new concepts: a snapshot is a set of read-only subvolumes (`snapshots` + `snapshot_volumes` tables), and `snapshot.Restore` already turns one into a writable copy anywhere on the same filesystem.
+Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback`, previews (`vops preview`, previews from registry tags). What's left builds on the same pieces.
 
-### Phase 2: preview environments (database branching)
+### Previews, next
 
-- `vops preview up <project> --name pr-42 [--ref <git ref>] [--image svc=ref] [--from <snapshot>]`, `vops preview ls|rm`.
-- A preview is a synthetic project `<project>@pr-42`: the engine already works per project (labels, hashes, plan/apply), so it mostly needs a different path, names and domain.
-- Code: `git worktree add ~/.vops/previews/<name> <ref>` on the host (build contexts and bind mounts come from there). `sync` could push the current branch as `refs/heads/<branch>` so `--ref` just works.
-- Data: take (or reuse) a snapshot of the base project and `snapshot.Restore` each volume into the preview's own volume names. O(1), copy-on-write.
-- Names: containers/networks/volumes get the preview slug; domain `<service>.pr-42.<project reversed>.<domain>` (autocert already handles arbitrary hosts).
-- State: a `previews` table (name, project, ref, image overrides, snapshot, ttl, created, last used) + audit triggers.
-- Cleanup: TTL (default 3 days since last update) in housekeeping; `rm` deletes containers, networks, volumes, worktree.
-- Guardrails (defaults, not options you have to remember):
-  - previews don't join the shared `vops` network (can't reach prod by accident);
-  - env: `COMPOSE_PROFILES` and a preview env layer that overrides the project env; document loudly that prod secrets + prod data can send real emails / charge real cards;
-  - `x-vops.preview: {skip: true}` for workers and crons;
-  - max previews per host (RAM: every preview is another database).
-- Deep test: preview with a real postgres, run a destructive migration job in it, prod untouched, rm leaves nothing behind.
-
-### Phase 3: previews from registry tags
-
-- Push `shop/web:preview-pr-42` → create/update preview `pr-42` of the projects running `shop/web`, with that image. The push trigger (`Daemon.onPush`) already finds services by repo; it needs a tag pattern (`x-vops.previews: "preview-*"`) and to call the preview code instead of apply.
+- Dashboard page for previews: the api is there (`GET/POST/DELETE /api/previews`, `/api/env` with `preview`).
+- Reset a preview's data without `rm`: `preview up --from <id>` (or `--from live`) on an existing preview; stop it, restore like rollback, start.
+- Delete the registry tags pushed for a preview when it's removed (today they stay until `vops registry rm`): only tags matching the project's `x-vops.previews` pattern.
+- Remove a preview when its branch is deleted or its PR merged: a `vops preview rm` from CI is enough today; maybe a push of an empty/special tag.
+- Per-preview ttl (`--ttl 12h`) and a "keep" flag for long-lived staging-like previews.
+- Previews of projects with fixed-subnet networks: rewrite or drop `ipam` in previews.
 
 ### Smaller data items
 

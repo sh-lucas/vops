@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -68,6 +69,12 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	fromStdin := fs.Bool("stdin", false, "")
 	tokenStdin := fs.Bool("token-stdin", false, "")
 	note := fs.String("m", "", "")
+	preview := fs.Bool("preview", false, "")
+	name := fs.String("name", "", "")
+	ref := fs.String("ref", "", "")
+	from := fs.Int64("from", 0, "")
+	var images multi
+	fs.Var(&images, "image", "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -177,10 +184,14 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		if err != nil {
 			return err
 		}
+		scope, applyHint := "", "run `vops apply` to deploy"
+		if *preview {
+			scope, applyHint = "&preview=1", "previews get it on their next `vops preview up`"
+		}
 		switch sub {
 		case "ls":
 			var keys []store.EnvKey
-			if err := getJSON(c, "/api/env?project="+url.QueryEscape(project), &keys); err != nil {
+			if err := getJSON(c, "/api/env?project="+url.QueryEscape(project)+scope, &keys); err != nil {
 				return err
 			}
 			for _, k := range keys {
@@ -207,20 +218,20 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 				if len(v) >= 2 && (v[0] == '"' && v[len(v)-1] == '"' || v[0] == '\'' && v[len(v)-1] == '\'') {
 					v = v[1 : len(v)-1]
 				}
-				if err := post(c, "POST", "/api/env", map[string]string{"project": project, "key": strings.TrimSpace(k), "value": v}, nil); err != nil {
+				if err := post(c, "POST", "/api/env", map[string]any{"project": project, "key": strings.TrimSpace(k), "value": v, "preview": *preview}, nil); err != nil {
 					return err
 				}
 				count++
 			}
-			fmt.Fprintf(out, "%d variable(s) set on %s; run `vops apply` to deploy them\n", count, project)
+			fmt.Fprintf(out, "%d %s variable(s) set on %s; %s\n", count, map[bool]string{true: "preview", false: "env"}[*preview], project, applyHint)
 			return sc.Err()
 		case "rm":
 			for _, k := range pos[2:] {
-				if err := post(c, "DELETE", "/api/env?project="+url.QueryEscape(project)+"&key="+url.QueryEscape(k), nil, nil); err != nil {
+				if err := post(c, "DELETE", "/api/env?project="+url.QueryEscape(project)+"&key="+url.QueryEscape(k)+scope, nil, nil); err != nil {
 					return err
 				}
 			}
-			fmt.Fprintf(out, "removed; run `vops apply` to deploy\n")
+			fmt.Fprintf(out, "removed; %s\n", applyHint)
 			return nil
 		}
 		return fmt.Errorf("env %s: unknown", sub)
@@ -434,6 +445,79 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		}
 		return stream(resp, out)
 
+	case "preview":
+		sub, err := arg(0, "ls|up|rm")
+		if err != nil {
+			return err
+		}
+		switch sub {
+		case "ls":
+			project, _ := arg(1, "")
+			var res []deploy.PreviewState
+			if err := getJSON(c, "/api/previews?project="+url.QueryEscape(project), &res); err != nil {
+				return err
+			}
+			tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+			fmt.Fprintln(tw, "PROJECT\tNAME\tCOMMIT\tRUNNING\tUPDATED\tEXPIRES\tURL\tIMAGES\tDATA")
+			for _, p := range res {
+				running, total, url := 0, 0, ""
+				for _, s := range p.Services {
+					for _, ct := range s.Containers {
+						total++
+						if ct.State == "running" || ct.Labels["vops.job"] != "" && ct.ExitCode == 0 {
+							running++
+						}
+					}
+					if len(s.Domains) > 0 && url == "" {
+						url = s.Domains[len(s.Domains)-1]
+					}
+				}
+				state := fmt.Sprintf("%d/%d", running, total)
+				if p.Error != "" {
+					state += " ✗ " + p.Error
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%.12s\t%s\t%s\t%s\t%s\t%s\t%s\n", p.Project, p.Name, p.Commit, state, ago(p.UpdatedAt), in(p.ExpiresAt), orDash(url), orDash(strings.Join(sortedImages(p.Images), ",")), p.Data)
+			}
+			return tw.Flush()
+		case "up":
+			project, err := arg(1, "project")
+			if err != nil {
+				return err
+			}
+			if *name == "" {
+				return errors.New("preview up needs --name (a dns label, e.g. pr-42)")
+			}
+			imgs := map[string]string{}
+			for _, i := range images {
+				svc, img, ok := strings.Cut(i, "=")
+				if !ok || svc == "" || img == "" {
+					return fmt.Errorf("--image %q: expected service=image", i)
+				}
+				imgs[svc] = img
+			}
+			resp, err := c.do("POST", "/api/previews", jsonBody(deploy.PreviewOpts{Project: project, Name: *name, Ref: *ref, Images: imgs, From: *from}))
+			if err != nil {
+				return err
+			}
+			return stream(resp, out)
+		case "rm":
+			project, err := arg(1, "project")
+			if err != nil {
+				return err
+			}
+			nm, err := arg(2, "name")
+			if err != nil {
+				return err
+			}
+			var res struct{ Log string }
+			if err := post(c, "DELETE", "/api/previews?project="+url.QueryEscape(project)+"&name="+url.QueryEscape(nm), nil, &res); err != nil {
+				return err
+			}
+			fmt.Fprint(out, res.Log)
+			return nil
+		}
+		return fmt.Errorf("preview %s: unknown", sub)
+
 	case "audit":
 		var logs []store.Audit
 		if err := getJSON(c, fmt.Sprintf("/api/audit?n=%d", *n), &logs); err != nil {
@@ -493,6 +577,29 @@ func ago(unix int64) string {
 		return fmt.Sprintf("%dh ago", int(d.Hours()))
 	}
 	return fmt.Sprintf("%dd ago", int(d.Hours()/24))
+}
+
+// in says when a future unix time comes.
+func in(unix int64) string {
+	d := time.Until(time.Unix(unix, 0)).Round(time.Minute)
+	switch {
+	case d <= 0:
+		return "now"
+	case d < time.Hour:
+		return fmt.Sprintf("in %dm", int(d.Minutes()))
+	case d < 48*time.Hour:
+		return fmt.Sprintf("in %dh", int(d.Hours()))
+	}
+	return fmt.Sprintf("in %dd", int(d.Hours()/24))
+}
+
+func sortedImages(m map[string]string) []string {
+	var out []string
+	for k, v := range m {
+		out = append(out, k+"="+v)
+	}
+	slices.Sort(out)
+	return out
 }
 
 func printStatus(c *client, out io.Writer) error {

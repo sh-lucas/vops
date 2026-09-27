@@ -368,3 +368,82 @@ services:
 		}
 	}
 }
+
+// The same compose as a preview: own names and domain, no shared network, no skipped services,
+// no host ports, no extra domains, and the top-level x-vops.previews pattern.
+func TestPreviewGuardrails(t *testing.T) {
+	yml := `
+x-vops: {previews: "pr-*"}
+services:
+  web:
+    image: x
+    ports: ["8080:80"]
+    networks: [default, vops]
+    depends_on: [worker]
+    volumes: ["data:/data"]
+    x-vops: {port: 80, domains: [shop.com], strategy: recreate}
+  db:
+    image: x
+    networks: [backend]
+  worker:
+    image: x
+    x-vops: {preview: {skip: true}}
+volumes:
+  data: {name: shop-data}
+networks:
+  backend: {name: shop-backend, internal: true}
+`
+	prod, err := load(t, "shop", yml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prod.Previews != "pr-*" || prod.VolumeName("data") != "shop-data" || prod.netName("backend") != "shop-backend" {
+		t.Fatalf("prod: %q %s %s", prod.Previews, prod.VolumeName("data"), prod.netName("backend"))
+	}
+	p, err := load(t, "shop@pr-1", yml, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := p.Services["worker"]; ok || !slices.Equal(p.Skipped, []string{"worker"}) {
+		t.Fatalf("worker should be skipped: %v", p.Skipped)
+	}
+	specs, err := p.Specs("example.com", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	web := specs[slices.IndexFunc(specs, func(s *Spec) bool { return s.Service == "web" })]
+	args := strings.Join(web.Args, " ")
+	var nets []string
+	for _, n := range web.Networks {
+		nets = append(nets, n.Name)
+	}
+	if strings.Contains(args, "-p ") || !slices.Equal(web.Domains, []string{"pr-1.shop.example.com", "web.pr-1.shop.example.com"}) ||
+		!slices.Equal(nets, []string{"vops-shop--pr-1"}) || len(web.DependsOn) != 0 || !strings.Contains(args, "-v vops-shop--pr-1-data:/data") {
+		t.Fatalf("preview web: domains %v networks %v deps %v args %s", web.Domains, nets, web.DependsOn, args)
+	}
+	if p.netName("backend") != "vops-shop--pr-1-backend" {
+		t.Fatalf("preview network: %s", p.netName("backend"))
+	}
+	if _, err := load(t, "shop@pr-1", "services:\n  a:\n    image: x\n    volumes: [\"d:/d\"]\nvolumes:\n  d: {external: true}\n", nil); err == nil || !strings.Contains(err.Error(), "external") {
+		t.Fatalf("external volume in a preview: %v", err)
+	}
+	for _, bad := range []string{"shop@PR", "shop@-x", "shop@a.b", "shop@"} {
+		if err := ValidProjectPath(bad); err == nil {
+			t.Errorf("%s accepted", bad)
+		}
+	}
+	for tag, want := range map[string]string{"preview-pr-42": "pr-42", "preview-PR_42": "pr-42", "preview-": "", "v1": "", "xpreview-1": ""} {
+		if got, ok := PreviewName("", tag); got != want || ok != (want != "") {
+			t.Errorf("%s: got %q %v, want %q", tag, got, ok, want)
+		}
+	}
+	if _, ok := PreviewName("off", "preview-1"); ok {
+		t.Error("previews: off still matches")
+	}
+	if got, ok := PreviewName("pr-*-web", "pr-7-web"); !ok || got != "7" {
+		t.Errorf("suffix pattern: %q %v", got, ok)
+	}
+	if _, err := load(t, "p", "x-vops: {previews: nope}\nservices:\n  a:\n    image: x\n", nil); err == nil {
+		t.Error("pattern without * accepted")
+	}
+}

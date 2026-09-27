@@ -26,6 +26,8 @@ type Project struct {
 	Volumes  map[string]*Volume
 	Networks map[string]*Network
 	Inactive []string // services left out by COMPOSE_PROFILES
+	Skipped  []string // services left out of a preview (x-vops.preview.skip)
+	Previews string   // top-level x-vops.previews: registry tags that create previews ("preview-*" when empty, "off")
 	Warnings []string
 }
 
@@ -85,6 +87,9 @@ type Vops struct {
 	Strategy string   `yaml:"strategy"` // rolling | recreate
 	Watch    *bool    `yaml:"watch"`    // redeploy when the tag is pushed to the vops registry (default true)
 	Timeout  Duration `yaml:"timeout"`  // readiness timeout (default 60s)
+	Preview  struct {
+		Skip bool `yaml:"skip"` // not run in previews (workers, crons)
+	} `yaml:"preview"`
 }
 
 type Build struct {
@@ -475,15 +480,45 @@ func IsComposeFile(name string) bool {
 	return strings.HasSuffix(name, ".compose.yml") || strings.HasSuffix(name, ".compose.yaml")
 }
 
-// ValidProjectPath checks every path segment can become a DNS label.
+// ValidProjectPath checks every path segment can become a DNS label. A preview path is "<project>@<name>".
 func ValidProjectPath(p string) error {
-	for s := range strings.SplitSeq(p, "/") {
+	base, name, preview := strings.Cut(p, "@")
+	for s := range strings.SplitSeq(base, "/") {
 		if !segmentRe.MatchString(s) {
 			return fmt.Errorf("project %q: directory %q must match %s", p, s, segmentRe)
 		}
 	}
+	if preview && !PreviewNameRe.MatchString(name) {
+		return fmt.Errorf("preview name %q must match %s", name, PreviewNameRe)
+	}
 	return nil
 }
+
+// PreviewNameRe: a preview name is a dns label (it becomes <service>.<name>.<project>.<domain>).
+var PreviewNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`)
+
+// IsPreview reports whether a project path is a preview ("shop@pr-42").
+func IsPreview(path string) bool { return strings.Contains(path, "@") }
+
+// DefaultPreviews is the tag pattern that creates previews when x-vops.previews is not set.
+const DefaultPreviews = "preview-*"
+
+// PreviewName reports whether a registry tag matches a previews pattern, and the preview it names (the
+// part matched by *). "_" and "." become "-" and letters are lowercased: "preview-PR_42" is preview "pr-42".
+// The name may still be invalid (check it with PreviewNameRe); a matching tag is a preview tag either way.
+func PreviewName(pattern, tag string) (string, bool) {
+	if pattern == "" {
+		pattern = DefaultPreviews
+	}
+	prefix, suffix, ok := strings.Cut(pattern, "*")
+	if !ok || len(tag) <= len(prefix)+len(suffix) || !strings.HasPrefix(tag, prefix) || !strings.HasSuffix(tag, suffix) {
+		return "", false
+	}
+	return strings.ToLower(strings.NewReplacer("_", "-", ".", "-").Replace(tag[len(prefix) : len(tag)-len(suffix)])), true
+}
+
+// ReadEnvFile reads KEY=VALUE lines (env_file, preview.env).
+func ReadEnvFile(path string) (map[string]string, error) { return readEnvFile(path) }
 
 // Load parses the compose files of one project. env is used for interpolation and pass-through variables.
 func Load(dir, path string, files []string, env map[string]string) (*Project, error) {
@@ -510,6 +545,9 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 		}
 		for _, w := range warns {
 			p.Warnings = append(p.Warnings, fmt.Sprintf("%s/%s: %s", path, f, w))
+		}
+		if err := p.topVops(doc.Content[0]); err != nil {
+			return nil, fmt.Errorf("%s/%s: %w", path, f, err)
 		}
 		stripExtensions(doc.Content[0], 0)
 		clean, _ := yaml.Marshal(doc.Content[0])
@@ -551,6 +589,11 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 	if err := p.applyProfiles(env["COMPOSE_PROFILES"]); err != nil {
 		return nil, err
 	}
+	if IsPreview(path) {
+		if err := p.previewGuardrails(); err != nil {
+			return nil, err
+		}
+	}
 	if err := p.checkNetworks(); err != nil {
 		return nil, err
 	}
@@ -566,10 +609,83 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 			return nil, fmt.Errorf("%s: service %s: %w", path, s.Name, err)
 		}
 	}
+	if IsPreview(path) {
+		// previews never join the shared network: a service that asked for it gets the preview's default network
+		for _, s := range p.Services {
+			if _, shared := s.Networks[SharedKey]; shared {
+				delete(s.Networks, SharedKey)
+				s.Networks["default"] = &NetOptions{}
+			}
+		}
+	}
 	if _, err := p.Order(); err != nil {
 		return nil, err
 	}
 	return p, nil
+}
+
+// topVops reads the top-level x-vops block of a compose file (project settings).
+func (p *Project) topVops(root *yaml.Node) error {
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Value != "x-vops" {
+			continue
+		}
+		v := root.Content[i+1]
+		if err := strictKeys(v, "previews"); err != nil {
+			return fmt.Errorf("x-vops: %w", err)
+		}
+		var top struct {
+			Previews string `yaml:"previews"`
+		}
+		if err := v.Decode(&top); err != nil {
+			return fmt.Errorf("x-vops: %w", err)
+		}
+		if top.Previews == "" {
+			continue
+		}
+		if top.Previews != "off" && strings.Count(top.Previews, "*") != 1 {
+			return fmt.Errorf("x-vops.previews must be a tag pattern with one * (the preview name), or off; got %q", top.Previews)
+		}
+		if p.Previews != "" && p.Previews != top.Previews {
+			return fmt.Errorf("x-vops.previews is set twice (%q and %q)", p.Previews, top.Previews)
+		}
+		p.Previews = top.Previews
+	}
+	return nil
+}
+
+// previewGuardrails keeps a preview away from production: x-vops.preview.skip services don't run,
+// no published host ports, no extra domains, no external volumes.
+func (p *Project) previewGuardrails() error {
+	for name, s := range p.Services {
+		if s.Vops.Preview.Skip {
+			delete(p.Services, name)
+			p.Skipped = append(p.Skipped, name)
+		}
+	}
+	slices.Sort(p.Skipped)
+	for _, s := range p.Services {
+		s.DependsOn = slices.DeleteFunc(s.DependsOn, func(d Dep) bool { return slices.Contains(p.Skipped, d.Name) })
+		if len(s.Ports) > 0 {
+			p.Warnings = append(p.Warnings, fmt.Sprintf("%s: service %s: published ports are left out of previews", p.Path, s.Name))
+			s.Ports = nil
+		}
+		s.Vops.Domains = nil
+		for _, m := range s.Volumes {
+			if m.Type == "bind" && filepath.IsAbs(m.Source) {
+				p.Warnings = append(p.Warnings, fmt.Sprintf("%s: service %s: %s is an absolute path, shared with production", p.Path, s.Name, m.Source))
+			}
+		}
+	}
+	for key, v := range p.Volumes {
+		if v.External {
+			return fmt.Errorf("%s: volume %s is external: a preview would write to it, so this project can't have previews", p.Path, key)
+		}
+	}
+	return nil
 }
 
 // resolveAliases inlines *alias nodes, so x-* anchors can be stripped afterwards.

@@ -31,13 +31,19 @@ func NormalizeImage(ref string) string {
 	return "docker.io/" + ref
 }
 
-// Slug is the project path as used in podman object names: "Shop/api" -> "shop.api".
-func Slug(path string) string { return strings.ToLower(strings.ReplaceAll(path, "/", ".")) }
+// Slug is the project path as used in podman object names: "Shop/api" -> "shop.api", preview "shop@pr-1" -> "shop--pr-1".
+func Slug(path string) string {
+	return strings.ToLower(strings.NewReplacer("/", ".", "@", "--").Replace(path))
+}
 
-// DNSName is the project path reversed as a dns name: "shop/api" -> "api.shop".
+// DNSName is the project path reversed as a dns name: "shop/api" -> "api.shop", preview "shop/api@pr-1" -> "pr-1.api.shop".
 func DNSName(path string) string {
-	parts := strings.Split(strings.ToLower(strings.ReplaceAll(path, "_", "-")), "/")
+	base, preview, _ := strings.Cut(path, "@")
+	parts := strings.Split(strings.ToLower(strings.ReplaceAll(base, "_", "-")), "/")
 	slices.Reverse(parts)
+	if preview != "" {
+		parts = append([]string{preview}, parts...)
+	}
 	return strings.Join(parts, ".")
 }
 
@@ -49,8 +55,11 @@ func NetworkName(path string) string { return "vops-" + Slug(path) }
 // SharedNetwork joins every vops container so projects can reach each other.
 const SharedNetwork = "vops"
 
-// VolumeName is the podman volume for a named compose volume.
+// VolumeName is the podman volume for a named compose volume. Previews ignore `name:` (it would be production's volume).
 func (p *Project) VolumeName(name string) string {
+	if IsPreview(p.Path) {
+		return "vops-" + Slug(p.Path) + "-" + name
+	}
 	if v := p.Volumes[name]; v != nil && v.External {
 		if v.Name != "" {
 			return v.Name
@@ -66,6 +75,7 @@ func (p *Project) VolumeName(name string) string {
 // Spec is everything deploy needs to run a service. Args + Cmd + image define the service; their hash decides redeploys.
 type Spec struct {
 	Project     string
+	Dir         string // the project dir on disk (in the repo, or in a preview's worktree)
 	Service     string
 	Image       string // empty when Build is set; deploy builds and fills it
 	Build       *Build
@@ -113,7 +123,7 @@ func (p *Project) Specs(rootDomain string, env map[string]string) ([]*Spec, erro
 
 func (p *Project) spec(s *Service, rootDomain string, onlyRouted bool, projectEnv map[string]string) (*Spec, error) {
 	sp := &Spec{
-		Project: p.Path, Service: s.Name, Image: NormalizeImage(s.Image), Build: s.Build, Cmd: s.Command,
+		Project: p.Path, Dir: p.Dir, Service: s.Name, Image: NormalizeImage(s.Image), Build: s.Build, Cmd: s.Command,
 		Job: s.job, DependsOn: s.DependsOn.Names(), Port: s.Vops.Port, Health: s.Vops.Health,
 		Replicas: s.Vops.Replicas, Strategy: s.Vops.Strategy, Watch: s.Vops.Watch == nil || *s.Vops.Watch,
 		Timeout: time.Duration(s.Vops.Timeout), StopWait: 10 * time.Second,
@@ -477,7 +487,7 @@ func (p *Project) netName(key string) string {
 	}
 	n := p.Networks[key]
 	switch {
-	case n != nil && n.Name != "":
+	case n != nil && n.Name != "" && (n.External || !IsPreview(p.Path)):
 		return n.Name
 	case n != nil && n.External:
 		return key

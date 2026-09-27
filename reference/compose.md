@@ -6,7 +6,7 @@ vops reads compose files itself and runs `podman run`. It supports the subset be
 
 A project dir may have `compose.yml`, `compose.yaml`, `docker-compose.yml`, `docker-compose.yaml` and any `*.compose.yml`/`*.compose.yaml`. They are merged; a service defined twice is an error. Dir names must match `[A-Za-z0-9][A-Za-z0-9_-]*`.
 
-Top level: `services`, `volumes` (`name`, `external`), `networks` (see below), `version` and `name` (ignored). Not supported: `secrets`, `configs`.
+Top level: `services`, `volumes` (`name`, `external`), `networks` (see below), `version` and `name` (ignored), `x-vops` (`previews`, see x-vops). Not supported: `secrets`, `configs`.
 
 ## Service keys
 
@@ -96,11 +96,30 @@ services:
       strategy: rolling     # rolling (default when routed, no host ports) | recreate
       timeout: 60s          # readiness timeout
       watch: true           # redeploy when this tag is pushed to the vops registry
+      preview: {skip: true} # don't run it in previews (workers, crons)
+
+x-vops:                     # top level: project settings
+  previews: "preview-*"     # registry tags that create previews (default "preview-*"; "off" disables)
 ```
 
 Domains: project `shop/api` is `api.shop.<domain>`. Each routed service gets `<service>.api.shop.<domain>`; when a project has a single routed service it also gets `api.shop.<domain>`.
 
 Readiness, in order: compose `healthcheck` → `x-vops.health` → any HTTP answer except 502/503/504 on `port` → "still running after 2s".
+
+## Previews
+
+A preview (`vops preview up shop --name pr-42`, or a push of `shop/web:preview-pr-42`) runs the same compose files as project `shop@pr-42`, with these differences:
+
+- **Env**: production's env is not used. Variables come from `preview.env` in the project dir (committed, `KEY=VALUE` lines like `env_file`, for non-secret overrides such as `SMTP_HOST=mailpit`), then from preview secrets (`vops env set shop --preview KEY`), which win. `COMPOSE_PROFILES` too. `VOPS_PREVIEW` is the preview's name.
+- **Data**: volumes and bind mounts inside the project dir start as a copy of production's (btrfs; empty without it).
+- **Code**: the compose files, build contexts and bind paths come from a git worktree of the preview's commit.
+- Services with `x-vops.preview.skip` don't run; a `depends_on` on them is dropped.
+- No shared `vops` network: a service that lists it gets the preview's `default` network instead. Other projects can't reach the preview, and it can't reach them.
+- No published `ports` (dropped with a warning) and no `x-vops.domains`.
+- `name:` of volumes and networks is ignored (it would be production's). `external` volumes are an error; `external` networks and absolute bind mounts are shared with production (the plan warns about the latter).
+- Networks with a fixed `ipam` subnet can't be created twice, so their projects can't have previews.
+
+Tags: with `previews: "preview-*"`, a pushed tag `preview-pr-42` is preview `pr-42` (the `*` part, lowercased, `_` and `.` become `-`). It sets that tag on every service running the pushed repo. A tag matching the pattern never redeploys production.
 
 ## Interpolation
 
@@ -117,3 +136,4 @@ Readiness, in order: compose `healthcheck` → `x-vops.health` → any HTTP answ
 | named volume | `vops-<project with dots>-<volume>` (unless `name:`/`external`) |
 | built image | `localhost/vops/<project>-<service>:<hash>` |
 | logs | journald `SYSLOG_IDENTIFIER=vops.<project with dots>.<service>` |
+| preview | project `<project>@<name>`, `<project with dots>--<name>` in all names above, domain `<service>.<name>.<project reversed>.<domain>` |

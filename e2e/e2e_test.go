@@ -166,6 +166,7 @@ func (w *world) startDaemon() {
 		cmd.Wait()
 		// read-only snapshots and subvolumes: t.TempDir can't remove them by itself
 		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "snapshots"))
+		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "previews"))
 		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, "vops"))
 		if w.t.Failed() {
 			w.t.Logf("daemon logs:\n%s", logs.String())

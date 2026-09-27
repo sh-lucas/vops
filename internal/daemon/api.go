@@ -159,10 +159,15 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		return nil
 	})
 
-	// ---- env (write-only values)
+	// ---- env (write-only values). preview=1 (or "preview": true) is the project's preview secrets scope.
 
 	h("GET /api/env", func(w http.ResponseWriter, r *http.Request) error {
-		keys, err := d.DB.EnvKeys(r.URL.Query().Get("project"))
+		q := r.URL.Query()
+		scope, err := envScope(q.Get("project"), q.Get("preview") == "1")
+		if err != nil {
+			return err
+		}
+		keys, err := d.DB.EnvKeys(scope)
 		if err != nil {
 			return err
 		}
@@ -170,27 +175,73 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		return nil
 	})
 	h("POST /api/env", func(w http.ResponseWriter, r *http.Request) error {
-		var in struct{ Project, Key, Value string }
+		var in struct {
+			Project, Key, Value string
+			Preview             bool
+		}
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		if in.Project == "" || !envKeyRe.MatchString(in.Key) {
-			return fmt.Errorf("invalid project or key %q (keys match %s)", in.Key, envKeyRe)
-		}
-		if err := d.DB.SetEnv(in.Project, in.Key, in.Value); err != nil {
+		scope, err := envScope(in.Project, in.Preview)
+		if err != nil {
 			return err
 		}
-		d.DB.Event(in.Project, "config", "env %s set", in.Key)
+		if !envKeyRe.MatchString(in.Key) {
+			return fmt.Errorf("invalid key %q (keys match %s)", in.Key, envKeyRe)
+		}
+		if err := d.DB.SetEnv(scope, in.Key, in.Value); err != nil {
+			return err
+		}
+		d.DB.Event(in.Project, "config", "%s %s set", envLabel(in.Preview), in.Key)
 		writeJSON(w, map[string]bool{"ok": true})
 		return nil
 	})
 	h("DELETE /api/env", func(w http.ResponseWriter, r *http.Request) error {
 		q := r.URL.Query()
-		if err := d.DB.UnsetEnv(q.Get("project"), q.Get("key")); err != nil {
+		scope, err := envScope(q.Get("project"), q.Get("preview") == "1")
+		if err != nil {
 			return err
 		}
-		d.DB.Event(q.Get("project"), "config", "env %s removed", q.Get("key"))
+		if err := d.DB.UnsetEnv(scope, q.Get("key")); err != nil {
+			return err
+		}
+		d.DB.Event(q.Get("project"), "config", "%s %s removed", envLabel(q.Get("preview") == "1"), q.Get("key"))
 		writeJSON(w, map[string]bool{"ok": true})
+		return nil
+	})
+
+	// ---- previews
+
+	h("GET /api/previews", func(w http.ResponseWriter, r *http.Request) error {
+		out, err := d.Engine.Previews(r.Context(), r.URL.Query().Get("project"))
+		if err != nil {
+			return err
+		}
+		writeJSON(w, out)
+		return nil
+	})
+	// up streams progress like apply
+	h("POST /api/previews", func(w http.ResponseWriter, r *http.Request) error {
+		var in deploy.PreviewOpts
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if err := d.Engine.PreviewUp(context.WithoutCancel(r.Context()), flushWriter{w}, in); err != nil {
+			fmt.Fprintf(w, "==> error: %v\n", err)
+		} else {
+			fmt.Fprintln(w, "==> ok")
+		}
+		return nil
+	})
+	h("DELETE /api/previews", func(w http.ResponseWriter, r *http.Request) error {
+		q := r.URL.Query()
+		var log strings.Builder
+		if err := d.Engine.PreviewRm(context.WithoutCancel(r.Context()), &log, q.Get("project"), q.Get("name")); err != nil {
+			return err
+		}
+		writeJSON(w, map[string]any{"ok": true, "log": log.String()})
 		return nil
 	})
 
@@ -429,6 +480,24 @@ var (
 )
 
 func must[T any](v T, _ error) T { return v }
+
+// envScope is where env vars of a project live: the project, or its previews' secrets.
+func envScope(project string, preview bool) (string, error) {
+	if project == "" || strings.ContainsAny(project, "@*") {
+		return "", fmt.Errorf("invalid project %q (for previews use the project and preview=true)", project)
+	}
+	if preview {
+		return deploy.PreviewEnvScope(project), nil
+	}
+	return project, nil
+}
+
+func envLabel(preview bool) string {
+	if preview {
+		return "preview env"
+	}
+	return "env"
+}
 
 type flushWriter struct{ w http.ResponseWriter }
 

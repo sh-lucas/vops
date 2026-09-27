@@ -33,6 +33,18 @@ type Meta struct {
 	Value string `json:"value"`
 }
 
+type Preview struct {
+	Project    string `json:"project"`
+	Name       string `json:"name"`
+	Ref        string `json:"ref"`
+	CommitSha  string `json:"commit_sha"`
+	Images     string `json:"images"`
+	SnapshotID int64  `json:"snapshot_id"`
+	Data       string `json:"data"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
+}
+
 type Project struct {
 	Path      string `json:"path"`
 	Disabled  bool   `json:"disabled"`
