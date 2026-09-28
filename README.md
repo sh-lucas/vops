@@ -5,7 +5,7 @@ vops is a cli and a daemon to self-host containers with less pain and overhead t
 
 ## State, development, lifecycle
 
-**v1.1, in production on one real server.** Everything below "Features" is covered by end-to-end tests against real podman (rootless) and by a production-like check (`just vps-test`: systemd + real sshd + podman in a container, rolling release under load with 0 failed requests). It also runs a real VPS (Ubuntu 24.04, ext4, rootless as a normal user with linger, real DNS and Let's Encrypt), migrated from docker compose + caddy + registry:2 + watchtower with about 1m20s of downtime: [reference/migrating.md](reference/migrating.md).
+**v1.1, in production on one real server.** Everything below "Features" is covered by end-to-end tests against real podman (rootless) and by a production-like check (`just vps-test`: systemd + real sshd + podman in a container, rolling release under load with 0 failed requests). It also runs a real VPS (Ubuntu 24.04, ext4, rootless as a normal user with linger, real DNS and Let's Encrypt), migrated from docker compose + caddy + registry:2 + watchtower with about 1m20s of downtime: [reference/migrating.md](reference/migrating.md). It survived an `apt upgrade` + reboot: linger starts the daemon, which brings every project back in dependency order (~7s for 6 containers).
 
 - Runtime deps on the host: linux, systemd, podman 4+ (netavark), git. btrfs (+ btrfs-progs) for snapshots and rollback; everything else works without it.
 - The daemon idles at ~16MB RSS. The binary is static, ~13MB.
@@ -132,7 +132,6 @@ Know these before putting something important on it:
 - **Previews need btrfs for data** (without it they start empty) and can't be made of projects with external volumes or fixed-subnet networks. Absolute bind mounts and external networks are shared with production. Registry tags pushed for previews stay until `vops registry rm`.
 - **Logs are journald's:** retention and disk use follow its config (`/etc/systemd/journald.conf`); no long-term log store.
 - **Third-party images are not re-pulled** on their own: `postgres:16` stays at the version first pulled until you change the tag.
-- **Not yet run on a real cloud VPS** (see State above).
 
 ## Commands
 
