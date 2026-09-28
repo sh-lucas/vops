@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"bytes"
+	"cmp"
 	"encoding/json/v2"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"maps"
 	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
@@ -100,6 +102,12 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	from := fs.Int64("from", 0, "")
 	var images multi
 	fs.Var(&images, "image", "")
+	imagesOnly := fs.Bool("images", false, "")
+	dataOnly := fs.Bool("data", false, "")
+	var services multi
+	fs.Var(&services, "service", "")
+	snapshotID := fs.Int64("snapshot", 0, "")
+	planOnly := fs.Bool("plan", false, "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -484,17 +492,53 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		return fmt.Errorf("snapshot %s: unknown", sub)
 
 	case "rollback":
-		if !*yes {
-			return errors.New("rollback on the host needs --yes (the cli shows what it restores first)")
-		}
 		project, err := arg(0, "project")
 		if err != nil {
 			return err
 		}
-		idArg, _ := arg(1, "")
-		var id int64
-		fmt.Sscan(idArg, &id)
-		resp, err := c.do("POST", "/api/rollback", jsonBody(map[string]any{"project": project, "id": id}))
+		o := deploy.RollbackOpts{Project: project, Images: *imagesOnly, Data: *dataOnly, Services: services, Snapshot: *snapshotID}
+		if len(services) > 0 && *dataOnly {
+			return errors.New("--service picks images; data always rolls back for the whole project (drop --data, or --service)")
+		}
+		if id, _ := arg(1, ""); id != "" {
+			if o.Before, err = strconv.ParseInt(strings.TrimPrefix(id, "#"), 10, 64); err != nil {
+				return fmt.Errorf("invalid deploy id %q (ids from vops history %s)", id, project)
+			}
+		}
+		if *planOnly {
+			q := url.Values{"project": {project}, "service": services, "before": {fmt.Sprint(o.Before)}, "snapshot": {fmt.Sprint(o.Snapshot)}}
+			if o.Images {
+				q.Set("images", "1")
+			}
+			if o.Data {
+				q.Set("data", "1")
+			}
+			if !*asJSON {
+				q.Set("format", "text")
+			}
+			resp, err := c.do("GET", "/api/rollback?"+q.Encode(), nil)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			_, err = io.Copy(out, resp.Body)
+			return err
+		}
+		if !*yes {
+			return errors.New("rollback on the host needs --yes (the cli shows what it does first)")
+		}
+		resp, err := c.do("POST", "/api/rollback", jsonBody(o))
+		if err != nil {
+			return err
+		}
+		return stream(resp, out)
+
+	case "unpin":
+		project, err := arg(0, "project")
+		if err != nil {
+			return err
+		}
+		resp, err := c.do("POST", "/api/unpin", jsonBody(map[string]any{"project": project, "services": pos[1:]}))
 		if err != nil {
 			return err
 		}
@@ -610,8 +654,11 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			for _, ch := range nd.Changes {
 				what = append(what, ch.Text())
 			}
-			if len(what) == 0 || d.Trigger == "rollback" {
+			if len(what) == 0 {
 				what = []string{d.Summary}
+			}
+			if d.Trigger == "rollback" {
+				what = []string{"rolled back " + strings.ReplaceAll(cmp.Or(d.Parts, "data"), ",", " and ") + ": " + d.Summary}
 			}
 			if d.Error != "" {
 				what = append(what, d.Error)
@@ -781,6 +828,9 @@ func printStatus(c *client, out io.Writer) error {
 				if st.Domain != "" {
 					info = "https://" + s.Domains[0]
 				}
+			}
+			if s.Pin != nil {
+				info = strings.TrimSpace(fmt.Sprintf("%s  pinned to #%d, compose says %s", info, s.Pin.DeployID, s.Pin.ComposeImage))
 			}
 			if s.Pending != "" {
 				info = strings.TrimSpace(info + "  pending: " + s.Pending + " " + s.Reason)

@@ -4,7 +4,7 @@ Ideas with a design sketch. Done things move to README/reference; decisions to r
 
 ## Data
 
-Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback`, previews (`vops preview`, previews from registry tags), deploy history with the dashboard timeline and previews tab. What's left builds on the same pieces.
+Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback` (images by pinning, and data), previews (`vops preview`, previews from registry tags), deploy history with the dashboard timeline and previews tab. What's left builds on the same pieces.
 
 ### Previews, next
 
@@ -20,7 +20,7 @@ Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback`, previews (`vops p
 - `vops snapshot diff <id>`: `btrfs subvolume find-new` / sizes, to see how much a snapshot holds exclusively.
 - Show snapshot disk usage (needs quotas or `btrfs filesystem du`, which is slow; maybe only on demand).
 - Off-host backups: `btrfs send` of a snapshot to a file/ssh target (`vops snapshot export <id> > file`), incremental against the previous one.
-- Roll back code and data together: `vops rollback --with-code` = check out the snapshot's commit as a revert commit on the host repo, apply, then restore. Needs care with the git-first model (the laptop must pull it).
+- Tag built images per commit (`localhost/vops/<project>-<service>:<commit>`, keep the last N) so built services can roll back too (today image rollback skips them: "can't roll back without the code").
 
 ## Other
 

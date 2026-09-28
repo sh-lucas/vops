@@ -236,4 +236,30 @@ func TestPreviewsFromRegistry(t *testing.T) {
 		t.Fatalf("preview chip: %s", b)
 	}
 	w.vops(dev, "preview", "rm", "shop", name)
+
+	// image rollback from the cli: right before the push, web runs web-prod's digest again, pinned, nothing pending
+	if out, err := w.try(dev, "", "rollback", "shop", "--service", "web", "--data", "-y"); err == nil || !strings.Contains(out, "whole project") {
+		t.Fatalf("--service with --data: %v\n%s", err, out)
+	}
+	out = w.vops(dev, "rollback", "shop", "--images", "-y")
+	if !regexp.MustCompile(`~ web: \S+/shop/web:v1 \(sha256:\w+\) → \S+/shop/web:v1 \(sha256:\w+\)`).MatchString(out) || !strings.Contains(out, "= api:") || !strings.Contains(out, "undo with: vops rollback shop") {
+		t.Fatalf("rollback:\n%s", out)
+	}
+	if b := body("web.shop.vops.test"); b != "web-prod" {
+		t.Fatalf("after image rollback: %q", b)
+	}
+	if st := w.vops(dev, "status"); !regexp.MustCompile(`web\s+1/1 running\s+https?://\S+\s+pinned to #\d+, compose says \S+/shop/web:v1`).MatchString(st) || strings.Contains(st, "differs from git") {
+		t.Fatalf("status of a pinned service:\n%s", st)
+	}
+	if pl := w.vops(dev, "plan"); !strings.Contains(pl, "nothing to do") || !strings.Contains(pl, "@ web pinned to #") {
+		t.Fatalf("plan of a pinned service:\n%s", pl)
+	}
+	if h := w.vops(dev, "history", "shop"); !regexp.MustCompile(`(?m)^\d+\s+.+?\s+rollback\s+\w+\s+ok\s+.+rolled back images: back to before #\d+, web → `).MatchString(h) {
+		t.Fatalf("history of a rollback:\n%s", h)
+	}
+	w.vops(dev, "registry", "gc")
+	out = w.vops(dev, "unpin", "shop")
+	if b := body("web.shop.vops.test"); b != "web-prod-2" || !strings.Contains(out, "pin to #") || strings.Contains(w.vops(dev, "status"), "pinned") {
+		t.Fatalf("unpin: %q\n%s", b, out)
+	}
 }

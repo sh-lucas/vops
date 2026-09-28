@@ -448,6 +448,7 @@ function projectList(st) {
       dots(s.containers),
       h("span", { class: "mono sname" }, s.name),
       h("span", { class: "doms small" }, s.domains.slice(0, 2).map((d) => h("a", { href: domainURL(st, d), target: "_blank", rel: "noopener" }, d))),
+      s.pin ? h("span", { class: "tag warn", title: "rolled back: compose says " + s.pin.compose_image }, "pinned · #" + s.pin.deploy_id) : null,
       s.pending ? h("span", { class: "tag warn" }, "pending " + s.pending) : null)));
   }
   return panel(panelHead(h("h2", {}, "Projects"), h("span", { class: "tag" }, st.projects.length)), h("div", { class: "plist" }, rows));
@@ -457,12 +458,17 @@ async function overview(alive) {
   let st;
   try { st = await getStatus(); } catch (e) { return failed(e, alive); }
   if (!alive()) return;
-  const render = (st) => page(
+  const render = (st) => {
+    // a pin is a temporary emergency state: always visible
+    const pins = st.projects.flatMap((p) => p.services.filter((s) => s.pin).map((s) => h("li", {}, h("a", { href: projectHref(p.path) }, p.path + "/" + s.name), " is pinned to the image of #" + s.pin.deploy_id + " (rolled back); compose says ", mono(s.pin.compose_image))));
+    const warns = [...(st.warnings || []).map((w) => h("li", {}, w)), ...pins];
+    return page(
     head({ title: "Overview", sub: [h("span", {}, "~/vops at ", mono(short(st.commit, 8) || "no commits yet")), sep(), st.domain || "no domain set in vops.yml"] }),
-    st.warnings && st.warnings.length ? alertBox("warn", st.warnings.length === 1 ? "Warning" : st.warnings.length + " warnings", h("ul", { class: "small" }, st.warnings.map((w) => h("li", {}, w)))) : null,
+    warns.length ? alertBox("warn", warns.length === 1 ? "Warning" : warns.length + " warnings", h("ul", { class: "small" }, warns)) : null,
     st.changes ? alertBox("info", "The host differs from git", h("span", { class: "small muted" }, "Changes are waiting to be applied (a push, env vars or enable/disable)."), h("button", { class: "btn primary sm", onclick: openPlan }, "Review and apply")) : null,
     stats(st),
     projectList(st));
+  };
   render(st);
   onStatus = render;
 }
@@ -541,10 +547,12 @@ function servicesTab(ctx, box) {
     return h("tr", {},
       h("td", {}, h("div", { class: "mono" }, s.name),
         s.domains.map((d) => h("div", { class: "small wrapany" }, h("a", { href: domainURL(st, d), target: "_blank", rel: "noopener" }, d))),
-        s.pending ? h("span", { class: "tag warn", style: "margin-top:4px" }, "pending " + s.pending + (s.reason ? ": " + s.reason : "")) : null),
+        s.pending ? h("span", { class: "tag warn", style: "margin-top:4px" }, "pending " + s.pending + (s.reason ? ": " + s.reason : "")) : null,
+        s.pin ? h("span", { class: "tag warn", style: "margin-top:4px", title: "Rolled back: runs the image deploy #" + s.pin.deploy_id + " ran; compose says " + s.pin.compose_image }, "pinned · #" + s.pin.deploy_id) : null),
       h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "ctr small" }, h("span", { class: "dot " + stateOf(c) }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
       h("td", { class: "mono small wrap", title: s.image }, shortImage(s.image)),
-      h("td", { class: "actions-cell" }, h("div", { class: "actions" }, h("a", { class: "btn sm", href: projectHref(path, "logs", "?service=" + enc(s.name)) }, "Logs"), restart)));
+      h("td", { class: "actions-cell" }, h("div", { class: "actions" }, h("a", { class: "btn sm", href: projectHref(path, "logs", "?service=" + enc(s.name)) }, "Logs"), restart,
+        s.pin ? h("button", { class: "btn sm", onclick: () => unpinService(ctx, s) }, "Unpin") : null)));
   }), "top")));
 }
 
@@ -641,30 +649,90 @@ function envTab(ctx, box) {
 // ---- data: restore and branch. The history of a project is a list of nodes (deploys, rollbacks, snapshots);
 // a node's snapshot is always the data right before it happened, so "restore" and "preview from here" start there.
 
-// after a restore, until the next deploy: "Data restored to #N · when · Undo"
+// after a rollback, until the next deploy: "Rolled back to before #N (images, data) · when · Undo"
 function restoredBanner(ctx) {
   const d = ctx.p.last_deploy;
   if (!d || d.trigger !== "rollback" || d.result !== "ok" || d.undoes) return null;
-  const undo = h("button", { class: "btn sm", onclick: () => restoreSnapshot(ctx, { id: d.snapshot_id, commit: d.commit, created_at: d.started_at }, "the data from right before this restore") }, icon("undo"), "Undo");
-  return alertBox("warn", `Data restored to snapshot #${d.restored_id}`,
-    h("span", { class: "small" }, when(d.finished_at), " · code was not rolled back · shown until the next deploy of this project"), d.snapshot_id ? undo : null);
+  const parts = (d.parts || "data").split(",");
+  const undo = h("button", { class: "btn sm", onclick: () => rollbackDialog(ctx, d.id) }, icon("undo"), "Undo…");
+  return alertBox("warn", d.before_id ? `Rolled back to before #${d.before_id} (${parts.join(", ")})` : `Data restored to snapshot #${d.restored_id}`,
+    h("span", { class: "small" }, when(d.finished_at), parts.includes("images") ? " · pinned services keep these images until a newer version is pushed" : " · code was not rolled back",
+      " · shown until the next deploy of this project"), undo);
 }
 
-// restoreSnapshot asks (stating what happens to containers, data and code), then streams the rollback
-async function restoreSnapshot(ctx, snap, what) {
+// the code note of a rollback: the data's commit vs the running one, and the git commands when they differ
+function codeNote(path, dataCommit, now) {
+  if (!dataCommit || !now || dataCommit === now) return h("p", { class: "small" }, "Compose and code are not touched", dataCommit ? ["; this data belongs to the commit running now (", mono(short(dataCommit, 8)), ")."] : ".");
+  return [h("p", { class: "small" }, "Compose and code are not touched: this data belongs to ", mono(short(dataCommit, 8)), ", while ", h("strong", {}, path), " runs ", mono(short(now, 8)), ". To run that code too, revert it in git and sync:"),
+    h("pre", { class: "cmd" }, `git restore --source=${short(dataCommit)} --staged --worktree -- ${path}/\ngit commit -m "${path}: code back to ${short(dataCommit, 8)}"\nvops sync`)];
+}
+
+const runRollback = (ctx, title, body) => streamDialog({ title, path: "/rollback", body: { project: ctx.path, ...body },
+  done: (ok) => { if (ok) toast("Rolled back"); ctx.reload && ctx.reload(); refreshStatus().catch(() => {}); } });
+
+// restoreSnapshot: data only, from a snapshot node (manual snapshots and the like)
+async function restoreSnapshot(ctx, snap) {
   const { path } = ctx;
-  const now = ctx.p.commit;
-  const code = snap.commit && now && snap.commit !== now
-    ? [h("p", {}, "Code is not rolled back: this data belongs to ", mono(short(snap.commit, 8)), ", while ", h("strong", {}, path), " runs ", mono(short(now, 8)), ". To run the matching code, revert it in git and sync:"),
-      h("pre", { class: "cmd" }, `git restore --source=${short(snap.commit)} --staged --worktree -- ${path}/\ngit commit -m "${path}: code back to ${short(snap.commit, 8)}"\nvops sync`)]
-    : h("p", {}, "Code is not touched", snap.commit ? ["; this data belongs to the commit running now (", mono(short(snap.commit, 8)), ")."] : ".");
   if (!(await confirmDialog({ title: `Restore ${path} data to #${snap.id}?`, ok: "Restore data", danger: true, body: [
-    h("p", {}, "Puts back ", h("strong", {}, what), snap.created_at ? [" (", what.includes("#" + snap.id) ? "" : "snapshot #" + snap.id + ", ", "taken ", when(snap.created_at), ")"] : "", "."),
+    h("p", {}, "Puts back snapshot #" + snap.id + " (", snap.reason, ", taken ", when(snap.created_at), "). Images are not touched."),
     "Its containers stop for a few seconds while the data is put back, then start again.",
     "The current data is snapshotted first, so this can be undone.",
-    code] }))) return;
-  streamDialog({ title: `Restoring ${path} to #${snap.id}`, path: "/rollback", body: { project: path, id: snap.id },
-    done: (ok) => { if (ok) toast("Data restored"); ctx.reload && ctx.reload(); refreshStatus().catch(() => {}); } });
+    codeNote(path, snap.commit, ctx.p.commit)] }))) return;
+  runRollback(ctx, `Restoring ${path} to #${snap.id}`, { snapshot: snap.id });
+}
+
+// rollbackDialog: "Roll back…" on a deploy (or "Undo…" on a rollback): back to right before it. Images per
+// service (pinned by digest), data for the whole project; what the server can't do is shown disabled with why.
+async function rollbackDialog(ctx, before) {
+  const { path } = ctx;
+  let rp;
+  try { rp = await api("GET", "/rollback?project=" + enc(path) + "&before=" + before); } catch (e) { return toast(e.message); }
+  const img = (x) => x ? h("span", { class: "mono", title: x.image + (x.digest ? "@" + x.digest : "") }, imgName(x.image.split("@")[0]), x.digest ? h("span", { class: "faint" }, " @" + short(x.digest, 7)) : null) : h("span", { class: "faint" }, "none");
+  const boxes = [];
+  const rows = rp.images.map((st) => {
+    const can = st.do === "pin" || st.do === "unpin";
+    const cb = h("input", { type: "checkbox", checked: st.selected, disabled: !can, "aria-label": st.service });
+    if (can) boxes.push([st.service, cb]);
+    const why = st.do === "skip" ? h("div", { class: "small warn-text" }, st.reason) : st.do === "same" ? h("div", { class: "small faint" }, "unchanged") : st.do === "unpin" ? h("div", { class: "small faint" }, "back to what compose says (unpinned)") : null;
+    return h("label", { class: "rb-row" + (can ? "" : " off") }, cb, h("div", {}, h("span", { class: "mono" }, st.service), " ", st.do === "same" ? img(st.now) : [img(st.now), " → ", img(st.to)], why));
+  });
+  const s = rp.snapshot;
+  const dataBox = h("input", { type: "checkbox", checked: rp.parts.includes("data"), disabled: !s, "aria-label": "data" });
+  const submit = h("button", { class: "btn danger solid" }, "Roll back");
+  const sync = () => { submit.disabled = !dataBox.checked && !boxes.some(([, cb]) => cb.checked); };
+  [dataBox, ...boxes.map(([, cb]) => cb)].forEach((cb) => cb.addEventListener("change", sync));
+  sync();
+  const title = rp.undoes ? `Undo rollback #${rp.undoes}` : `Roll ${path} back to before #${before}`;
+  const d = h("dialog", { class: "modal" }, h("form", { onsubmit: (e) => {
+    e.preventDefault();
+    d.close();
+    const services = boxes.filter(([, cb]) => cb.checked).map(([svc]) => svc);
+    runRollback(ctx, title, { before, images: services.length > 0, services, data: dataBox.checked });
+  } },
+    h("div", { class: "modal-head" }, h("h3", {}, title)),
+    h("div", { class: "modal-body" },
+      h("p", { class: "small" }, "Back to right before ", rp.undoes ? "this rollback" : "deploy #" + before, rp.from ? ": the images deploy #" + rp.from + " left running and the data from just before." : "."),
+      h("h4", { class: "rb-h" }, "Images"),
+      rp.no_images ? h("p", { class: "small warn-text" }, rp.no_images) : rows,
+      rp.images.some((st) => st.do === "pin") ? h("p", { class: "small" }, "Rolling release, no downtime. Pinned services keep these images until a newer version is pushed, compose changes their image, or you unpin them.") : null,
+      h("h4", { class: "rb-h" }, "Data"),
+      h("label", { class: "rb-row" + (s ? "" : " off") }, dataBox, h("div", {},
+        s ? ["Snapshot #" + s.id + " (" + s.reason + ", ", when(s.created_at), ")", h("div", { class: "small" }, "The project stops for a few seconds while it is put back; the current data is snapshotted first, so this can be undone.")]
+          : h("span", { class: "warn-text small" }, rp.no_data || "no snapshot for this point"))),
+      s ? codeNote(path, s.commit, rp.commit) : null),
+    h("div", { class: "modal-foot" }, h("button", { type: "button", class: "btn", onclick: () => d.close() }, "Cancel"), submit)));
+  d.addEventListener("close", () => d.remove());
+  document.body.append(d);
+  d.showModal();
+}
+
+// unpin: back to what compose says (rolling)
+async function unpinService(ctx, s) {
+  if (!(await confirmDialog({ title: `Unpin ${s.name}?`, ok: "Unpin",
+    body: [h("p", {}, "Runs ", mono(s.pin.compose_image), " again, as compose says, with a rolling release."),
+      h("p", { class: "small" }, "It is pinned to the image deploy #" + s.pin.deploy_id + " ran (", mono(shortImage(s.image)), ").")] }))) return;
+  streamDialog({ title: `Unpinning ${ctx.path}/${s.name}`, path: "/unpin", body: { project: ctx.path, services: [s.name] },
+    done: (ok) => { if (ok) toast("Unpinned " + s.name); refreshStatus().catch(() => {}); } });
 }
 
 const nameRe = "[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?";
@@ -745,12 +813,12 @@ function timelineTab(ctx, box) {
         title = ["Deploy ", h("span", { class: "faint" }, "#" + dep.id)];
         if (dep.result === "failed") cls += " failed";
       } else if (n.kind === "rollback") {
-        title = dep.undoes ? ["Undo of ", h("span", { class: "faint" }, "#" + dep.undoes)] : ["Data restored ", h("span", { class: "faint" }, "#" + dep.id)];
+        title = dep.undoes ? ["Undo of ", h("span", { class: "faint" }, "#" + dep.undoes)] : [dep.before_id ? "Rolled back to before #" + dep.before_id + " " : "Data restored ", h("span", { class: "faint" }, "#" + dep.id)];
         if (dep.result === "failed") cls += " failed";
       } else title = [s.reason === "manual" ? "Snapshot" : s.reason + " snapshot", " ", h("span", { class: "faint" }, "#" + s.id)];
-      const restore = s ? h("button", { class: "btn sm", title: n.kind === "rollback" ? "Put back the data from right before this restore" : "Put back " + (n.kind === "deploy" ? "the data from right before this deploy" : "this snapshot"),
-        onclick: () => restoreSnapshot(ctx, s, n.kind === "deploy" ? `the data from right before deploy #${dep.id}` : n.kind === "rollback" ? "the data from right before this restore" : `snapshot #${s.id}`) },
-        n.kind === "rollback" ? [icon("undo"), "Undo"] : "Restore data") : null;
+      const restore = dep ? h("button", { class: "btn sm", title: n.kind === "rollback" ? "Back to right before this rollback" : "Back to right before this deploy: its images, its data",
+        onclick: () => rollbackDialog(ctx, dep.id) }, n.kind === "rollback" ? [icon("undo"), "Undo…"] : [icon("undo"), "Roll back…"])
+        : s ? h("button", { class: "btn sm", title: "Put back this snapshot's data", onclick: () => restoreSnapshot(ctx, s) }, "Restore data") : null;
       const del = n.kind === "snapshot" ? h("button", { class: "btn sm danger", onclick: async () => {
         if (!(await confirmDialog({ title: `Delete snapshot #${s.id}?`, ok: "Delete", danger: true,
           body: [`${s.reason} snapshot taken ${ago(s.created_at)}${s.note ? ` (${s.note})` : ""}. It can't be recovered.`] }))) return;
@@ -763,9 +831,11 @@ function timelineTab(ctx, box) {
             dep && n.kind === "deploy" ? h("span", { class: "tag" + (dep.trigger === "push" ? " accent" : "") }, dep.trigger) : null,
             dep && dep.result === "failed" ? h("span", { class: "tag bad" }, "failed") : null,
             h("span", { class: "spacer" }), h("span", { class: "muted small" }, when(n.at))),
-          n.kind === "rollback" ? h("div", { class: "small" }, "put back snapshot #" + dep.restored_id, restoredFrom(dep.restored_id), h("span", { class: "muted" }, " · code unchanged")) : null,
+          n.kind === "rollback" ? h("div", { class: "small" }, (dep.parts || "data").split(",").join(" and "), dep.restored_id ? [" · put back snapshot #" + dep.restored_id, restoredFrom(dep.restored_id)] : null, h("span", { class: "muted" }, " · code unchanged")) : null,
+          n.kind === "rollback" && dep.parts && dep.parts.includes("images") && n.changes.length ? h("div", { class: "tl-changes" }, n.changes.map(changeLine)) : null,
           h("div", { class: "tl-line" }, n.commit ? commitLine(n.commit, t.subjects) : h("span", { class: "faint small" }, "no commit")),
           n.kind === "deploy" && n.changes.length ? h("div", { class: "tl-changes" }, n.changes.map(changeLine)) : null,
+          n.gone.length ? h("div", { class: "small faint", title: "Registry gc keeps the images of the newest image_keep deploys (vops.yml)" }, "image gone from the registry: ", n.gone.join(", ")) : null,
           n.kind === "deploy" && !n.changes.length && dep.summary ? h("div", { class: "muted small" }, dep.summary) : null,
           dep && dep.error ? h("div", { class: "small error wrapany" }, dep.error) : null,
           s && n.kind === "snapshot" && s.note ? h("div", { class: "small muted wrapany" }, "“" + s.note + "”") : null,

@@ -118,8 +118,8 @@ ORDER BY project, name;
 DELETE FROM previews WHERE project = ? AND name = ?;
 
 -- name: CreateDeploy :one
-INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, before_id, parts, result, error, summary, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id;
 
 -- name: GetDeploy :one
@@ -128,6 +128,27 @@ SELECT * FROM deploys WHERE id = ?;
 -- name: ListDeploys :many
 SELECT * FROM deploys WHERE project = ? ORDER BY id DESC LIMIT ?;
 
+-- name: PreviousDeploy :one
+SELECT * FROM deploys WHERE project = ? AND id < ? ORDER BY id DESC LIMIT 1;
+
 -- name: LatestDeploys :many
 -- the newest deploy of every project
 SELECT * FROM deploys WHERE id IN (SELECT max(id) FROM deploys GROUP BY project);
+
+-- name: RecentDeployImages :many
+-- the images of the newest `keep` deploys of every project (registry gc keeps them)
+SELECT images FROM deploys d
+WHERE (SELECT count(*) FROM deploys x WHERE x.project = d.project AND x.id > d.id) < CAST(sqlc.arg(keep) AS INTEGER);
+
+-- name: PutPin :exec
+INSERT INTO pins (project, service, image, digest, compose_image, deploy_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (project, service) DO UPDATE SET image = excluded.image, digest = excluded.digest, compose_image = excluded.compose_image,
+    deploy_id = excluded.deploy_id, created_at = excluded.created_at;
+
+-- name: ListPins :many
+SELECT * FROM pins
+WHERE sqlc.arg(project) = '' OR project = sqlc.arg(project)
+ORDER BY project, service;
+
+-- name: DeletePin :execrows
+DELETE FROM pins WHERE project = ? AND service = ?;

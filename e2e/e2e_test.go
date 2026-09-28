@@ -393,7 +393,7 @@ func TestEndToEnd(t *testing.T) {
 	if ls := w.vops(dev, "snapshot", "ls", "notes"); !strings.Contains(ls, "protected: vops-notes-data") || !strings.Contains(ls, "pre-deploy") || !strings.Contains(ls, "by hand") {
 		t.Fatalf("snapshot ls:\n%s", ls)
 	}
-	if out := w.vops(dev, "rollback", "notes", "--yes"); !strings.Contains(out, "rolled back data to") || !strings.Contains(out, "undo with") {
+	if out := w.vops(dev, "rollback", "notes", "--yes"); !strings.Contains(out, "data restored to #") || !strings.Contains(out, "undo with: vops rollback notes") {
 		t.Fatalf("rollback:\n%s", out)
 	}
 	if got := execNotes("read", "/data/f"); got != "before" {

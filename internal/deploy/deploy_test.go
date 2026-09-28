@@ -592,9 +592,9 @@ volumes:
 	preDeploy := snaps[0]
 	write("B") // the "migration" of v2
 
-	// rollback to before v2: data is A again, the db is running, and there is an undo point
+	// rollback (no id: right before the last deploy, v2): data is A again, the db is running, and there is an undo point
 	var buf strings.Builder
-	if err := v.e.Rollback(ctx, &buf, p, preDeploy.ID); err != nil {
+	if err := v.e.Rollback(ctx, &buf, RollbackOpts{Project: p}); err != nil {
 		t.Fatalf("%v\n%s", err, buf.String())
 	}
 	if got := read(); got != "A|A" {
@@ -604,11 +604,15 @@ volumes:
 	if latest[0].Reason != "pre-rollback" {
 		t.Fatalf("no undo point: %+v", latest[0])
 	}
-	if l, _ := v.e.LatestSnapshot(p); l.ID != preDeploy.ID {
-		t.Fatalf("default rollback target should skip pre-rollback snapshots: #%d", l.ID)
+	rb, _ := v.e.DB.Deploys(p, 1)
+	if rb[0].RestoredID != preDeploy.ID || rb[0].Parts != "data" || rb[0].SnapshotID != latest[0].ID {
+		t.Fatalf("rollback row: %+v", rb[0])
 	}
-	// undo the rollback
-	if err := v.e.Rollback(ctx, &buf, p, latest[0].ID); err != nil {
+	if again, err := v.e.RollbackPlan(ctx, RollbackOpts{Project: p}); err != nil || again.Before.ID != rb[0].BeforeID || again.Snapshot.ID != preDeploy.ID {
+		t.Fatalf("a second rollback must target the same deploy, not the undo point: %v %+v", err, again)
+	}
+	// undo the rollback: right before it
+	if err := v.e.Rollback(ctx, &buf, RollbackOpts{Project: p, Before: rb[0].ID}); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(); got != "B|B" {
@@ -645,7 +649,7 @@ volumes:
 		t.Fatal("pruned snapshot still on disk")
 	}
 	// the manual snapshot still restores
-	if err := v.e.Rollback(ctx, io.Discard, p, manual.ID); err != nil {
+	if err := v.e.Rollback(ctx, io.Discard, RollbackOpts{Project: p, Snapshot: manual.ID}); err != nil {
 		t.Fatal(err)
 	}
 	if got := read(); got != "C|C" {

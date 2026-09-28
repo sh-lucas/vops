@@ -75,17 +75,24 @@ type ConfigChange struct {
 }
 
 type ProjectPlan struct {
-	Path     string   `json:"path"`
-	Disabled bool     `json:"disabled,omitempty"`
-	Gone     bool     `json:"gone,omitempty"` // directory removed from git
-	Error    string   `json:"error,omitempty"`
-	Actions  []Action `json:"actions"`
+	Path     string     `json:"path"`
+	Disabled bool       `json:"disabled,omitempty"`
+	Gone     bool       `json:"gone,omitempty"` // directory removed from git
+	Error    string     `json:"error,omitempty"`
+	Actions  []Action   `json:"actions"`
+	Pins     []PinState `json:"pins,omitempty"` // services running a past image (image rollback)
 
 	specs    map[string]*desired
 	actual   map[string][]podman.Container
 	nets     []compose.NetworkDef
 	previews string // x-vops.previews
 	project  *compose.Project
+}
+
+// PinState is a pin as the plan sees it: in effect, or stale (the next apply drops it and runs what compose says).
+type PinState struct {
+	store.Pin `json:",inline"`
+	Stale     string `json:"stale,omitempty"`
 }
 
 type Action struct {
@@ -102,6 +109,9 @@ type desired struct {
 	own    string // "repo:tag" in our registry, when the image is ours
 	repo   string // the repo of own
 	digest string // manifest digest in our registry, when the image is ours
+
+	pin     *store.Pin // runs a pinned image instead of compose's (image rollback)
+	compose *desired   // pinned: what compose says
 }
 
 // Changes reports whether the plan does anything.
@@ -110,7 +120,7 @@ func (p *Plan) Changes() bool {
 		return true
 	}
 	for _, pp := range p.Projects {
-		if pp.Error != "" {
+		if pp.Error != "" || slices.ContainsFunc(pp.Pins, func(p PinState) bool { return p.Stale != "" }) {
 			return true
 		}
 		for _, a := range pp.Actions {
@@ -160,6 +170,13 @@ func (p *Plan) Print(w io.Writer) {
 				line += "  (" + a.Reason + ")"
 			}
 			fmt.Fprintln(w, line)
+		}
+		for _, pin := range pp.Pins {
+			if pin.Stale != "" {
+				fmt.Fprintf(w, "  @ %s: pin to #%d dropped (%s)\n", pin.Service, pin.DeployID, pin.Stale)
+			} else {
+				fmt.Fprintf(w, "  @ %s pinned to #%d (%s), compose says %s\n", pin.Service, pin.DeployID, shortRef(store.PinRef(pin.Pin)), pin.ComposeImage)
+			}
 		}
 	}
 	if !p.Changes() {
@@ -228,6 +245,17 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	if err != nil {
 		return nil, err
 	}
+	allPins, err := e.DB.Pins("")
+	if err != nil {
+		return nil, err
+	}
+	pins := map[string]map[string]store.Pin{}
+	for _, pin := range allPins {
+		if pins[pin.Project] == nil {
+			pins[pin.Project] = map[string]store.Pin{}
+		}
+		pins[pin.Project][pin.Service] = pin
+	}
 	containers, err := podman.PS(ctx, LProject)
 	if err != nil {
 		return nil, err
@@ -270,6 +298,9 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			for _, s := range sortedKeys(pp.actual) {
 				pp.Actions = append(pp.Actions, Action{s, "remove", reason})
 			}
+			for _, s := range sortedKeys(pins[p]) {
+				pp.Pins = append(pp.Pins, PinState{Pin: pins[p][s], Stale: map[bool]string{true: "project removed from git"}[pp.Gone]})
+			}
 			continue
 		}
 		env, err := e.DB.Env(p)
@@ -277,7 +308,7 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			pp.Error = err.Error()
 			continue
 		}
-		if err := e.planProject(ctx, pp, source{root: e.Repo, files: files, env: env}, cfg.Domain, &plan.Warnings); err != nil {
+		if err := e.planProject(ctx, pp, source{root: e.Repo, files: files, env: env, pins: pins[p]}, cfg.Domain, &plan.Warnings); err != nil {
 			pp.Error = err.Error()
 			continue
 		}
@@ -296,10 +327,11 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 
 // source is where a project's definition comes from: the repo, or a preview's worktree with its own env and images.
 type source struct {
-	root   string            // the git working tree (e.Repo or a preview worktree)
-	files  []string          // compose files in the project dir
-	env    map[string]string // interpolation and pass-through variables
-	images map[string]string // preview image overrides: service -> image
+	root   string               // the git working tree (e.Repo or a preview worktree)
+	files  []string             // compose files in the project dir
+	env    map[string]string    // interpolation and pass-through variables
+	images map[string]string    // preview image overrides: service -> image
+	pins   map[string]store.Pin // image rollback: service -> pinned image (projects only, previews ignore pins)
 }
 
 func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, domain string, warns *[]string) error {
@@ -344,12 +376,31 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 		if err != nil {
 			return fmt.Errorf("service %s: %w", sp.Service, err)
 		}
+		if pin, ok := src.pins[sp.Service]; ok {
+			ps := PinState{Pin: pin}
+			if now := composeRef(d); now != pin.ComposeImage {
+				ps.Stale = "compose says " + now + " now"
+			} else {
+				pinned, compose := *sp, d
+				pinned.Image, pinned.Build = store.PinRef(pin), nil
+				if d, err = e.resolve(ctx, src.root, &pinned, domain); err != nil {
+					return fmt.Errorf("service %s: pinned image: %w", sp.Service, err)
+				}
+				d.pin, d.compose = &pin, compose
+			}
+			pp.Pins = append(pp.Pins, ps)
+		}
 		pp.specs[sp.Service] = d
 		order = append(order, compare(d, pp.actual[sp.Service]))
 	}
 	for _, s := range sortedKeys(pp.actual) {
 		if _, ok := pp.specs[s]; !ok {
 			order = append(order, Action{s, "remove", "service removed from compose"})
+		}
+	}
+	for _, s := range sortedKeys(src.pins) {
+		if _, ok := pp.specs[s]; !ok {
+			pp.Pins = append(pp.Pins, PinState{Pin: src.pins[s], Stale: "service not in compose anymore"})
 		}
 	}
 	pp.Actions = order
@@ -546,6 +597,9 @@ func (p *Plan) Watching(repo, tag string) []proxy.Key {
 			continue
 		}
 		for name, d := range pp.specs {
+			if d.compose != nil {
+				d = d.compose // a push of the tag compose names is a newer version: it ends the pin (ApplyOpts.Unpin)
+			}
 			if d.own == repo+":"+tag && d.spec.Watch {
 				out = append(out, proxy.Key{Project: pp.Path, Service: name})
 			}
@@ -562,6 +616,7 @@ type ServiceState struct {
 	Port       int                `json:"port,omitempty"`
 	Pending    string             `json:"pending,omitempty"` // create | update | start | remove
 	Reason     string             `json:"reason,omitempty"`
+	Pin        *store.Pin         `json:"pin,omitempty"` // runs a past image (image rollback), not what compose says
 	Containers []podman.Container `json:"containers"`
 }
 
@@ -587,6 +642,7 @@ func (pp *ProjectPlan) Services() []ServiceState {
 			if st.Domains == nil {
 				st.Domains = []string{}
 			}
+			st.Pin = d.pin
 		} else if len(st.Containers) > 0 {
 			st.Image = st.Containers[0].Image
 		}
@@ -602,3 +658,19 @@ func (pp *ProjectPlan) Services() []ServiceState {
 
 // finished: podman reports a container that ran to completion as exited, or stopped once cleaned up.
 func finished(state string) bool { return state == "exited" || state == "stopped" }
+
+// composeRef is the image compose asks for: its image, or the tag vops builds it as.
+func composeRef(d *desired) string {
+	if d.spec.Build != nil {
+		return d.image
+	}
+	return d.spec.Image
+}
+
+// shortRef shortens the digest of an image ref for humans: "r/shop/web@sha256:0123456789ab".
+func shortRef(ref string) string {
+	if i := strings.Index(ref, "@sha256:"); i >= 0 && len(ref) > i+20 {
+		return ref[:i+20]
+	}
+	return ref
+}

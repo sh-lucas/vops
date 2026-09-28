@@ -27,6 +27,8 @@ type Deploy struct {
 	Summary    string `json:"summary"`
 	StartedAt  int64  `json:"started_at"`
 	FinishedAt int64  `json:"finished_at"`
+	BeforeID   int64  `json:"before_id"`
+	Parts      string `json:"parts"`
 }
 
 type Env struct {
@@ -47,6 +49,16 @@ type Event struct {
 type Meta struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
+}
+
+type Pin struct {
+	Project      string `json:"project"`
+	Service      string `json:"service"`
+	Image        string `json:"image"`
+	Digest       string `json:"digest"`
+	ComposeImage string `json:"compose_image"`
+	DeployID     int64  `json:"deploy_id"`
+	CreatedAt    int64  `json:"created_at"`
 }
 
 type Preview struct {

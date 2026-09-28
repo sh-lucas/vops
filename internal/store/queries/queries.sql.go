@@ -33,8 +33,8 @@ func (q *Queries) AddSnapshotVolume(ctx context.Context, arg AddSnapshotVolumePa
 }
 
 const createDeploy = `-- name: CreateDeploy :one
-INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, before_id, parts, result, error, summary, started_at, finished_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 RETURNING id
 `
 
@@ -46,6 +46,8 @@ type CreateDeployParams struct {
 	SnapshotID int64  `json:"snapshot_id"`
 	RestoredID int64  `json:"restored_id"`
 	Undoes     int64  `json:"undoes"`
+	BeforeID   int64  `json:"before_id"`
+	Parts      string `json:"parts"`
 	Result     string `json:"result"`
 	Error      string `json:"error"`
 	Summary    string `json:"summary"`
@@ -62,6 +64,8 @@ func (q *Queries) CreateDeploy(ctx context.Context, arg CreateDeployParams) (int
 		arg.SnapshotID,
 		arg.RestoredID,
 		arg.Undoes,
+		arg.BeforeID,
+		arg.Parts,
 		arg.Result,
 		arg.Error,
 		arg.Summary,
@@ -176,6 +180,23 @@ func (q *Queries) DeleteExpiredSessions(ctx context.Context, expires int64) erro
 	return err
 }
 
+const deletePin = `-- name: DeletePin :execrows
+DELETE FROM pins WHERE project = ? AND service = ?
+`
+
+type DeletePinParams struct {
+	Project string `json:"project"`
+	Service string `json:"service"`
+}
+
+func (q *Queries) DeletePin(ctx context.Context, arg DeletePinParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deletePin, arg.Project, arg.Service)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deletePreview = `-- name: DeletePreview :exec
 DELETE FROM previews WHERE project = ? AND name = ?
 `
@@ -227,7 +248,7 @@ func (q *Queries) DeleteUser(ctx context.Context, name string) error {
 }
 
 const getDeploy = `-- name: GetDeploy :one
-SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at FROM deploys WHERE id = ?
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at, before_id, parts FROM deploys WHERE id = ?
 `
 
 func (q *Queries) GetDeploy(ctx context.Context, id int64) (Deploy, error) {
@@ -247,6 +268,8 @@ func (q *Queries) GetDeploy(ctx context.Context, id int64) (Deploy, error) {
 		&i.Summary,
 		&i.StartedAt,
 		&i.FinishedAt,
+		&i.BeforeID,
+		&i.Parts,
 	)
 	return i, err
 }
@@ -336,7 +359,7 @@ func (q *Queries) GetUser(ctx context.Context, name string) (User, error) {
 }
 
 const latestDeploys = `-- name: LatestDeploys :many
-SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at FROM deploys WHERE id IN (SELECT max(id) FROM deploys GROUP BY project)
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at, before_id, parts FROM deploys WHERE id IN (SELECT max(id) FROM deploys GROUP BY project)
 `
 
 // the newest deploy of every project
@@ -363,6 +386,8 @@ func (q *Queries) LatestDeploys(ctx context.Context) ([]Deploy, error) {
 			&i.Summary,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.BeforeID,
+			&i.Parts,
 		); err != nil {
 			return nil, err
 		}
@@ -454,7 +479,7 @@ func (q *Queries) ListAutoSnapshotsToPrune(ctx context.Context, arg ListAutoSnap
 }
 
 const listDeploys = `-- name: ListDeploys :many
-SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at FROM deploys WHERE project = ? ORDER BY id DESC LIMIT ?
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at, before_id, parts FROM deploys WHERE project = ? ORDER BY id DESC LIMIT ?
 `
 
 type ListDeploysParams struct {
@@ -485,6 +510,8 @@ func (q *Queries) ListDeploys(ctx context.Context, arg ListDeploysParams) ([]Dep
 			&i.Summary,
 			&i.StartedAt,
 			&i.FinishedAt,
+			&i.BeforeID,
+			&i.Parts,
 		); err != nil {
 			return nil, err
 		}
@@ -589,6 +616,43 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 			&i.Project,
 			&i.Kind,
 			&i.Message,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPins = `-- name: ListPins :many
+SELECT project, service, image, digest, compose_image, deploy_id, created_at FROM pins
+WHERE ?1 = '' OR project = ?1
+ORDER BY project, service
+`
+
+func (q *Queries) ListPins(ctx context.Context, project interface{}) ([]Pin, error) {
+	rows, err := q.db.QueryContext(ctx, listPins, project)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Pin{}
+	for rows.Next() {
+		var i Pin
+		if err := rows.Scan(
+			&i.Project,
+			&i.Service,
+			&i.Image,
+			&i.Digest,
+			&i.ComposeImage,
+			&i.DeployID,
+			&i.CreatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -777,6 +841,67 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 	return items, nil
 }
 
+const previousDeploy = `-- name: PreviousDeploy :one
+SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at, before_id, parts FROM deploys WHERE project = ? AND id < ? ORDER BY id DESC LIMIT 1
+`
+
+type PreviousDeployParams struct {
+	Project string `json:"project"`
+	ID      int64  `json:"id"`
+}
+
+func (q *Queries) PreviousDeploy(ctx context.Context, arg PreviousDeployParams) (Deploy, error) {
+	row := q.db.QueryRowContext(ctx, previousDeploy, arg.Project, arg.ID)
+	var i Deploy
+	err := row.Scan(
+		&i.ID,
+		&i.Project,
+		&i.CommitSha,
+		&i.Trigger,
+		&i.Images,
+		&i.SnapshotID,
+		&i.RestoredID,
+		&i.Undoes,
+		&i.Result,
+		&i.Error,
+		&i.Summary,
+		&i.StartedAt,
+		&i.FinishedAt,
+		&i.BeforeID,
+		&i.Parts,
+	)
+	return i, err
+}
+
+const putPin = `-- name: PutPin :exec
+INSERT INTO pins (project, service, image, digest, compose_image, deploy_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (project, service) DO UPDATE SET image = excluded.image, digest = excluded.digest, compose_image = excluded.compose_image,
+    deploy_id = excluded.deploy_id, created_at = excluded.created_at
+`
+
+type PutPinParams struct {
+	Project      string `json:"project"`
+	Service      string `json:"service"`
+	Image        string `json:"image"`
+	Digest       string `json:"digest"`
+	ComposeImage string `json:"compose_image"`
+	DeployID     int64  `json:"deploy_id"`
+	CreatedAt    int64  `json:"created_at"`
+}
+
+func (q *Queries) PutPin(ctx context.Context, arg PutPinParams) error {
+	_, err := q.db.ExecContext(ctx, putPin,
+		arg.Project,
+		arg.Service,
+		arg.Image,
+		arg.Digest,
+		arg.ComposeImage,
+		arg.DeployID,
+		arg.CreatedAt,
+	)
+	return err
+}
+
 const putPreview = `-- name: PutPreview :exec
 INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, deploy_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, updated_at = excluded.updated_at
@@ -810,6 +935,35 @@ func (q *Queries) PutPreview(ctx context.Context, arg PutPreviewParams) error {
 		arg.UpdatedAt,
 	)
 	return err
+}
+
+const recentDeployImages = `-- name: RecentDeployImages :many
+SELECT images FROM deploys d
+WHERE (SELECT count(*) FROM deploys x WHERE x.project = d.project AND x.id > d.id) < CAST(?1 AS INTEGER)
+`
+
+// the images of the newest `keep` deploys of every project (registry gc keeps them)
+func (q *Queries) RecentDeployImages(ctx context.Context, keep int64) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, recentDeployImages, keep)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var images string
+		if err := rows.Scan(&images); err != nil {
+			return nil, err
+		}
+		items = append(items, images)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const setEnv = `-- name: SetEnv :exec

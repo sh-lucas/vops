@@ -60,7 +60,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Commit     string                `json:"commit"`
 			AppliedAt  int64                 `json:"applied_at"`
 			Services   []deploy.ServiceState `json:"services"`
-			LastDeploy *store.Deploy         `json:"last_deploy"` // a rollback here means the data was restored since the last deploy
+			LastDeploy *store.Deploy         `json:"last_deploy"` // a rollback here: rolled back since the last deploy (the banner)
 		}
 		type preview struct {
 			Project string `json:"project"`
@@ -399,7 +399,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		return nil
 	})
 	h("POST /api/registry/gc", func(w http.ResponseWriter, r *http.Request) error {
-		res, err := d.Reg.GC(time.Hour)
+		res, err := d.gc()
 		if err != nil {
 			return err
 		}
@@ -467,25 +467,69 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		writeJSON(w, map[string]bool{"ok": true})
 		return nil
 	})
-	// rollback streams progress like apply; id 0 means the latest snapshot that isn't a pre-rollback one
+	// rollback: GET shows what it would do (format=text for the cli), POST does it and streams progress like apply
+	rollbackOpts := func(q map[string][]string) (deploy.RollbackOpts, error) {
+		get := func(k string) string {
+			if len(q[k]) > 0 {
+				return q[k][0]
+			}
+			return ""
+		}
+		o := deploy.RollbackOpts{Project: get("project"), Images: get("images") == "1", Data: get("data") == "1", Services: q["service"]}
+		for k, dst := range map[string]*int64{"before": &o.Before, "snapshot": &o.Snapshot} {
+			if v := get(k); v != "" {
+				n, err := strconv.ParseInt(v, 10, 64)
+				if err != nil {
+					return o, fmt.Errorf("invalid %s %q", k, v)
+				}
+				*dst = n
+			}
+		}
+		return o, nil
+	}
+	h("GET /api/rollback", func(w http.ResponseWriter, r *http.Request) error {
+		o, err := rollbackOpts(r.URL.Query())
+		if err != nil {
+			return err
+		}
+		rp, err := d.Engine.RollbackPlan(r.Context(), o)
+		if err != nil {
+			return err
+		}
+		if r.URL.Query().Get("format") == "text" {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			rp.Print(w)
+			return nil
+		}
+		writeJSON(w, rp)
+		return nil
+	})
 	h("POST /api/rollback", func(w http.ResponseWriter, r *http.Request) error {
+		var in deploy.RollbackOpts
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if err := d.Engine.Rollback(context.WithoutCancel(r.Context()), flushWriter{w}, in); err != nil {
+			fmt.Fprintf(w, "==> error: %v\n", err)
+		} else {
+			fmt.Fprintln(w, "==> ok")
+		}
+		return nil
+	})
+	// unpin: back to what compose says for these services (all pinned ones if none), streamed like apply
+	h("POST /api/unpin", func(w http.ResponseWriter, r *http.Request) error {
 		var in struct {
-			Project string `json:"project"`
-			ID      int64  `json:"id"`
+			Project  string   `json:"project"`
+			Services []string `json:"services"`
 		}
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		if in.ID == 0 {
-			s, err := d.Engine.LatestSnapshot(in.Project)
-			if err != nil {
-				return err
-			}
-			in.ID = s.ID
-		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.Rollback(context.WithoutCancel(r.Context()), flushWriter{w}, in.Project, in.ID); err != nil {
+		if err := d.Engine.Unpin(context.WithoutCancel(r.Context()), flushWriter{w}, in.Project, in.Services); err != nil {
 			fmt.Fprintf(w, "==> error: %v\n", err)
 		} else {
 			fmt.Fprintln(w, "==> ok")

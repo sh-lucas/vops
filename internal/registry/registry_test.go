@@ -127,7 +127,7 @@ func TestPodmanManifestList(t *testing.T) {
 		t.Fatalf("expected an index, got %s", mt)
 	}
 	// GC must keep the child manifest of a tagged index
-	if _, err := reg.GC(0); err != nil {
+	if _, err := reg.GC(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := podman.Run(ctx, "pull", "-q", "--tls-verify=false", "--creds", "alice:secret", ref); err != nil {
@@ -291,21 +291,25 @@ func TestGC(t *testing.T) {
 	cfg := pushBlob(c, "app/a", []byte("{}"))
 	shared := pushBlob(c, "app/a", []byte("shared layer"))
 	old := pushBlob(c, "app/a", []byte("old layer"))
-	pushManifest(c, "app/a", "latest", cfg, shared, old)
+	oldManifest, _ := pushManifest(c, "app/a", "latest", cfg, shared, old)
 	newer := pushBlob(c, "app/a", []byte("new layer"))
 	pushManifest(c, "app/a", "latest", cfg, shared, newer) // old manifest is now untagged
 	stray := pushBlob(c, "app/a", []byte("never referenced"))
 	pushBlob(c, "app/gone", []byte("repo with no manifests"))
 
 	// with a long grace nothing is touched
-	if res, _ := reg.GC(time.Hour); res.Blobs != 0 || res.Manifests != 0 {
+	if res, _ := reg.GC(time.Hour, nil); res.Blobs != 0 || res.Manifests != 0 {
 		t.Fatalf("grace ignored: %+v", res)
 	}
-	res, err := reg.GC(0)
+	// a digest in the keep set (a pin, a preview, a recent deploy) survives untagged, with its layers
+	if res, _ := reg.GC(0, map[string]bool{oldManifest: true}); res.Manifests != 0 || res.Blobs != 2 || reg.Resolve("app/a", oldManifest) == "" || !exists(reg.blobPath(old)) {
+		t.Fatalf("kept digest collected: %+v", res)
+	}
+	res, err := reg.GC(0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res.Manifests != 1 || res.Blobs != 4 { // old manifest, old layer, stray, gone's blob
+	if res.Manifests != 1 || res.Blobs != 2 { // old manifest and old layer (stray and gone's blob went in the first pass)
 		t.Fatalf("gc: %+v", res)
 	}
 	for _, d := range []string{old, stray} {

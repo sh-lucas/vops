@@ -20,8 +20,8 @@ const historyLimit = 100
 
 var pastTense = map[string]string{"create": "created", "update": "updated", "start": "started", "remove": "removed"}
 
-// record finishes a history row and stores it. Failing to record never fails the deploy.
-func (e *Engine) record(ctx context.Context, rec store.Deploy, specs map[string]*desired, err error) {
+// record finishes a history row, stores it and returns its id. Failing to record never fails the deploy.
+func (e *Engine) record(ctx context.Context, rec store.Deploy, specs map[string]*desired, err error) int64 {
 	rec.FinishedAt = time.Now().Unix()
 	rec.Result = "ok"
 	if err != nil {
@@ -32,7 +32,8 @@ func (e *Engine) record(ctx context.Context, rec store.Deploy, specs map[string]
 		prev = last[0].Images
 	}
 	rec.Images = e.runningImages(ctx, rec.Project, specs, prev)
-	e.DB.AddDeploy(rec)
+	id, _ := e.DB.AddDeploy(rec)
+	return id
 }
 
 func shortErr(err error) string {
@@ -58,14 +59,7 @@ func (e *Engine) runningImages(ctx context.Context, project string, specs map[st
 	for svc, list := range by {
 		d := specs[svc]
 		if d != nil && !slices.ContainsFunc(list, func(c podman.Container) bool { return c.Labels[LHash] != d.hash }) {
-			img := store.DeployImage{Image: d.spec.Image, Digest: d.digest, Built: d.spec.Build != nil}
-			if img.Built {
-				img.Image = d.image
-			}
-			if img.Digest == "" && !img.Built {
-				img.Digest = imageDigest(ctx, d.image)
-			}
-			out[svc] = img
+			out[svc] = imageOf(ctx, d)
 		} else if p, ok := prev[svc]; ok {
 			out[svc] = p
 		} else {
@@ -73,6 +67,27 @@ func (e *Engine) runningImages(ctx context.Context, project string, specs map[st
 		}
 	}
 	return out
+}
+
+// imageOf is what a desired service runs, as the history records it: compose's image (or the tag vops builds),
+// by digest when known; a pinned service records the pinned image.
+func imageOf(ctx context.Context, d *desired) store.DeployImage {
+	if d.pin != nil {
+		return store.DeployImage{Image: d.pin.Image, Digest: d.pin.Digest}
+	}
+	img := store.DeployImage{Image: composeRef(d), Digest: d.digest, Built: d.spec.Build != nil}
+	if img.Digest == "" && !img.Built {
+		img.Digest = imageDigest(ctx, d.image)
+	}
+	return img
+}
+
+// sameImage: the same digest when both are known, else the same ref.
+func sameImage(a, b store.DeployImage) bool {
+	if a.Digest != "" && b.Digest != "" {
+		return a.Digest == b.Digest
+	}
+	return a.Image == b.Image && a.Built == b.Built
 }
 
 // imageDigest is the manifest digest of a pulled image, "" for local ones (it can't be pulled by it).
@@ -111,6 +126,7 @@ type Node struct {
 	Images   map[string]store.DeployImage `json:"images"`
 	Changes  []ImageChange                `json:"changes"` // images vs the previous deploy
 	Previews []string                     `json:"previews"`
+	Gone     []string                     `json:"gone"` // services whose image is gone from the vops registry (older than image_keep)
 }
 
 // ImageChange is a service whose image differs from the previous deploy (From nil: new service; To nil: gone).
@@ -232,7 +248,12 @@ func (e *Engine) Timeline(ctx context.Context, project string) (Timeline, error)
 	})
 	for i := range t.Nodes {
 		n := &t.Nodes[i]
-		n.Previews = []string{}
+		n.Previews, n.Gone = []string{}, []string{}
+		for _, svc := range sortedKeys(n.Images) {
+			if !e.available(n.Images[svc]) {
+				n.Gone = append(n.Gone, svc)
+			}
+		}
 		for _, pv := range previews {
 			if pv.DeployID != 0 && n.Deploy != nil && n.Deploy.ID == pv.DeployID ||
 				pv.DeployID == 0 && pv.SnapshotID != 0 && n.Snapshot != nil && n.Snapshot.ID == pv.SnapshotID {
@@ -262,4 +283,48 @@ func (e *Engine) Timeline(ctx context.Context, project string) (Timeline, error)
 		}
 	}
 	return t, nil
+}
+
+// available reports whether an image can be run again: an own-registry image must still be in the registry
+// (gc keeps the newest image_keep deploys' images); others are assumed pullable.
+func (e *Engine) available(img store.DeployImage) bool {
+	if img.Digest == "" {
+		return true
+	}
+	repo, _, ok := e.ownImage(img.Pinned(), e.domain())
+	return !ok || e.Registry.Resolve(repo, img.Digest) != ""
+}
+
+// KeepDigests is what registry gc must keep untagged: the digests that pins, previews and the newest keep
+// deploys of every project run, so rollback and "Preview from here" still find them.
+func (e *Engine) KeepDigests(keep int) (map[string]bool, error) {
+	out := map[string]bool{}
+	add := func(ref string) {
+		if _, d, ok := strings.Cut(ref, "@"); ok {
+			out[d] = true
+		}
+	}
+	pins, err := e.DB.Pins("")
+	if err != nil {
+		return nil, err
+	}
+	for _, p := range pins {
+		out[p.Digest] = true
+	}
+	previews, err := e.DB.Previews("")
+	if err != nil {
+		return nil, err
+	}
+	for _, pv := range previews {
+		for _, img := range pv.Images {
+			add(img)
+		}
+	}
+	images, err := e.DB.RecentDeployImages(keep)
+	for _, img := range images {
+		if img.Digest != "" {
+			out[img.Digest] = true
+		}
+	}
+	return out, err
 }

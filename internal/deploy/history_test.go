@@ -132,28 +132,32 @@ volumes:
 		t.Fatalf("history: %+v", history())
 	}
 
-	// rollback to the data before the second deploy, then undo it
+	// rollback to right before the second deploy: data A; web ran a local image then (no digest), so only data
 	var buf strings.Builder
-	if err := v.e.Rollback(ctx, &buf, p, d2.SnapshotID); err != nil {
+	rp, err := v.e.RollbackPlan(ctx, RollbackOpts{Project: p, Before: d2.ID})
+	if err != nil || strings.Join(rp.Parts, ",") != "data" || rp.From != ds[1].ID || len(rp.Images) != 2 || rp.Images[1].Do != "skip" || !strings.Contains(rp.Images[1].Reason, "no digest") {
+		t.Fatalf("rollback plan: %v %+v", err, rp)
+	}
+	if err := v.e.Rollback(ctx, &buf, RollbackOpts{Project: p, Before: d2.ID}); err != nil {
 		t.Fatalf("%v\n%s", err, buf.String())
 	}
 	if got := exec(p, "read", "/data/f"); got != "A" {
 		t.Fatalf("after rollback: %q", got)
 	}
 	r1 := history()[0]
-	if r1.Trigger != "rollback" || r1.RestoredID != d2.SnapshotID || r1.SnapshotID == 0 || r1.Undoes != 0 || r1.Result != "ok" || r1.Commit != c5 || r1.Images["web"].Image != v3 {
+	if r1.Trigger != "rollback" || r1.RestoredID != d2.SnapshotID || r1.BeforeID != d2.ID || r1.Parts != "data" || r1.SnapshotID == 0 || r1.Undoes != 0 || r1.Result != "ok" || r1.Commit != c5 || r1.Images["web"].Image != v3 {
 		t.Fatalf("rollback row: %+v", r1)
 	}
 	if last, _ := v.e.DB.LatestDeploys(); last[p].ID != r1.ID {
 		t.Fatalf("latest deploy should be the rollback: %+v", last[p])
 	}
-	if err := v.e.Rollback(ctx, io.Discard, p, r1.SnapshotID); err != nil {
+	if err := v.e.Rollback(ctx, io.Discard, RollbackOpts{Project: p, Before: r1.ID}); err != nil {
 		t.Fatal(err)
 	}
 	if got := exec(p, "read", "/data/f"); got != "C" {
 		t.Fatalf("after undo: %q", got)
 	}
-	if r2 := history()[0]; r2.Undoes != r1.ID || r2.RestoredID != r1.SnapshotID {
+	if r2 := history()[0]; r2.Undoes != r1.ID || r2.RestoredID != r1.SnapshotID || r2.Parts != "data" {
 		t.Fatalf("undo row: %+v", r2)
 	}
 	manual, err := v.e.Snapshot(ctx, io.Discard, p, "keep")

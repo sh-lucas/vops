@@ -21,7 +21,6 @@ import (
 	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/daemon"
 	"github.com/sh-lucas/vops/internal/deploy"
-	"github.com/sh-lucas/vops/internal/store"
 )
 
 func run(dir string, env []string, name string, args ...string) error {
@@ -468,53 +467,57 @@ func cmdDaemon() error {
 	return err
 }
 
-// ---- rollback: show what gets restored, ask, then restore that exact snapshot
+// ---- rollback: show what it does (per service, the data, the code), ask, then do exactly that
 
 func cmdRollback(g globals, args []string) error {
+	if g.local { // the host side of a forwarded rollback: the laptop already showed the plan
+		return runHere("rollback", args, nil, os.Stdout)
+	}
 	fs := flag.NewFlagSet("rollback", flag.ContinueOnError)
 	yes := fs.Bool("yes", false, "")
 	fs.BoolVar(yes, "y", false, "")
+	asJSON := fs.Bool("json", false, "")
+	images := fs.Bool("images", false, "")
+	data := fs.Bool("data", false, "")
+	var services multi
+	fs.Var(&services, "service", "")
+	snap := fs.String("snapshot", "", "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
 	}
-	if len(pos) == 0 {
-		return errors.New("usage: vops rollback <project> [snapshot-id] [-y]")
+	if len(pos) == 0 || len(pos) > 2 {
+		return errors.New("usage: vops rollback <project> [deploy-id] [--images] [--data] [--service s]... [--snapshot id] [-y]")
 	}
-	project := pos[0]
-	if *yes && len(pos) > 1 {
-		return forward(g, "rollback", []string{project, pos[1], "--yes"}, nil, os.Stdout)
+	rest := slices.Clone(pos)
+	if *images {
+		rest = append(rest, "--images")
+	}
+	if *data {
+		rest = append(rest, "--data")
+	}
+	for _, s := range services {
+		rest = append(rest, "--service", s)
+	}
+	if *snap != "" {
+		rest = append(rest, "--snapshot", *snap)
 	}
 	var buf bytes.Buffer
-	if err := forward(g, "snapshot", []string{"ls", project, "--json"}, nil, &buf); err != nil {
+	if err := forward(g, "rollback", append(slices.Clone(rest), "--plan", "--json"), nil, &buf); err != nil {
 		return err
 	}
-	var res struct {
-		Snapshots []store.Snapshot `json:"snapshots"`
-	}
-	if err := json.Unmarshal(buf.Bytes(), &res); err != nil {
+	if *asJSON {
+		_, err := os.Stdout.Write(buf.Bytes())
 		return err
 	}
-	var target *store.Snapshot
-	for i, s := range res.Snapshots {
-		if len(pos) > 1 && fmt.Sprint(s.ID) == pos[1] || len(pos) == 1 && s.Reason != "pre-rollback" {
-			target = &res.Snapshots[i]
-			break
-		}
+	var rp deploy.RollbackPlan
+	if err := json.Unmarshal(buf.Bytes(), &rp); err != nil {
+		return err
 	}
-	if target == nil {
-		return fmt.Errorf("no such snapshot for %s (vops snapshot ls %s)", project, project)
+	rp.Print(os.Stdout)
+	if len(rp.Parts) == 0 {
+		return errors.New("nothing to roll back")
 	}
-	var vols []string
-	for _, v := range target.Volumes {
-		vols = append(vols, v.Name)
-	}
-	fmt.Printf("restore %s to snapshot #%d (%s, %s, commit %.12s)\n  data: %s\n", project, target.ID, target.Reason, ago(target.CreatedAt), target.Commit, strings.Join(vols, ", "))
-	if target.Note != "" {
-		fmt.Printf("  note: %s\n", target.Note)
-	}
-	fmt.Println("  the project's containers stop while it restores; the current data is snapshotted first, so this can be undone.")
-	fmt.Println("  code is not rolled back: to run the old code too, git revert and vops sync first.")
 	if !*yes {
 		if !isTerminal(os.Stdin) {
 			return errors.New("not a terminal: pass --yes")
@@ -523,5 +526,8 @@ func cmdRollback(g globals, args []string) error {
 			return errors.New("aborted")
 		}
 	}
-	return forward(g, "rollback", []string{project, fmt.Sprint(target.ID), "--yes"}, nil, os.Stdout)
+	if len(pos) == 1 && rp.Before != nil {
+		rest = append(rest, fmt.Sprint(rp.Before.ID)) // exactly the point shown, even if a deploy lands in between
+	}
+	return forward(g, "rollback", append(rest, "--yes"), nil, os.Stdout)
 }

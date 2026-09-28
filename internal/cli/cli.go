@@ -46,7 +46,10 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   user ls | add <name> [--pattern re] [--repo r]... [--token-stdin] | rm <name> | token <name>
   registry ls [repo] | rm <repo:tag> | gc
   snapshot ls [project] | create <project> [-m note] | rm <id>
-  rollback <project> [snapshot-id] [-y]   put a snapshot's data back (undoable)
+  rollback <project> [deploy-id] [--images] [--data] [--service s]... [--snapshot id] [-y]
+                                     back to right before a deploy (default: the last one): its images
+                                     (pinned by digest) and its data; undo: rollback <project> <rollback-id>
+  unpin <project> [service...]       back to the images compose says (rolling)
   history <project> [-n N]           deploys, rollbacks and snapshots, newest first
   admin password                     set the dashboard password
   events [project]                   what happened (deploys, pushes, config)
@@ -102,7 +105,7 @@ func Main(args []string) int {
 		err = cmdRollback(g, rest)
 	case "preview":
 		err = cmdPreview(g, rest)
-	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit", "history":
+	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit", "history", "unpin":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)

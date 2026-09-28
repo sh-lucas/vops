@@ -223,7 +223,8 @@ func (d *Daemon) onPush(repo, tag, digest string) {
 	if len(keys) == 0 {
 		return
 	}
-	if _, err := d.Engine.Apply(ctx, w, deploy.ApplyOpts{Services: keys, Trigger: "push"}); err != nil {
+	// a pinned service (image rollback) running this tag gets the newer version: its pin ends
+	if _, err := d.Engine.Apply(ctx, w, deploy.ApplyOpts{Services: keys, Trigger: "push", Unpin: repo + ":" + tag + " pushed"}); err != nil {
 		log.Printf("push trigger %s:%s: %v", repo, tag, err)
 	}
 }
@@ -419,9 +420,19 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		d.Engine.Lock(func() { d.Engine.RefreshRoutes(ctx) })
 		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
 		if n%(24*60) == 0 {
-			if res, err := d.Reg.GC(time.Hour); err == nil && res.Blobs > 0 {
+			if res, err := d.gc(); err == nil && res.Blobs > 0 {
 				d.DB.Event("", "gc", "registry gc: %d manifests, %d blobs, %d bytes freed", res.Manifests, res.Blobs, res.Freed)
 			}
 		}
 	}
+}
+
+// gc collects the registry, keeping what pins, previews and the newest image_keep deploys of every project run
+// (untagged once a tag moves on), so rollback and "Preview from here" still find them.
+func (d *Daemon) gc() (registry.GCResult, error) {
+	keep, err := d.Engine.KeepDigests(d.cfg.Load().Defaults().ImageKeep)
+	if err != nil {
+		return registry.GCResult{}, err
+	}
+	return d.Reg.GC(time.Hour, keep)
 }

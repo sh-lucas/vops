@@ -95,7 +95,7 @@ services:
       replicas: 2           # routed services only
       strategy: rolling     # rolling (default when routed, no host ports) | recreate
       timeout: 60s          # readiness timeout
-      watch: true           # redeploy when this tag is pushed to the vops registry
+      watch: true           # redeploy when this tag is pushed to the vops registry (it also ends an image rollback pin)
       preview: {skip: true} # don't run it in previews (workers, crons)
 
 x-vops:                     # top level: project settings

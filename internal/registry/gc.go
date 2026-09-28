@@ -16,9 +16,10 @@ type GCResult struct {
 	Freed     int64 `json:"freed"`
 }
 
-// GC deletes untagged manifests (unless an index or a kept subject references them), blobs nothing
-// references, and uploads older than a day. Anything younger than grace is kept, so a push in progress is safe.
-func (reg *Registry) GC(grace time.Duration) (GCResult, error) {
+// GC deletes untagged manifests (unless an index or a kept subject references them, or their digest is in keep:
+// what pins, previews and recent deploys run), blobs nothing references, and uploads older than a day.
+// Anything younger than grace is kept, so a push in progress is safe.
+func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCResult, error) {
 	reg.mu.Lock()
 	defer reg.mu.Unlock()
 	var res GCResult
@@ -66,7 +67,7 @@ func (reg *Registry) GC(grace time.Duration) (GCResult, error) {
 			visit(d)
 		}
 		for d := range all {
-			if young(reg.repoPath(name, "manifests", hexOf(d))) {
+			if keepDigests[d] || young(reg.repoPath(name, "manifests", hexOf(d))) {
 				visit(d)
 			}
 		}

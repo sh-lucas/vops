@@ -29,11 +29,14 @@ type ApplyOpts struct {
 	Commit   string      // refuse if HEAD is not this commit (what the user confirmed)
 	Projects []string    // only these projects (all if empty)
 	Services []proxy.Key // only these services (all if empty); used by registry push triggers
-	Trigger  string      // for the deploy history: sync | apply | ui | push (default apply)
+	Trigger  string      // for the deploy history: sync | apply | ui | push | unpin (default apply)
+	Unpin    string      // drop the pins of Services first, saying why (a push brought a newer version, vops unpin)
+
+	noSnapshot bool // rollback: the data was just restored, no pre-deploy snapshot
 }
 
 // Triggers are what can start a deploy, as the history records them.
-var Triggers = []string{"sync", "apply", "ui", "push", "rollback"}
+var Triggers = []string{"sync", "apply", "ui", "push", "unpin", "rollback"}
 
 func (o ApplyOpts) wantsProject(project string) bool {
 	if len(o.Projects) > 0 && !slices.Contains(o.Projects, project) {
@@ -57,6 +60,11 @@ func (e *Engine) Apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan,
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	w = &syncWriter{w: w}
+	if opts.Unpin != "" {
+		for _, k := range opts.Services {
+			e.unpin(w, k.Project, k.Service, opts.Unpin)
+		}
+	}
 	plan, err := e.Plan(ctx)
 	if err != nil {
 		return nil, err
@@ -95,6 +103,11 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 		return nil
 	}
 	rec := store.Deploy{Project: pp.Path, Commit: plan.Commit, Trigger: cmpOr(opts.Trigger, "apply"), StartedAt: time.Now().Unix()}
+	for _, pin := range pp.Pins {
+		if pin.Stale != "" && opts.wants(pp.Path, pin.Service) {
+			e.unpin(w, pp.Path, pin.Service, pin.Stale)
+		}
+	}
 	err := e.deployProject(ctx, w, plan, pp, opts, &rec)
 	if compose.IsPreview(pp.Path) || pp.Error == "" && !slices.ContainsFunc(pp.Actions, func(a Action) bool { return a.Kind != "none" && opts.wants(pp.Path, a.Service) }) {
 		return err
@@ -114,7 +127,7 @@ func (e *Engine) deployProject(ctx context.Context, w io.Writer, plan *Plan, pp 
 		}
 	}
 	// previews are disposable copies: no pre-deploy snapshots of them
-	if !compose.IsPreview(pp.Path) && slices.ContainsFunc(pp.Actions, func(a Action) bool {
+	if !compose.IsPreview(pp.Path) && !opts.noSnapshot && slices.ContainsFunc(pp.Actions, func(a Action) bool {
 		return (a.Kind == "create" || a.Kind == "update") && opts.wants(pp.Path, a.Service)
 	}) {
 		id, err := e.preDeploy(ctx, w, pp, plan.Commit)
@@ -632,4 +645,51 @@ func (s *syncWriter) Write(p []byte) (int, error) {
 		f.Flush()
 	}
 	return n, err
+}
+
+// unpin removes a pin, if there is one, and says why. The next deploy of the service runs what compose says.
+func (e *Engine) unpin(w io.Writer, project, service, why string) {
+	pins, _ := e.DB.Pins(project)
+	for _, pin := range pins {
+		if pin.Service != service {
+			continue
+		}
+		if _, err := e.DB.DeletePin(project, service); err != nil {
+			fmt.Fprintf(w, "%s/%s: unpin: %v\n", project, service, err)
+			return
+		}
+		fmt.Fprintf(w, "%s/%s: pin to #%d removed: %s\n", project, service, pin.DeployID, why)
+		e.DB.Event(project, "rollback", "%s: pin to #%d (%s) removed: %s", service, pin.DeployID, shortRef(store.PinRef(pin)), why)
+	}
+}
+
+// Unpin removes the pins of a project's services (all of them when none are named) and deploys what compose
+// says for those services (rolling). Other pending changes of the project wait for an apply.
+func (e *Engine) Unpin(ctx context.Context, w io.Writer, project string, services []string) error {
+	pins, err := e.DB.Pins(project)
+	if err != nil {
+		return err
+	}
+	var keys []proxy.Key
+	for _, pin := range pins {
+		if len(services) == 0 || slices.Contains(services, pin.Service) {
+			keys = append(keys, proxy.Key{Project: project, Service: pin.Service})
+		}
+	}
+	for _, s := range services {
+		if !slices.Contains(keys, proxy.Key{Project: project, Service: s}) {
+			return fmt.Errorf("%s/%s is not pinned", project, s)
+		}
+	}
+	if len(keys) == 0 {
+		return fmt.Errorf("%s has no pinned services", project)
+	}
+	if flags, _ := e.DB.Projects(); flags[project].Disabled { // an apply would remove its containers
+		for _, k := range keys {
+			e.unpin(w, project, k.Service, "unpinned by hand; it runs what compose says once enabled")
+		}
+		return nil
+	}
+	_, err = e.Apply(ctx, w, ApplyOpts{Services: keys, Trigger: "unpin", Unpin: "unpinned by hand"})
+	return err
 }

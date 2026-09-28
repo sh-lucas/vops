@@ -256,6 +256,10 @@ dl.kv dt { color: var(--faint); }
 dl.kv dd { margin: 0; min-width: 0; }
 .modal dl.kv { margin: 12px 0; }
 .modal label.field input { width: 100%; }
+.rb-h { margin: 14px 0 6px; font-size: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--faint); }
+label.rb-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 8px; align-items: start; padding: 6px 0; font-size: 13px; overflow-wrap: anywhere; cursor: pointer; }
+label.rb-row input { margin-top: 2px; }
+label.rb-row.off { cursor: default; opacity: .75; }
 
 /* ---- previews */
 .pvlist > .pv { padding: 12px 16px; border-bottom: 1px solid var(--line); }

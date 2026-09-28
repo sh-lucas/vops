@@ -474,6 +474,8 @@ type Deploy struct {
 	SnapshotID int64                  `json:"snapshot_id"` // the data right before this event (pre-deploy or pre-rollback); 0 = none
 	RestoredID int64                  `json:"restored_id"` // rollback: the snapshot put back
 	Undoes     int64                  `json:"undoes"`      // rollback: the rollback it undid
+	BeforeID   int64                  `json:"before_id"`   // rollback: it went back to right before this deploy
+	Parts      string                 `json:"parts"`       // rollback: images, data or images,data ("" on old rows: data)
 	Result     string                 `json:"result"`      // ok | failed
 	Error      string                 `json:"error"`
 	Summary    string                 `json:"summary"`
@@ -503,7 +505,7 @@ func (i DeployImage) Pinned() string {
 
 func deployFrom(r queries.Deploy) Deploy {
 	d := Deploy{ID: r.ID, Project: r.Project, Commit: r.CommitSha, Trigger: r.Trigger, Images: map[string]DeployImage{}, SnapshotID: r.SnapshotID,
-		RestoredID: r.RestoredID, Undoes: r.Undoes, Result: r.Result, Error: r.Error, Summary: r.Summary, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt}
+		RestoredID: r.RestoredID, Undoes: r.Undoes, BeforeID: r.BeforeID, Parts: r.Parts, Result: r.Result, Error: r.Error, Summary: r.Summary, StartedAt: r.StartedAt, FinishedAt: r.FinishedAt}
 	json.Unmarshal([]byte(r.Images), &d.Images)
 	return d
 }
@@ -515,13 +517,25 @@ func (d *DB) AddDeploy(x Deploy) (int64, error) {
 	}
 	images, _ := json.Marshal(x.Images, json.Deterministic(true))
 	return d.q.CreateDeploy(ctx, queries.CreateDeployParams{Project: x.Project, CommitSha: x.Commit, Trigger: x.Trigger, Images: string(images),
-		SnapshotID: x.SnapshotID, RestoredID: x.RestoredID, Undoes: x.Undoes, Result: x.Result, Error: x.Error, Summary: x.Summary,
+		SnapshotID: x.SnapshotID, RestoredID: x.RestoredID, Undoes: x.Undoes, BeforeID: x.BeforeID, Parts: x.Parts, Result: x.Result, Error: x.Error, Summary: x.Summary,
 		StartedAt: x.StartedAt, FinishedAt: x.FinishedAt})
 }
 
 // Deploy returns one deploy; found is false when it doesn't exist.
 func (d *DB) Deploy(id int64) (x Deploy, found bool, err error) {
 	r, err := d.q.GetDeploy(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Deploy{}, false, nil
+	}
+	if err != nil {
+		return Deploy{}, false, err
+	}
+	return deployFrom(r), true, nil
+}
+
+// PreviousDeploy is the deploy of a project right before deploy id; found is false when there is none.
+func (d *DB) PreviousDeploy(project string, id int64) (x Deploy, found bool, err error) {
+	r, err := d.q.PreviousDeploy(ctx, queries.PreviousDeployParams{Project: project, ID: id})
 	if errors.Is(err, sql.ErrNoRows) {
 		return Deploy{}, false, nil
 	}
@@ -549,4 +563,39 @@ func (d *DB) LatestDeploys() (map[string]Deploy, error) {
 		out[r.Project] = deployFrom(r)
 	}
 	return out, err
+}
+
+// RecentDeployImages lists the images of the newest keep deploys of every project.
+func (d *DB) RecentDeployImages(keep int) ([]DeployImage, error) {
+	rows, err := d.q.RecentDeployImages(ctx, int64(keep))
+	var out []DeployImage
+	for _, r := range rows {
+		var m map[string]DeployImage
+		json.Unmarshal([]byte(r), &m)
+		for _, img := range m {
+			out = append(out, img)
+		}
+	}
+	return out, err
+}
+
+// ---- pins (image rollback: a service runs a past image until a newer version arrives)
+
+type Pin = queries.Pin
+
+// PinRef is what a pinned service runs: its image by digest.
+func PinRef(p Pin) string { return DeployImage{Image: p.Image, Digest: p.Digest}.Pinned() }
+
+func (d *DB) PutPin(p Pin) error {
+	return d.q.PutPin(ctx, queries.PutPinParams{Project: p.Project, Service: p.Service, Image: p.Image, Digest: p.Digest,
+		ComposeImage: p.ComposeImage, DeployID: p.DeployID, CreatedAt: now()})
+}
+
+// Pins lists pins ("" = of all projects).
+func (d *DB) Pins(project string) ([]Pin, error) { return d.q.ListPins(ctx, project) }
+
+// DeletePin removes a pin and reports whether there was one.
+func (d *DB) DeletePin(project, service string) (bool, error) {
+	n, err := d.q.DeletePin(ctx, queries.DeletePinParams{Project: project, Service: service})
+	return n > 0, err
 }

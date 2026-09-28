@@ -1,6 +1,6 @@
 // Package config reads the config files of vops.
 //
-//	<repo>/vops.yml        committed: the whole config (domain, email, listeners, tls, snapshots, previews)
+//	<repo>/vops.yml        committed: the whole config (domain, email, listeners, tls, snapshots, images, previews)
 //	~/.vops/config.yml     on the host: the lock, a copy of the last applied vops.yml
 //	<repo>/vops-lock.yml   gitignored, local only: how to reach the host
 //
@@ -34,6 +34,7 @@ type Config struct {
 	TLS          string `yaml:"tls"`           // auto (default) | off
 	Snapshots    string `yaml:"snapshots"`     // on (default) | off
 	SnapshotKeep int    `yaml:"snapshot_keep"` // automatic snapshots kept per project, default 5
+	ImageKeep    int    `yaml:"image_keep"`    // registry gc keeps the images of the newest N deploys per project, default 10
 	PreviewMax   int    `yaml:"preview_max"`   // previews on this host at once, default 5 (each one is another database)
 	PreviewTTL   string `yaml:"preview_ttl"`   // previews not updated for this long are removed, default 3d
 	// ACMEDirectory overrides the Let's Encrypt directory (staging, pebble in tests).
@@ -65,6 +66,9 @@ func (c Config) Defaults() Config {
 	def(&c.Snapshots, "on")
 	if c.SnapshotKeep == 0 {
 		c.SnapshotKeep = 5
+	}
+	if c.ImageKeep == 0 {
+		c.ImageKeep = 10
 	}
 	if c.PreviewMax == 0 {
 		c.PreviewMax = 5
@@ -99,6 +103,9 @@ func (c Config) Validate() error {
 	}
 	if c.SnapshotKeep < 0 {
 		return fmt.Errorf("snapshot_keep must be positive")
+	}
+	if c.ImageKeep < 0 {
+		return fmt.Errorf("image_keep must be positive")
 	}
 	if c.PreviewMax < 0 {
 		return fmt.Errorf("preview_max must be positive")
@@ -153,6 +160,7 @@ func (c Config) Diff(o Config) []string {
 	add("tls", c.TLS, o.TLS)
 	add("snapshots", c.Snapshots, o.Snapshots)
 	add("snapshot_keep", c.SnapshotKeep, o.SnapshotKeep)
+	add("image_keep", c.ImageKeep, o.ImageKeep)
 	add("preview_max", c.PreviewMax, o.PreviewMax)
 	add("preview_ttl", c.PreviewTTL, o.PreviewTTL)
 	add("acme_directory", c.ACMEDirectory, o.ACMEDirectory)
@@ -225,6 +233,7 @@ ui: "127.0.0.1:9984"     # dashboard + registry for "vops ui" tunnels; ":9984" e
 tls: auto                # auto (let's encrypt) | off
 snapshots: on            # btrfs snapshots before every deploy | off
 snapshot_keep: 5         # automatic snapshots kept per project
+image_keep: 10           # registry gc keeps the images of the last N deploys per project (rollback, previews)
 preview_max: 5           # previews on this host at once (each one runs its own copy of the databases)
 preview_ttl: 3d          # previews not updated for this long are removed
 `, domain, email)
