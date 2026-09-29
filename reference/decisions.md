@@ -4,10 +4,10 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 
 ## Shape
 
-- **One binary, `vops`.** Same binary is the local CLI, the remote CLI and the daemon (`vops daemon`). Install = copy the binary over ssh. No scp, no rsync: `ssh host 'cat > file' < binary`.
+- **One binary, `vops`.** Same binary is the local CLI, the remote CLI, the daemon (`vops daemon`) and the proxy (`vops proxy`). Install = copy the binary over ssh. No scp, no rsync: `ssh host 'cat > file' < binary`.
 - **Go deps: 3.** `modernc.org/sqlite` (pure Go, keeps the binary static so it can be copied anywhere), `go.yaml.in/yaml/v3` (compose files; writing a YAML parser is not worth it), `golang.org/x/crypto/acme/autocert` (Let's Encrypt). Everything else is stdlib.
 - **Runtime deps on the host:** linux, systemd, podman (netavark backend), git. btrfs (+ btrfs-progs) enables snapshots and rollback; without it everything else works and the dashboard says why snapshots are off.
-- **The daemon is the reverse proxy.** No Caddy/Traefik/nginx. Rolling releases need to flip traffic the moment a new replica is ready; doing that in-process is a map swap instead of a config reload. TLS comes from autocert (HTTP-01 + TLS-ALPN-01).
+- **Our own reverse proxy, in its own process.** No Caddy/Traefik/nginx: rolling releases need to flip traffic the moment a new replica is ready, and our proxy does it with a map swap instead of a config reload. TLS comes from autocert (HTTP-01 + TLS-ALPN-01). It runs as `vops proxy` (`vops-proxy.service`), not inside the daemon: a panic, OOM or deadlock in the daemon, or an upgrade (which restarts it), used to take every site down. See "The proxy process".
 - **Local CLI talks to the host through ssh only.** `vops status` locally runs `ssh host ~/.vops/bin/vops status` there; the remote vops talks to the daemon over a unix socket (`~/.vops/vops.sock`). ssh is the auth. There is no public API besides the web UI.
 
 ## Paths on the host
@@ -24,7 +24,10 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 | `~/.vops/previews/<slug>/` | a preview's git worktree (and its bind-mounted data) |
 | `~/.vops/secret.key` | AES key for env values at rest |
 | `~/.vops/certs/` | ACME cache |
-| `~/.vops/vops.sock` | daemon socket |
+| `~/.vops/vops.sock` | daemon socket (the cli) |
+| `~/.vops/web.sock` | daemon socket for the proxy: `vops.<domain>` and `registry.<domain>` |
+| `~/.vops/proxy.sock` | proxy control socket: routing table, status, reload |
+| `~/.vops/routes.json` | the proxy's last routing table (it starts from it) |
 
 ## Git sync
 
@@ -97,9 +100,12 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 
 ## Install
 
-- `vops install user@host` checks arch/podman/git/systemd, uploads the binary and runs `vops setup` on the host, which: creates dirs, inits `~/vops`, writes the systemd unit, enables linger (non-root), starts the daemon and prints the admin password once.
-- root → system unit `/etc/systemd/system/vops.service`; non-root → user unit, needs `net.ipv4.ip_unprivileged_port_start<=80` (setup tells you the sudo command if it isn't).
-- `KillMode=process` so restarting the daemon never kills containers.
+- `vops install user@host` checks arch/podman/git/systemd and the host's vops version, uploads the binary and runs `vops setup` on the host, which: creates dirs, inits `~/vops`, writes the two systemd units, enables linger (non-root), restarts the daemon, (re)starts the proxy if needed and prints the admin password once. Running it again is the upgrade; there is no other command to learn.
+- root → system units in `/etc/systemd/system/`; non-root → user units, need `net.ipv4.ip_unprivileged_port_start<=80` (setup tells you the sudo command if it isn't).
+- `vops.service`: `KillMode=process` so restarting the daemon never kills containers. `vops-proxy.service`: no children, default kill mode, `RestartSec=1`.
+- Setup always restarts the daemon (new code) but the proxy only when it isn't running, its unit file changed, or it reports another `proxy.Version` over `proxy.sock`, since restarting it is the only thing that interrupts the sites. The binary is replaced with `mv`, so a proxy that keeps running keeps its old inode: fine, its behaviour is what `proxy.Version` describes.
+- Order: the daemon first, then the proxy. From v1.2 (one `vops.service` holding :80/:443) the restarted daemon no longer binds them, so the proxy starting next finds them free; if it doesn't (a slow stop), it exits and systemd retries every second, forever (`StartLimitIntervalSec=0`). Then setup asks the daemon to send its table (`POST /api/proxy/sync`), so the first start serves every route within a second or two. That migration costs a few seconds of downtime once, and setup says so.
+- Both units are `Type=notify` (READY=1 once the sockets are bound, so `systemctl restart` returns when the process really serves; no more "wait 2s before trusting is-active") with a watchdog (`WatchdogSec=60` daemon, `30` proxy). The ping is sent only while a request to the process's own unix socket succeeds, so a deadlocked process is restarted (SIGABRT: Go prints every goroutine to the journal), not only a dead one. The daemon says READY before starting stopped containers after a reboot, so a slow podman can't hit the start timeout (its socket answers meanwhile; applies wait for the engine lock). sd_notify is ~50 lines of stdlib (`internal/sdnotify`), a no-op outside systemd.
 
 ## depends_on, jobs, profiles
 
@@ -112,9 +118,9 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 
 - One config file, `vops.yml`, committed: domain, email, listeners, tls, snapshots, images kept (`image_keep`), preview limits. It is desired state like the compose files: a change shows up in the plan (`~ ui: a -> b`) and takes effect on apply.
 - The host keeps `~/.vops/config.yml`, a copy of the last applied `vops.yml` (the "lock"). The daemon always starts from the lock, never straight from the repo, so a broken or half-pushed `vops.yml` can't stop it: the plan warns "keeping the config in effect" and nothing changes.
-- `vops install` sends the local `vops.yml` to the host as its first lock, so the daemon starts with the right ports and tls before the first sync.
+- `vops install` sends the local `vops.yml` to the host as its first lock, so the daemon and the proxy start with the right ports and tls before the first sync.
 - A hand edit of the lock is drift: the next plan shows it and apply puts `vops.yml` back.
-- Listener changes (http, https, ui, tls, acme email) need new sockets: after apply the daemon re-execs itself (same pid, systemd doesn't notice; containers keep running, routes are rebuilt from labels). Everything else (domain, snapshots, preview limits) applies live.
+- Listener changes need new sockets, and only the process that owns them restarts, by re-exec'ing itself (same pid, systemd doesn't notice; containers keep running): http, https, tls, acme email restart the proxy (sites blink for a moment), `ui` restarts the daemon (sites don't notice). After writing the lock the daemon tells the proxy to re-read it (`POST /reload`); the proxy compares with what it runs and decides. Everything else (domain, snapshots, preview limits) applies live, in both.
 - Parsing is strict: a typo in `vops.yml` is an error, not a silently ignored key. Every key has a default, so a new key (like `image_keep`) absent from an existing `vops.yml` or lock changes nothing on upgrade.
 
 ## Snapshots and rollback
@@ -176,14 +182,31 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Registry basic-auth results are cached for 5 minutes (pbkdf2 per blob request would be slow); changing users or the admin password clears the cache.
 - HTTPS listens even before a domain exists (the domain arrives with the first sync); until then port 80 serves plain http.
 - Every `podman.Run` has a timeout (2m + the `-t` grace period; 30m for pull/build): a hung podman (storage lock, dead mount) would otherwise hold the deploy lock forever and block every apply and restart. Log streams are exempt.
-- The daemon crashing doesn't touch containers (`KillMode=process`, systemd restarts it in 2s, routes are rebuilt from labels), but the proxy lives in it: sites are down for those seconds.
+- The daemon crashing doesn't touch containers (`KillMode=process`, systemd restarts it in 2s, routes are rebuilt from labels) nor the sites (the proxy is another process). Only the dashboard and the registry are down for those seconds: the proxy answers 502 with a clear text for their hosts.
 - Tests share one isolated podman storage (`~/.cache/vops-test`) guarded by a file lock, so `go test ./...` runs packages in parallel safely.
 - The daemon idles at ~16MB RSS.
-- The systemd unit sets `HOME` explicitly (system units have none) and `StartLimitIntervalSec=0` (never give up restarting). `setup` waits 2s before trusting `is-active`.
+- The systemd units set `HOME` explicitly (system units have none) and `StartLimitIntervalSec=0` (never give up restarting).
 - Containers get `--log-driver journald` explicitly when journald is running: some distros (Fedora's podman image) default to k8s-file, which loses logs of removed replicas.
 - Removing a container counts as done when it is gone, even if podman errors cleaning up its network afterwards (seen with nested podman).
 - Changing only readiness settings (`health`, `timeout`, `strategy`) doesn't recreate containers; they aren't part of the service hash.
 - `just vps-test` is the production-like check: fake ssh in `go test` covers the logic fast, the vps container covers real sshd/systemd/root.
+
+## The proxy process
+
+- `vops proxy` owns :80/:443 from the config lock, autocert (same `~/.vops/certs`, same host policy: `vops.<domain>`, `registry.<domain>`, routed hosts), http→https redirects, HSTS and the routing table. It imports `config` and stdlib only: no sqlite, podman, registry or deploy engine, so there is little in it to crash.
+- The daemon has no public listener anymore. It keeps `vops.sock` (cli) and `ui` (loopback by default: `vops ui` tunnels and podman pulling from our registry), and serves `vops.<domain>` and `registry.<domain>` on `web.sock` (0600), where the proxy forwards them with a plain `httputil.ReverseProxy`: request and response bodies stream (registry pushes, log follows), no size limits, no read/write timeouts (only 10s for headers). The daemon trusts the forwarded client ip and scheme there (login events, `Secure` cookies). Daemon down → those two hosts answer 502 "the daemon is not running", every site keeps working.
+- Protocol, on `proxy.sock` (0600, http): `PUT /routes` swaps the whole table and answers after the swap, `GET /status` (proxy.Version, vops build, route count, table hash, pid, last push), `GET /routes`, `POST /reload` (re-read the lock), `GET /ping`.
+- The daemon stays the source of truth (routes rebuilt from podman labels). Every change of its table (`proxy.Table.OnChange`) sends the whole table, synchronously: a rolling release's switch returns after the proxy swapped its map, so drain-then-stop stays correct. Whole table, not diffs: tables are small, and a push can't be half-applied or out of order (pushes are serialized and always send the current table). The housekeeping tick (every minute) rebuilds from podman and resends, so drift heals by itself.
+- Proxy unreachable during a deploy: the deploy goes on (the proxy keeps serving its last table), the daemon logs it and records an event, and resends every second until the proxy answers (and records that too).
+- The proxy writes `routes.json` (write, fsync, rename) after each push that changes it, and loads it at start: it comes back with the right routes after its own restart even with the daemon dead. One writer, the proxy: the file is exactly what it last served. If the daemon wrote it instead, the file and the proxy's memory would be two copies with two writers, and a proxy that missed pushes while down would still need the daemon's retry, which already covers it.
+- `proxy.Version` (an int) is the proxy's behaviour plus this protocol. Bump it when either changes, and only then: that is what makes `vops setup` restart the proxy. A daemon change never needs it.
+- Visibility: `/api/status` has `proxy` (up, version, routes, in sync = the table hashes match), and adds a warning when it is down, out of sync or on another version. `vops status` prints it on the first line; the dashboard shows it in the top bar and the warnings on the overview.
+
+## Versions: cli vs host
+
+- The cli sends its version with every forwarded command (`VOPS_CLIENT=v1.3.0 ~/.vops/bin/vops --local ...`: an env assignment, so hosts from before the check just ignore it). The host refuses when major.minor differ, exit code 3: older cli → "update yours (go install ...)", newer cli → "run `vops install` to upgrade it". Patch differences are fine; `version` always answers; `setup` is exempt (install already decided). Dev builds (no parseable version) skip it with a one-line warning. Versions come from `-ldflags -X main.version` or the module/VCS version Go stamps (`v1.2.1-0.2026…+dirty` counts as 1.2).
+- No extra ssh round trip per command for this. A newer cli against a host from before the check can't be caught by the host; `sync`/`apply` catch it anyway: their plan carries the host's version since 1.3, so a plan without one is a 1.2-or-older host.
+- `vops install` reads the host's version in its probe and prints "installing", "upgrading vX → vY" or "reinstalling vX". Installing an older major.minor over a newer host is refused unless `--force` (a teammate with an old cli would otherwise downgrade production). With `--binary`, the version is asked from that binary (or read from its build info when it's for another arch).
 
 ## Previews
 

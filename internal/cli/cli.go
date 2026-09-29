@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -27,7 +28,8 @@ const usage = `vops: git push your containers to your own server.
 
 on your machine (inside the repo):
   init [--domain d] [--email e]      prepare the repo (vops.yml, .gitignore, registry/)
-  install user@host [--ssh-key k]    install vops on a host and link this repo to it
+  install user@host [--ssh-key k]    install or upgrade vops on a host and link this repo to it
+                                     (--force: install an older vops over a newer one)
   sync [-y]                          pull, push, show the plan, apply
   ui                                 open the dashboard through an ssh tunnel
 
@@ -58,6 +60,7 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
 
 on the host:
   daemon                             run the daemon (systemd does this)
+  proxy                              run the proxy on :80/:443 (systemd does this)
   setup                              create dirs, git repo, systemd unit (install does this)
 
 global flags: --host user@host, --port N, --ssh-key path (override vops-lock.yml)
@@ -78,6 +81,30 @@ func Main(args []string) int {
 	}
 	cmd, rest := rest[0], rest[1:]
 	var err error
+	// a forwarded command: refuse when the cli that sent it has another major.minor (setup: install decided)
+	if client := os.Getenv("VOPS_CLIENT"); client != "" && !slices.Contains([]string{"version", "--version", "help", "-h", "--help", "setup"}, cmd) {
+		err = checkClient(client)
+	}
+	if err == nil {
+		err = dispatch(g, cmd, rest)
+	}
+	if err != nil {
+		var ee *exitError
+		if errors.As(err, &ee) {
+			return ee.code
+		}
+		var ve *versionError
+		if errors.As(err, &ve) {
+			fmt.Fprintln(os.Stderr, "vops:", ve.msg)
+			return exitVersion
+		}
+		fmt.Fprintln(os.Stderr, "vops:", err)
+		return 1
+	}
+	return 0
+}
+
+func dispatch(g globals, cmd string, rest []string) (err error) {
 	switch cmd {
 	case "help", "-h", "--help":
 		fmt.Print(usage)
@@ -93,6 +120,8 @@ func Main(args []string) int {
 		err = cmdUI(g, rest)
 	case "daemon":
 		err = cmdDaemon()
+	case "proxy":
+		err = cmdProxy()
 	case "setup":
 		err = cmdSetup(rest)
 	case "apply":
@@ -110,15 +139,7 @@ func Main(args []string) int {
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)
 	}
-	if err != nil {
-		var ee *exitError
-		if errors.As(err, &ee) {
-			return ee.code
-		}
-		fmt.Fprintln(os.Stderr, "vops:", err)
-		return 1
-	}
-	return 0
+	return err
 }
 
 type exitError struct{ code int }

@@ -138,11 +138,17 @@ func (c Config) Previews() (max int, ttl time.Duration) {
 	return c.Defaults().PreviewMax, ttl
 }
 
-// Listeners reports whether two configs differ in anything that needs the daemon to restart.
-func (c Config) Listeners(o Config) bool {
-	return c.HTTP != o.HTTP || c.HTTPS != o.HTTPS || c.UI != o.UI || c.TLS != o.TLS || c.ACMEDirectory != o.ACMEDirectory ||
+// ProxyListeners reports whether the proxy's sockets or certificates change (the proxy restarts).
+func (c Config) ProxyListeners(o Config) bool {
+	return c.HTTP != o.HTTP || c.HTTPS != o.HTTPS || c.TLS != o.TLS || c.ACMEDirectory != o.ACMEDirectory ||
 		c.TLS == "auto" && c.Email != o.Email
 }
+
+// UIListener reports whether the daemon's ui listener changes (the daemon restarts).
+func (c Config) UIListener(o Config) bool { return c.UI != o.UI }
+
+// LockPath is the host copy of the last applied vops.yml (~/.vops/config.yml).
+func LockPath(vopsHome string) string { return filepath.Join(vopsHome, "config.yml") }
 
 // Diff lists changed fields as "name: old -> new".
 func (c Config) Diff(o Config) []string {

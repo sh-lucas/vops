@@ -60,6 +60,7 @@ type Engine struct {
 }
 
 type Plan struct {
+	Version  string         `json:"version,omitempty"` // the host's vops (the cli checks it: hosts before 1.3 don't check themselves)
 	Commit   string         `json:"commit"`
 	Domain   string         `json:"domain"`
 	Projects []*ProjectPlan `json:"projects"`
@@ -69,9 +70,10 @@ type Plan struct {
 
 // ConfigChange is vops.yml differing from the config in effect.
 type ConfigChange struct {
-	Changes []string      `json:"changes"`
-	Restart bool          `json:"restart"` // listeners change: the daemon restarts itself (containers keep running)
-	To      config.Config `json:"to"`
+	Changes      []string      `json:"changes"`
+	Restart      bool          `json:"restart"`       // the ui listener changes: the daemon restarts itself (containers keep running)
+	ProxyRestart bool          `json:"proxy_restart"` // http/https/tls change: the proxy restarts itself (sites blink)
+	To           config.Config `json:"to"`
 }
 
 type ProjectPlan struct {
@@ -146,6 +148,9 @@ func (p *Plan) Print(w io.Writer) {
 		fmt.Fprintln(w, "vops.yml")
 		for _, ch := range c.Changes {
 			fmt.Fprintf(w, "  ~ %s\n", ch)
+		}
+		if c.ProxyRestart {
+			fmt.Fprintln(w, "  (the proxy restarts to apply it: sites blink for a moment; containers keep running)")
 		}
 		if c.Restart {
 			fmt.Fprintln(w, "  (the daemon restarts to apply it; containers keep running)")
@@ -229,7 +234,7 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			plan.Warnings = append(plan.Warnings, fmt.Sprintf("%v: keeping the config in effect", err))
 			cfg = current
 		case cfg != current:
-			plan.Config = &ConfigChange{Changes: current.Diff(cfg), Restart: current.Listeners(cfg), To: cfg}
+			plan.Config = &ConfigChange{Changes: current.Diff(cfg), Restart: current.UIListener(cfg), ProxyRestart: current.ProxyListeners(cfg), To: cfg}
 		}
 	} else if err != nil {
 		return nil, err

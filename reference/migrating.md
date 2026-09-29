@@ -18,7 +18,7 @@ What worked moving a real server (docker compose + caddy + registry:2 + watchtow
 1. Stop the old proxy and apps (keep the old databases running), final dumps.
 2. Stop the new backends, drop/recreate the new databases, restore, compare row counts against the old databases. MySQL: `RESET BINARY LOGS AND GTIDS` before restoring a second dump into the same server, or it refuses the dump's `GTID_PURGED`.
 3. Start the new backends, stop the old databases.
-4. Switch `vops.yml` to `http: ":80"`, `https: ":443"` and sync: the daemon re-execs on the new ports, certificates are issued on the first request of each domain (~5s).
+4. Switch `vops.yml` to `http: ":80"`, `https: ":443"` and sync: the proxy re-execs on the new ports, certificates are issued on the first request of each domain (~5s).
 5. Test from outside: the same battery as the rehearsal, bodies against a baseline taken before starting, and the registry flow CI uses (login, pull, push).
 
 Rollback at any point: `systemctl --user stop vops` and `docker start` the old containers (nothing of the old stack is deleted; `restart: unless-stopped` keeps them stopped across reboots).

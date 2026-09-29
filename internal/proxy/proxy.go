@@ -3,6 +3,9 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json/v2"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -26,6 +29,9 @@ type Table struct {
 	mu       sync.RWMutex
 	services map[Key]entry
 	hosts    map[string]Key
+
+	// OnChange runs after every Set/Replace, synchronously (the daemon pushes the table to the proxy process with it).
+	OnChange func()
 }
 
 func NewTable() *Table { return &Table{services: map[Key]entry{}, hosts: map[string]Key{}} }
@@ -33,19 +39,19 @@ func NewTable() *Table { return &Table{services: map[Key]entry{}, hosts: map[str
 // Set replaces the domains and backends ("127.0.0.1:port") of a service. No backends removes it.
 func (t *Table) Set(k Key, domains, backends []string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	if len(backends) == 0 || len(domains) == 0 {
 		delete(t.services, k)
 	} else {
 		t.services[k] = entry{slices.Clone(domains), slices.Clone(backends), new(atomic.Uint64)}
 	}
 	t.reindex()
+	t.mu.Unlock()
+	t.changed()
 }
 
 // Replace swaps the whole table (used when rebuilding from podman).
 func (t *Table) Replace(all map[Key][2][]string) {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	t.services = map[Key]entry{}
 	for k, v := range all {
 		if len(v[0]) > 0 && len(v[1]) > 0 {
@@ -53,6 +59,23 @@ func (t *Table) Replace(all map[Key][2][]string) {
 		}
 	}
 	t.reindex()
+	t.mu.Unlock()
+	t.changed()
+}
+
+// SetRoutes swaps the whole table for a list of routes (what the proxy process receives).
+func (t *Table) SetRoutes(routes []Route) {
+	all := map[Key][2][]string{}
+	for _, r := range routes {
+		all[Key{r.Project, r.Service}] = [2][]string{r.Domains, r.Backends}
+	}
+	t.Replace(all)
+}
+
+func (t *Table) changed() {
+	if t.OnChange != nil {
+		t.OnChange()
+	}
 }
 
 func (t *Table) reindex() {
@@ -112,8 +135,15 @@ func (t *Table) Routes() []Route {
 	for k, e := range t.services {
 		out = append(out, Route{k.Project, k.Service, e.domains, e.backends})
 	}
-	slices.SortFunc(out, func(a, b Route) int { return strings.Compare(a.Project+a.Service, b.Project+b.Service) })
+	slices.SortFunc(out, func(a, b Route) int { return strings.Compare(a.Project+"/"+a.Service, b.Project+"/"+b.Service) })
 	return out
+}
+
+// Hash identifies a table's content, so the daemon and the proxy can tell whether they agree.
+func Hash(routes []Route) string {
+	b, _ := json.Marshal(routes)
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:8])
 }
 
 // Host normalizes a Host header: lowercase, no port.

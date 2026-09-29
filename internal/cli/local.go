@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"debug/buildinfo"
 	"encoding/json/v2"
 	"errors"
 	"flag"
@@ -21,6 +22,7 @@ import (
 	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/daemon"
 	"github.com/sh-lucas/vops/internal/deploy"
+	"github.com/sh-lucas/vops/internal/proxy"
 )
 
 func run(dir string, env []string, name string, args ...string) error {
@@ -127,6 +129,7 @@ var archNames = map[string]string{"x86_64": "amd64", "aarch64": "arm64", "armv7l
 func cmdInstall(g globals, args []string) error {
 	fs := flag.NewFlagSet("install", flag.ContinueOnError)
 	binary := fs.String("binary", "", "")
+	force := fs.Bool("force", false, "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -145,12 +148,18 @@ func cmdInstall(g globals, args []string) error {
 
 	fmt.Fprintf(os.Stderr, "checking %s\n", r.Host)
 	var probe bytes.Buffer
-	if err := r.Shell(`uname -m; for c in podman git systemctl; do command -v $c >/dev/null 2>&1 && echo has-$c; done; true`, nil, &probe); err != nil {
+	if err := r.Shell(`uname -m; for c in podman git systemctl; do command -v $c >/dev/null 2>&1 && echo has-$c; done; `+RemoteBin+` version 2>/dev/null; true`, nil, &probe); err != nil {
 		return err
 	}
-	lines := strings.Fields(probe.String())
-	if len(lines) == 0 {
+	lines := strings.Split(strings.TrimSpace(probe.String()), "\n")
+	if len(lines) == 0 || lines[0] == "" {
 		return errors.New("could not probe the host")
+	}
+	hostVersion := ""
+	for _, l := range lines {
+		if v, ok := strings.CutPrefix(l, "vops "); ok {
+			hostVersion = strings.TrimSpace(v)
+		}
 	}
 	arch := archNames[lines[0]]
 	var missing []string
@@ -170,6 +179,24 @@ func cmdInstall(g globals, args []string) error {
 		if bin, err = os.Executable(); err != nil {
 			return err
 		}
+	}
+	newVersion := Version
+	if *binary != "" {
+		newVersion = binaryVersion(bin)
+	}
+	hv, hok := parseVersion(hostVersion)
+	nv, nok := parseVersion(newVersion)
+	switch {
+	case hostVersion == "":
+		fmt.Fprintf(os.Stderr, "installing vops %s\n", newVersion)
+	case hostVersion == newVersion:
+		fmt.Fprintf(os.Stderr, "reinstalling vops %s\n", newVersion)
+	case hok && nok && nv.less(hv) && !*force:
+		return &versionError{fmt.Sprintf("the host runs vops %s, this is %s: installing it would downgrade the host. update yours (%s), or pass --force", hostVersion, newVersion, updateCmd)}
+	case hok && nok && nv.less(hv):
+		fmt.Fprintf(os.Stderr, "downgrading vops %s → %s (--force)\n", hostVersion, newVersion)
+	default:
+		fmt.Fprintf(os.Stderr, "upgrading vops %s → %s\n", hostVersion, newVersion)
 	}
 	f, err := os.Open(bin)
 	if err != nil {
@@ -201,6 +228,19 @@ func cmdInstall(g globals, args []string) error {
 		fmt.Printf("\nlinked %s to %s (vops-lock.yml, git remote \"vops\"); next: vops sync\n", root, r.Host)
 	}
 	return nil
+}
+
+// binaryVersion asks a vops binary its version (it may be for another arch: then its build info says).
+func binaryVersion(bin string) string {
+	if out, err := exec.Command(bin, "version").Output(); err == nil {
+		if v, ok := strings.CutPrefix(strings.TrimSpace(string(out)), "vops "); ok {
+			return v
+		}
+	}
+	if bi, err := buildinfo.ReadFile(bin); err == nil && bi.Main.Version != "" && bi.Main.Version != "(devel)" {
+		return bi.Main.Version
+	}
+	return "dev"
 }
 
 func linkRepo(root string, r *Remote) error {
@@ -301,6 +341,11 @@ func applyFlow(g globals, yes bool, commit string, projects []string, trigger st
 	var plan deploy.Plan
 	if err := json.Unmarshal(buf.Bytes(), &plan); err != nil {
 		return fmt.Errorf("plan: %w", err)
+	}
+	if r, _ := g.remote(); r != nil {
+		if err := checkPlanVersion(plan.Version); err != nil {
+			return err
+		}
 	}
 	if commit != "" && plan.Commit != commit {
 		return fmt.Errorf("the host is at %.12s, expected %.12s", plan.Commit, commit)
@@ -453,18 +498,41 @@ func cmdDaemon() error {
 	if err != nil {
 		return err
 	}
+	d.Version = Version
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
-	err = d.Run(ctx)
-	if errors.Is(err, daemon.ErrRestart) {
-		// new listeners from vops.yml: become a fresh daemon, same pid (systemd doesn't notice)
-		exe, xerr := os.Executable()
-		if xerr != nil {
-			return xerr
-		}
-		return syscall.Exec(strings.TrimSuffix(exe, " (deleted)"), os.Args, os.Environ())
+	if err := d.Run(ctx); !errors.Is(err, daemon.ErrRestart) {
+		return err
 	}
-	return err
+	return reexec() // a new ui listener from vops.yml
+}
+
+// cmdProxy runs the proxy process: :80/:443, certificates, the routing table the daemon sends.
+func cmdProxy() error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+	vh, _ := daemon.Paths(home)
+	s, err := proxy.NewServer(vh, Version)
+	if err != nil {
+		return err
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := s.Run(ctx); !errors.Is(err, proxy.ErrRestart) {
+		return err
+	}
+	return reexec() // new http/https/tls from vops.yml
+}
+
+// reexec becomes a fresh process with the same pid (systemd doesn't notice; the new one sends READY again).
+func reexec() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	return syscall.Exec(strings.TrimSuffix(exe, " (deleted)"), os.Args, os.Environ())
 }
 
 // ---- rollback: show what it does (per service, the data, the code), ask, then do exactly that

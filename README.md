@@ -5,10 +5,10 @@ vops is a cli and a daemon to self-host containers with less pain and overhead t
 
 ## State, development, lifecycle
 
-**v1.2, in production on one real server.** Everything below "Features" is covered by end-to-end tests against real podman (rootless) and by a production-like check (`just vps-test`: systemd + real sshd + podman in a container, rolling release under load with 0 failed requests). It also runs a real VPS (Ubuntu 24.04, ext4, rootless as a normal user with linger, real DNS and Let's Encrypt), migrated from docker compose + caddy + registry:2 + watchtower with about 1m20s of downtime: [reference/migrating.md](reference/migrating.md). It survived an `apt upgrade` + reboot: linger starts the daemon, which brings every project back in dependency order (~7s for 6 containers).
+**v1.3, in production on one real server.** Everything below "Features" is covered by end-to-end tests against real podman (rootless) and by a production-like check (`just vps-test`: systemd + real sshd + podman in a container, an in-place upgrade from v1.2, then an upgrade, a daemon SIGKILL and a rolling release under load with 0 failed requests). It also runs a real VPS (Ubuntu 24.04, ext4, rootless as a normal user with linger, real DNS and Let's Encrypt), migrated from docker compose + caddy + registry:2 + watchtower with about 1m20s of downtime: [reference/migrating.md](reference/migrating.md). It survived an `apt upgrade` + reboot: linger starts the daemon, which brings every project back in dependency order (~7s for 6 containers).
 
 - Runtime deps on the host: linux, systemd, podman 4+ (netavark), git. btrfs (+ btrfs-progs) for snapshots and data rollback (image rollback works without it); everything else works without it.
-- The daemon idles at ~16MB RSS. The binary is static, ~13MB.
+- Two processes of the same binary: the daemon (deploys, registry, dashboard; idles at ~16MB RSS) and a small proxy that owns :80/:443. The binary is static, ~13MB.
 - Why things are the way they are: [reference/decisions.md](reference/decisions.md).
 
 ## How it works
@@ -18,10 +18,10 @@ your laptop                                   the host
 ./ (git repo)  --- git push over ssh --->     ~/vops/ (working tree, updated on push)
   vops.yml                                      shop/api/compose.yml  -> containers
   shop/api/compose.yml                          registry/data/        -> your images
-  vops-lock.yml (gitignored)                  ~/.vops/                -> sqlite, certs, binary, socket
+  vops-lock.yml (gitignored)                  ~/.vops/                -> sqlite, certs, binary, sockets
 ```
 
-`vops sync` pulls from the host, pushes to it, shows what will change and asks before applying. The daemon runs the containers with podman, routes `https://<service>.<project>.<domain>` to them, gets certificates from Let's Encrypt, serves a registry at `registry.<domain>` and a dashboard at `vops.<domain>`.
+`vops sync` pulls from the host, pushes to it, shows what will change and asks before applying. The daemon runs the containers with podman and serves a registry at `registry.<domain>` and a dashboard at `vops.<domain>`. The proxy, a separate process, routes `https://<service>.<project>.<domain>` to the containers and gets certificates from Let's Encrypt; it keeps serving when the daemon crashes or is upgraded.
 
 ## Install
 
@@ -29,7 +29,7 @@ your laptop                                   the host
 go install github.com/sh-lucas/vops/cmd/vops@latest   # go 1.27+, puts vops in $(go env GOPATH)/bin
 ```
 
-`vops install` copies this same binary to the host, so it must match the host (linux, same arch). From a mac or for an arm64 host:
+`vops install` copies this same binary to the host, so it must match the host (linux, same arch). Running it again upgrades the host in place (from v1.2 too: the proxy moves to its own service, a few seconds of downtime once). The cli and the host must run the same major.minor: a mismatch is refused with what to do (update yours, or `vops install` to upgrade the host); patch versions may differ. From a mac or for an arm64 host:
 
 ```sh
 GOOS=linux GOARCH=arm64 go install github.com/sh-lucas/vops/cmd/vops@latest
@@ -102,7 +102,7 @@ git add -A && git commit -m site && vops sync
 
 ### Config
 - Everything is in `vops.yml` at the repo root (`vops init` writes it with comments): domain, email, listeners, tls, snapshots, images kept, preview limits. Changes show up in the plan and take effect on apply, like compose files.
-- The host keeps the last applied copy in `~/.vops/config.yml` and always runs from it, so a broken `vops.yml` never breaks the daemon. New listeners restart the daemon in place (containers keep running).
+- The host keeps the last applied copy in `~/.vops/config.yml` and always runs from it, so a broken `vops.yml` never breaks the daemon. New http/https/tls restart the proxy in place (sites blink for a moment), a new `ui` the daemon (sites don't notice); containers keep running.
 
 ### Registry
 - Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).
@@ -110,6 +110,12 @@ git add -A && git commit -m site && vops sync
 - The dashboard admin pulls everything and pushes nothing.
 - Pushing a tag that a service runs redeploys it (rolling). No watchtower. Opt out with `x-vops.watch: false`. Tags like `preview-pr-42` create previews instead (see Previews).
 - Garbage collection: dashboard button, `vops registry gc`, and daily. It keeps untagged images that pins, previews and the last `image_keep` deploys of each project run.
+
+### Proxy
+- Our own, in its own process (`vops-proxy.service`): :80/:443, Let's Encrypt, http→https, HSTS, routing to containers. It knows nothing about sqlite, podman or the registry.
+- The daemon crashing, deadlocking (a watchdog restarts both) or being upgraded never takes the sites down; the dashboard and registry hosts answer 502 until it's back. `vops install` restarts the proxy only when the proxy itself changed.
+- The daemon sends it the routing table on every change and waits for the swap (rolling releases stay zero-downtime); the proxy keeps its last table on disk, so it restarts with the right routes even with the daemon down.
+- `vops status` and the dashboard's top bar show whether it is up, its version and routes, and warn when it is down or out of sync.
 
 ### Dashboard
 - `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`.
@@ -125,7 +131,7 @@ Know these before putting something important on it:
 
 - **Compose is a subset, run by vops itself** (not podman-compose): it translates each service into `podman run`. Unsupported keys are errors, never silently ignored. Not supported: `secrets`, `configs`, `extends`, `links`, `container_name`, `depends_on.restart`, `network_mode: service:x`, most of `deploy`. Full list: [reference/compose.md](reference/compose.md).
 - **Semantics that differ from compose:** containers are named `vops-...` (so `podman compose ps` doesn't see them), `restart` defaults to `unless-stopped`, every `depends_on` waits for readiness, and during a rolling release two versions run side by side for a few seconds.
-- **One host.** No clustering, no failover; the daemon, proxy and registry run on the same machine as the containers.
+- **One host.** No clustering, no failover; the daemon, proxy and registry run on the same machine as the containers. The proxy is a separate process, so a daemon crash or upgrade doesn't stop the sites, but the host (and the proxy restarting for new http/https/tls) still does.
 - **Podman only, netavark only.** CNI setups can't resolve service names.
 - **Env values are hidden from the api and dashboard, not from the host:** anyone with a shell on the host can see them with `podman inspect`.
 - **Recreate means downtime:** services with published `ports`, without `x-vops.port`, or on a network whose definition changed are stopped before the new container starts.
@@ -140,7 +146,7 @@ Know these before putting something important on it:
 ## Commands
 
 ```
-vops init | install user@host | sync [-y] | ui
+vops init | install user@host [--force] | sync [-y] | ui
 vops status | plan | apply [-y] [project...]
 vops logs <project> [service] [-f] [-n N] [--grep s] [--since t] [--until t]
 vops restart <project> [service] | enable <project> | disable <project>
@@ -153,7 +159,7 @@ vops preview up <project> --name n [--image svc=ref]... [--ref r] [--from id]
 vops preview ls [project] | rm <project> <name>
 ```
 
-Inside a linked repo commands run on the host over ssh; on the host they talk to the daemon directly.
+Inside a linked repo commands run on the host over ssh; on the host they talk to the daemon directly. On the host, systemd runs `vops daemon` and `vops proxy`.
 
 ## Development
 
@@ -165,4 +171,4 @@ just gen        # sqlc generate (after editing internal/store/queries.sql or mig
 just vps-test   # systemd + real sshd + podman in a container as the host (slow, needs network)
 ```
 
-Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api, previews from registry tags, a push recorded in the history, a preview of a past deploy by digest, an image rollback with its pin and unpin), `internal/deploy` checks zero failed requests during a rolling release, runs a destructive migration in a preview of a real postgres, walks the deploy history (deploys, a failed one, rollback and undo, a preview from a past deploy) and rolls images back through its own registry (zero failed requests, pins ending on a push or a compose change, images and data together, gc keeping what rollback needs), `internal/registry` pushes and pulls with real podman.
+Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api, previews from registry tags, a push recorded in the history, a preview of a past deploy by digest, an image rollback with its pin and unpin; the proxy as its own process: a rolling release through it with zero failed requests, the daemon SIGKILLed while sites answer, the proxy restarting from its table on disk with the daemon dead, a deploy while the proxy is down; cli/host version mismatches, upgrade and refused downgrade), `just vps-test` upgrades a real v1.2 host (systemd) in place and checks an upgrade and a daemon SIGKILL under load with zero failed requests, `internal/deploy` checks zero failed requests during a rolling release, runs a destructive migration in a preview of a real postgres, walks the deploy history (deploys, a failed one, rollback and undo, a preview from a past deploy) and rolls images back through its own registry (zero failed requests, pins ending on a push or a compose change, images and data together, gc keeping what rollback needs), `internal/registry` pushes and pulls with real podman.

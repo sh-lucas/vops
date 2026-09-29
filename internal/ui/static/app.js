@@ -344,11 +344,16 @@ document.addEventListener("keydown", (e) => { if (e.key === "Escape") document.b
 $pending.append(h("span", { class: "dot warn" }), h("span", {}, "Pending", h("span", { class: "long" }, " changes")));
 $pending.onclick = openPlan;
 
+// the proxy process serves every site; the dashboard may still be up (ui listener, `vops ui`) when it isn't
+const proxyChip = (px) => !px ? null : h("span", { title: px.up ? "proxy v" + px.version + " serves " + px.routes + " routes" + (px.in_sync ? "" : ", not the daemon's current table") : "the proxy is not running: sites are down" },
+  h("span", { class: "dot " + (!px.up ? "bad" : px.in_sync ? "ok" : "warn") }), px.up ? "proxy · " + px.routes : "proxy down");
+
 let sideSig = "";
 function renderChrome(st) {
   $hoststat.replaceChildren(
     h("span", { title: "~/vops on the host is at this commit" }, icon("commit"), h("span", { class: "mono" }, short(st.commit, 8) || "no commits")),
-    h("span", { class: "dom", title: "domain (vops.yml)" }, icon("globe"), st.domain || "no domain"));
+    h("span", { class: "dom", title: "domain (vops.yml)" }, icon("globe"), st.domain || "no domain"),
+    proxyChip(st.proxy));
   $pending.hidden = !st.changes;
   const sig = JSON.stringify([st.projects.map((p) => [p.path, health(p)]), st.previews]);
   if (sig !== sideSig) {

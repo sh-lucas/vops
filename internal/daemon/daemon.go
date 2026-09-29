@@ -20,13 +20,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/crypto/acme"
-	"golang.org/x/crypto/acme/autocert"
-
 	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
+	"github.com/sh-lucas/vops/internal/sdnotify"
 	"github.com/sh-lucas/vops/internal/store"
 )
 
@@ -34,15 +32,19 @@ type Daemon struct {
 	Home string // ~/.vops
 	Repo string // ~/vops
 
-	DB     *store.DB
-	Reg    *registry.Registry
-	Engine *deploy.Engine
-	Routes *proxy.Table
+	DB      *store.DB
+	Reg     *registry.Registry
+	Engine  *deploy.Engine
+	Routes  *proxy.Table // the source of truth; every change is pushed to the proxy process
+	Version string       // this build, for /api/plan
 
-	cfg       atomic.Pointer[config.Config] // the lock (~/.vops/config.yml): what is in effect
-	restart   chan struct{}                 // listeners changed: Run returns ErrRestart
-	pullToken string
-	authCache sync.Map // sha256(user:pass) -> cachedAuth
+	cfg        atomic.Pointer[config.Config] // the lock (~/.vops/config.yml): what is in effect
+	restart    chan struct{}                 // the ui listener changed: Run returns ErrRestart
+	pullToken  string
+	authCache  sync.Map // sha256(user:pass) -> cachedAuth
+	proxy      *proxy.Client
+	pushMu     sync.Mutex
+	proxyDirty atomic.Bool // the last push failed: retried every second
 }
 
 type cachedAuth struct {
@@ -57,11 +59,11 @@ func Paths(home string) (vopsHome, repo string) {
 
 func SocketPath(vopsHome string) string { return filepath.Join(vopsHome, "vops.sock") }
 
-// ErrRestart: the daemon must be restarted (re-exec'd) to apply new listeners.
+// ErrRestart: the daemon must be restarted (re-exec'd) to apply a new ui listener.
 var ErrRestart = errors.New("restart")
 
 // LockPath is the host copy of the last applied vops.yml.
-func LockPath(vopsHome string) string { return filepath.Join(vopsHome, "config.yml") }
+func LockPath(vopsHome string) string { return config.LockPath(vopsHome) }
 
 // New opens the state. It does not listen yet.
 func New(vopsHome, repo string) (*Daemon, error) {
@@ -89,8 +91,9 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1)}
+	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1), proxy: proxy.NewClient(vopsHome)}
 	d.cfg.Store(&host)
+	d.Routes.OnChange = d.pushRoutes
 	reg.Auth = d.registryAuth
 	reg.OnPush = d.onPush
 	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
@@ -106,7 +109,8 @@ func New(vopsHome, repo string) (*Daemon, error) {
 }
 
 // applyConfig makes a new vops.yml take effect: write the lock, update what can change live,
-// and restart the daemon when listeners change. Called by apply (engine lock held).
+// tell the proxy (it re-execs itself for new http/https/tls), and restart the daemon for a new ui listener.
+// Called by apply (engine lock held).
 func (d *Daemon) applyConfig(c config.Config, w io.Writer) error {
 	old := *d.cfg.Load()
 	if err := config.WriteLockFile(LockPath(d.Home), c); err != nil {
@@ -116,14 +120,69 @@ func (d *Daemon) applyConfig(c config.Config, w io.Writer) error {
 	d.Engine.SnapshotKeep, d.Engine.SnapshotsOff = c.SnapshotKeep, c.Snapshots == "off"
 	d.Engine.PreviewMax, d.Engine.PreviewTTL = c.Previews()
 	d.DB.Event("", "config", "vops.yml applied: %s", strings.Join(old.Diff(c), ", "))
-	if old.Listeners(c) {
-		fmt.Fprintln(w, "vops.yml: listeners changed, the daemon restarts in a second (containers keep running)")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if restart, err := d.proxy.Reload(ctx); err != nil {
+		fmt.Fprintf(w, "vops.yml: ! the proxy did not take it (%v); it reads it when it starts\n", err)
+	} else if restart {
+		fmt.Fprintln(w, "vops.yml: listeners changed, the proxy restarts (sites blink for a moment; containers keep running)")
+	}
+	if old.UIListener(c) {
+		fmt.Fprintln(w, "vops.yml: ui listener changed, the daemon restarts in a second (containers keep running)")
 		go func() {
 			time.Sleep(time.Second) // let the apply response finish
 			d.restart <- struct{}{}
 		}()
 	}
 	return nil
+}
+
+// pushRoutes sends the whole table to the proxy process and returns once the proxy serves it, so a rolling
+// release drains the old replicas only after traffic moved. A proxy that is down never fails a deploy:
+// it keeps serving its last table, and the push is retried every second until it answers.
+func (d *Daemon) pushRoutes() {
+	d.pushMu.Lock()
+	defer d.pushMu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := d.proxy.Push(ctx, d.Routes.Routes())
+	switch was := d.proxyDirty.Swap(err != nil); {
+	case err != nil && !was:
+		log.Printf("proxy: %v (it serves its last table; retrying)", err)
+		d.DB.Event("", "error", "proxy unreachable, routes not sent: %v (sites keep the routes it had; retrying every second)", err)
+	case err == nil && was:
+		log.Print("proxy: reachable again, routes sent")
+		d.DB.Event("", "config", "proxy reachable again, routes sent")
+	}
+}
+
+// ProxyState is what /api/status says about the proxy process.
+type ProxyState struct {
+	Up      bool   `json:"up"`
+	Version int    `json:"version"`
+	Binary  string `json:"binary,omitempty"`
+	Routes  int    `json:"routes"`
+	InSync  bool   `json:"in_sync"`
+	Error   string `json:"error,omitempty"`
+}
+
+func (d *Daemon) proxyState(ctx context.Context) (ProxyState, []string) {
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	st, err := d.proxy.Status(ctx)
+	if err != nil {
+		return ProxyState{Error: err.Error()}, []string{"the proxy is not running: sites are down until it is back (it restarts by itself; check: journalctl -u vops-proxy)"}
+	}
+	ours := d.Routes.Routes()
+	ps := ProxyState{Up: true, Version: st.Version, Binary: st.Binary, Routes: st.Routes, InSync: st.Hash == proxy.Hash(ours)}
+	var warns []string
+	if !ps.InSync {
+		warns = append(warns, fmt.Sprintf("the proxy serves %d routes, the daemon has %d: they are resent every minute (if it lasts, restart vops-proxy)", st.Routes, len(ours)))
+	}
+	if st.Version != proxy.Version {
+		warns = append(warns, fmt.Sprintf("the proxy runs protocol v%d, this vops expects v%d: run `vops install` again", st.Version, proxy.Version))
+	}
+	return ps, warns
 }
 
 // loopback turns ":9984" or "0.0.0.0:9984" into "127.0.0.1:9984" (what podman pulls from).
@@ -240,8 +299,8 @@ func (l *logWriter) Write(p []byte) (int, error) {
 
 // ---- serving
 
-// Handler routes by Host: vops.<domain> is the ui, registry.<domain> the registry, anything else the proxy.
-func (d *Daemon) Handler() http.Handler {
+// WebHandler serves web.sock: what the proxy forwards for vops.<domain> (the ui) and registry.<domain>.
+func (d *Daemon) WebHandler() http.Handler {
 	ui := d.UIHandler()
 	regOnly := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v2" || strings.HasPrefix(r.URL.Path, "/v2/") {
@@ -250,16 +309,29 @@ func (d *Daemon) Handler() http.Handler {
 		}
 		http.Error(w, "this is a container registry: podman login "+r.Host, http.StatusNotFound)
 	})
-	routes := proxy.Handler(d.Routes)
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return fromProxy(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch h := proxy.Host(r.Host); {
 		case h != "" && h == d.uiHost():
 			ui.ServeHTTP(w, r)
 		case h != "" && h == d.registryHost():
 			regOnly.ServeHTTP(w, r)
 		default:
-			routes.ServeHTTP(w, r)
+			http.Error(w, "vops: no such site", http.StatusNotFound)
 		}
+	}))
+}
+
+// fromProxy trusts what the proxy forwarded (web.sock is 0600, only the proxy talks to it): the client's
+// address for login events, and https, so session cookies stay Secure.
+func fromProxy(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
+			r.RemoteAddr = strings.TrimSpace(ip[strings.LastIndex(ip, ",")+1:])
+		}
+		if r.Header.Get("X-Forwarded-Proto") == "https" {
+			r.TLS = &tls.ConnectionState{}
+		}
+		h.ServeHTTP(w, r)
 	})
 }
 
@@ -284,95 +356,54 @@ func securityHeaders(h http.Handler) http.Handler {
 	})
 }
 
-// Run serves until ctx is done.
+// Run serves until ctx is done. The daemon has no public listener: the proxy process owns :80/:443 and
+// forwards the ui and registry hosts to web.sock.
 func (d *Daemon) Run(ctx context.Context) error {
 	log.SetFlags(0)
-	d.Engine.StartStopped(ctx, &logWriter{prefix: "boot: "})
-
 	cfg := *d.cfg.Load()
 	var servers []*http.Server
 	errc := make(chan error, 4)
-	serve := func(name string, l net.Listener, h http.Handler, tlsCfg *tls.Config) {
-		srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, TLSConfig: tlsCfg}
+	serve := func(name string, l net.Listener, h http.Handler) {
+		srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
 		servers = append(servers, srv)
 		log.Printf("listening on %s (%s)", l.Addr(), name)
 		go func() {
-			var err error
-			if tlsCfg != nil {
-				err = srv.ServeTLS(l, "", "")
-			} else {
-				err = srv.Serve(l)
-			}
-			if !errors.Is(err, http.ErrServerClosed) {
+			if err := srv.Serve(l); !errors.Is(err, http.ErrServerClosed) {
 				errc <- fmt.Errorf("%s: %w", name, err)
 			}
 		}()
 	}
-
-	sock := SocketPath(d.Home)
-	os.Remove(sock)
-	sl, err := net.Listen("unix", sock)
+	unix := func(path string) (net.Listener, error) {
+		os.Remove(path)
+		l, err := net.Listen("unix", path)
+		if err == nil {
+			os.Chmod(path, 0o600)
+		}
+		return l, err
+	}
+	sl, err := unix(SocketPath(d.Home))
 	if err != nil {
 		return err
 	}
-	os.Chmod(sock, 0o600)
-	serve("socket", sl, d.API(true), nil)
-
+	serve("socket", sl, d.API(true))
+	wl, err := unix(proxy.WebSocket(d.Home))
+	if err != nil {
+		return err
+	}
+	serve("web, from the proxy", wl, d.WebHandler())
 	if cfg.UI != "" && cfg.UI != "off" {
 		l, err := net.Listen("tcp", cfg.UI)
 		if err != nil {
 			return fmt.Errorf("ui: %w", err)
 		}
-		serve("ui", l, d.UIHandler(), nil)
+		serve("ui", l, d.UIHandler())
 	}
+	sdnotify.Notify("READY=1")
+	go sdnotify.Watchdog(ctx, d.ping)
 
-	main := d.Handler()
-	listen := func(addr string) (net.Listener, error) {
-		if addr == "" || addr == "off" {
-			return nil, nil
-		}
-		return net.Listen("tcp", addr)
-	}
-	if cfg.TLS != "off" && cfg.HTTPS != "" && cfg.HTTPS != "off" {
-		// always listen: the domain may only arrive with the first sync
-		m := &autocert.Manager{
-			Prompt:     autocert.AcceptTOS,
-			Cache:      autocert.DirCache(filepath.Join(d.Home, "certs")),
-			Email:      cfg.Email,
-			HostPolicy: d.hostPolicy,
-		}
-		if cfg.ACMEDirectory != "" {
-			m.Client = &acme.Client{DirectoryURL: cfg.ACMEDirectory}
-		}
-		l, err := listen(cfg.HTTPS)
-		if err != nil {
-			return fmt.Errorf("https: %w", err)
-		}
-		tlsCfg := m.TLSConfig()
-		tlsCfg.MinVersion = tls.VersionTLS12
-		serve("https", l, hsts(main), tlsCfg)
-		if l, err := listen(cfg.HTTP); err != nil {
-			return fmt.Errorf("http: %w", err)
-		} else if l != nil {
-			// acme challenges, then https redirects for hosts we serve; plain http until a domain is set
-			serve("http", l, m.HTTPHandler(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				if d.domain() == "" {
-					main.ServeHTTP(w, r)
-					return
-				}
-				if d.hostPolicy(r.Context(), proxy.Host(r.Host)) != nil {
-					http.NotFound(w, r)
-					return
-				}
-				http.Redirect(w, r, "https://"+proxy.Host(r.Host)+r.URL.RequestURI(), http.StatusMovedPermanently)
-			})), nil)
-		}
-	} else if l, err := listen(cfg.HTTP); err != nil {
-		return fmt.Errorf("http: %w", err)
-	} else if l != nil {
-		serve("http, tls off", l, main, nil)
-	}
-
+	// after a reboot: start what should run; this also sends the routes to the proxy
+	d.Engine.StartStopped(ctx, &logWriter{prefix: "boot: "})
+	go d.retryProxy(ctx)
 	go d.housekeeping(ctx)
 	select {
 	case <-ctx.Done():
@@ -389,23 +420,41 @@ func (d *Daemon) Run(ctx context.Context) error {
 	return err
 }
 
-func hsts(h http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Strict-Transport-Security", "max-age=31536000")
-		h.ServeHTTP(w, r)
-	})
-}
-
-// hostPolicy only lets autocert ask for certificates of hosts we serve.
-func (d *Daemon) hostPolicy(_ context.Context, host string) error {
-	if host == d.uiHost() || host == d.registryHost() || d.Routes.Has(host) {
-		return nil
+// ping is the watchdog's health check: the daemon's own socket answers.
+func (d *Daemon) ping(ctx context.Context) error {
+	c := &http.Client{Transport: &http.Transport{DisableKeepAlives: true, DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", SocketPath(d.Home))
+	}}}
+	req, _ := http.NewRequestWithContext(ctx, "GET", "http://vops/api/ping", nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		return err
 	}
-	return fmt.Errorf("vops: unknown host %q", host)
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return errors.New(resp.Status)
+	}
+	return nil
 }
 
-// housekeeping: daily registry GC of uploads, route refresh in case a container restarted on its own,
-// expired previews.
+// retryProxy resends the table every second while the proxy is unreachable.
+func (d *Daemon) retryProxy(ctx context.Context) {
+	tick := time.NewTicker(time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		if d.proxyDirty.Load() {
+			d.pushRoutes()
+		}
+	}
+}
+
+// housekeeping: daily registry GC of uploads, route refresh in case a container restarted on its own
+// (which also resends the whole table to the proxy, so drift heals), expired previews.
 func (d *Daemon) housekeeping(ctx context.Context) {
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()

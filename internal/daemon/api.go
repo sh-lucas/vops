@@ -66,14 +66,16 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Project string `json:"project"`
 			Name    string `json:"name"`
 		}
+		px, pwarns := d.proxyState(r.Context())
 		out := struct {
-			Domain   string    `json:"domain"`
-			Commit   string    `json:"commit"`
-			Changes  bool      `json:"changes"`
-			Warnings []string  `json:"warnings"`
-			Projects []project `json:"projects"`
-			Previews []preview `json:"previews"`
-		}{plan.Domain, plan.Commit, plan.Changes(), plan.Warnings, []project{}, []preview{}}
+			Domain   string     `json:"domain"`
+			Commit   string     `json:"commit"`
+			Changes  bool       `json:"changes"`
+			Warnings []string   `json:"warnings"`
+			Projects []project  `json:"projects"`
+			Previews []preview  `json:"previews"`
+			Proxy    ProxyState `json:"proxy"`
+		}{plan.Domain, plan.Commit, plan.Changes(), append(pwarns, plan.Warnings...), []project{}, []preview{}, px}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
 			var ld *store.Deploy
@@ -90,11 +92,17 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		return nil
 	})
 
+	h("GET /api/ping", func(w http.ResponseWriter, r *http.Request) error {
+		_, err := io.WriteString(w, "ok\n")
+		return err
+	})
+
 	h("GET /api/plan", func(w http.ResponseWriter, r *http.Request) error {
 		plan, err := d.Engine.Plan(r.Context())
 		if err != nil {
 			return err
 		}
+		plan.Version = d.Version
 		if r.URL.Query().Get("format") == "text" {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			plan.Print(w)
@@ -556,6 +564,20 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	})
 
 	if trusted {
+		// `vops setup` after starting the proxy: rebuild the table from podman and send it now
+		h("POST /api/proxy/sync", func(w http.ResponseWriter, r *http.Request) error {
+			var err error
+			d.Engine.Lock(func() { err = d.Engine.RefreshRoutes(r.Context()) })
+			if err != nil {
+				return err
+			}
+			if d.proxyDirty.Load() {
+				return errors.New("the proxy did not take the routes")
+			}
+			writeJSON(w, map[string]int{"routes": len(d.Routes.Routes())})
+			return nil
+		})
+
 		h("POST /api/admin/password", func(w http.ResponseWriter, r *http.Request) error {
 			var in struct{ Password string }
 			if err := readJSON(r, &in); err != nil {

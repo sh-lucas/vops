@@ -78,9 +78,10 @@ func (r *Remote) Shell(script string, stdin io.Reader, stdout io.Writer) error {
 	return nil
 }
 
-// Run runs `vops --local <args>` on the host.
+// Run runs `vops --local <args>` on the host. VOPS_CLIENT tells the host which cli sent it: a host
+// with another major.minor refuses (exit 3); hosts before 1.3 ignore it.
 func (r *Remote) Run(args []string, stdin io.Reader, stdout io.Writer, tty bool) error {
-	q := []string{RemoteBin, "--local"}
+	q := []string{"VOPS_CLIENT=" + shellQuote(Version), RemoteBin, "--local"}
 	for _, a := range args {
 		q = append(q, shellQuote(a))
 	}

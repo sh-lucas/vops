@@ -6,6 +6,7 @@ README.md has the expected features, AGENTS.md has system instructions, referenc
 Read it, and keep it up to date.
 
 Map: reference/decisions.md records every design decision (update it when you make or change one), reference/compose.md the supported compose subset, reference/architecture.md the package map. `just test` runs everything (needs podman). TODO.md has the next ideas with design sketches.
+Bump `proxy.Version` (internal/proxy/server.go) when the proxy's behaviour or the daemon<->proxy protocol changes, and only then: `vops install` restarts the proxy (every site blinks) only when that number differs.
 SQL lives in internal/store/queries.sql and internal/store/migrations/ (new file per change, never edit an applied one); run `just gen` (sqlc) and commit the generated internal/store/queries/.
 
 On simple stuff, use subagents, but keep them around for the next batch of features and give instruction by instruction to avoid context creep. sonnet 5 is recommended in this case. For complex stuff, orchestrate: a single agent that handles the whole thing, and you just think about the high level product and UX.

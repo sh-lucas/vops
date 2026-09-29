@@ -153,29 +153,41 @@ func (w *world) eventually(what string, fn func() bool) {
 	}
 }
 
+// startDaemon starts the host's two processes like systemd would: the proxy (:80/:443 here httpAddr) and the daemon.
 func (w *world) startDaemon() {
-	cmd := exec.Command(filepath.Join(w.hostHome, ".vops", "bin", "vops"), "daemon")
+	w.startProc("proxy")
+	w.startProc("daemon")
+	w.t.Cleanup(func() {
+		// read-only snapshots and subvolumes: t.TempDir can't remove them by itself
+		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "snapshots"))
+		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "previews"))
+		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, "vops"))
+	})
+}
+
+// startProc runs `vops daemon` or `vops proxy` on the fake host until the test ends and waits for its socket.
+func (w *world) startProc(what string) *exec.Cmd {
+	cmd := exec.Command(filepath.Join(w.hostHome, ".vops", "bin", "vops"), what)
 	cmd.Env = append(w.env, "HOME="+w.hostHome)
-	var logs bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &logs, &logs
+	logs := &bytes.Buffer{}
+	cmd.Stdout, cmd.Stderr = logs, logs
+	sock := filepath.Join(w.hostHome, ".vops", map[string]string{"daemon": "vops.sock", "proxy": "proxy.sock"}[what])
+	os.Remove(sock)
 	if err := cmd.Start(); err != nil {
 		w.t.Fatal(err)
 	}
 	w.t.Cleanup(func() {
 		cmd.Process.Signal(os.Interrupt)
 		cmd.Wait()
-		// read-only snapshots and subvolumes: t.TempDir can't remove them by itself
-		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "snapshots"))
-		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, ".vops", "previews"))
-		snapshot.Delete(context.Background(), filepath.Join(w.hostHome, "vops"))
 		if w.t.Failed() {
-			w.t.Logf("daemon logs:\n%s", logs.String())
+			w.t.Logf("%s logs:\n%s", what, logs.String())
 		}
 	})
-	w.eventually("daemon socket", func() bool {
-		_, err := os.Stat(filepath.Join(w.hostHome, ".vops", "vops.sock"))
+	w.eventually(what+" socket", func() bool {
+		_, err := os.Stat(sock)
 		return err == nil
 	})
+	return cmd
 }
 
 func TestEndToEnd(t *testing.T) {

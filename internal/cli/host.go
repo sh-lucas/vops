@@ -788,11 +788,25 @@ func printStatus(c *client, out io.Writer) error {
 			AppliedAt int64 `json:"applied_at"`
 			Services  []deploy.ServiceState
 		}
+		Proxy struct {
+			Up      bool
+			Version int
+			Routes  int
+			InSync  bool `json:"in_sync"`
+		}
 	}
 	if err := getJSON(c, "/api/status", &st); err != nil {
 		return err
 	}
-	fmt.Fprintf(out, "commit %.12s  domain %s\n", st.Commit, orDash(st.Domain))
+	proxyNote := "down"
+	if p := st.Proxy; p.Up {
+		proxyNote = fmt.Sprintf("up (v%d, %d routes", p.Version, p.Routes)
+		if !p.InSync {
+			proxyNote += ", out of sync"
+		}
+		proxyNote += ")"
+	}
+	fmt.Fprintf(out, "commit %.12s  domain %s  proxy %s\n", st.Commit, orDash(st.Domain), proxyNote)
 	for _, w := range st.Warnings {
 		fmt.Fprintf(out, "! %s\n", w)
 	}
