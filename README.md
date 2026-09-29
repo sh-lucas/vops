@@ -118,7 +118,7 @@ git add -A && git commit -m site && vops sync
 - `vops status` and the dashboard's top bar show whether it is up, its version and routes, and warn when it is down or out of sync.
 
 ### Dashboard
-- `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`.
+- `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`, so it is a web login (admin password, session cookie), not ssh. Anything you do from it (apply, rollback, env, users) is available to whoever has that password.
 - Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart, unpin), timeline (deploys, rollbacks, snapshots; roll back images and/or data, preview from a point), previews, logs (live, search, date range, download), env vars (production or previews), events. Also registry images and users, git-tracked files (text only), events and audit log. Works on a phone.
 
 ### Logs
@@ -159,7 +159,7 @@ vops preview up <project> --name n [--image svc=ref]... [--ref r] [--from id]
 vops preview ls [project] | rm <project> <name>
 ```
 
-Inside a linked repo commands run on the host over ssh; on the host they talk to the daemon directly. On the host, systemd runs `vops daemon` and `vops proxy`.
+Inside a linked repo commands run on the host over ssh (`sync`, `apply` and `install` only work that way); on the host they talk to the daemon directly. The web-facing parts are the dashboard (admin password) and the registry (per-user tokens), see Dashboard and Registry. On the host, systemd runs `vops daemon` and `vops proxy`.
 
 ## Development
 
