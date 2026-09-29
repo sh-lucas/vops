@@ -28,7 +28,6 @@ const ICONS = {
   menu: "M4 7h16M4 12h16M4 17h16",
   logout: "M9 4H6a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h3M16 8l4 4-4 4M20 12H9",
   download: "M12 4v11M7 10l5 5 5-5M5 20h14",
-  expand: "M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5",
   refresh: "M20 12a8 8 0 1 1-2.34-5.66M20 4v5h-5",
   commit: "M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6zM3 12h6M15 12h6",
   globe: "M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18zM3.5 9h17M3.5 15h17M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18",
@@ -559,8 +558,7 @@ function servicesTab(ctx, box) {
 function logsTab(ctx, box) {
   const service = ctx.params.get("service");
   const lv = logView({ path: ctx.path, service, services: ctx.p.services.map((s) => s.name),
-    hrefFor: (svc) => projectHref(ctx.path, "logs", svc ? "?service=" + enc(svc) : ""),
-    fullHref: "#/logs/" + enc(ctx.path) + (service ? "?service=" + enc(service) : "") });
+    hrefFor: (svc) => projectHref(ctx.path, "logs", svc ? "?service=" + enc(svc) : "") });
   box.replaceChildren(lv.el);
   lv.start();
   onLeave(lv.stop);
@@ -999,15 +997,24 @@ function lineTime(el) {
   return isNaN(d) ? null : d;
 }
 
-function logView({ path, service, services, hrefFor, fullHref }) {
+// date + time as two inputs; .value is "YYYY-MM-DDTHH:mm" like datetime-local, an empty time falls back to def
+function dtField(def, onchange) {
+  const d = h("input", { type: "date", "aria-label": "date", onchange });
+  const t = h("input", { type: "time", "aria-label": "time", onchange });
+  t.title = "empty = " + def;
+  return { el: h("span", { class: "dtf" }, d, t), get value() { return d.value ? d.value + "T" + (t.value || def) : ""; },
+    set value(v) { [d.value, t.value] = v ? v.split("T") : ["", ""]; } };
+}
+
+function logView({ path, service, services, hrefFor }) {
   const maxLines = 5000;
   const narrow = matchMedia("(max-width: 700px)").matches;
   const view = h("div", { class: "logview" + (narrow ? " wrap" : ""), tabindex: "0" });
   const lines = view.getElementsByClassName("ll");
   const grep = h("input", { type: "search", class: "search", placeholder: "Search all history", "aria-label": "search" });
-  const from = h("input", { type: "datetime-local", step: "60", "aria-label": "from", onchange: () => onRange() });
-  const to = h("input", { type: "datetime-local", step: "60", "aria-label": "to", onchange: () => onRange() });
-  const clear = h("button", { type: "button", class: "btn ghost sm", hidden: true, onclick: () => { from.value = to.value = ""; follow.checked = true; onRange(); } }, "Clear");
+  const from = dtField("00:00", () => onRange());
+  const to = dtField("23:59", () => onRange());
+  const clear = h("button", { type: "button", class: "btn sm", hidden: true, onclick: () => { from.value = to.value = ""; follow.checked = true; onRange(); } }, "Clear");
   const follow = h("input", { type: "checkbox", checked: true, onchange: () => start() });
   const wrap = h("input", { type: "checkbox", checked: narrow, onchange: () => view.classList.toggle("wrap", wrap.checked) });
   const status = h("span", {}), avail = h("span", {}), loaded = h("span", {});
@@ -1017,7 +1024,7 @@ function logView({ path, service, services, hrefFor, fullHref }) {
     h("option", { value: "" }, "All services"), svcNames.map((s) => h("option", { value: s, selected: s === service }, s))) : null;
   let cancel = () => {}, before = null, busyOlder = false, gen = 0, partial = "", dropped = false, metaQueued = false;
 
-  // datetime-local is local time, minute precision; "to" includes its whole minute
+  // from/to are local time, minute precision; "to" includes its whole minute
   const unix = (input, end) => {
     if (!input.value) return null;
     const t = Math.floor(new Date(input.value).getTime() / 1000);
@@ -1125,12 +1132,21 @@ function logView({ path, service, services, hrefFor, fullHref }) {
       error: (msg) => { status.textContent = msg; },
     });
   };
+  const fmt = h("select", { "aria-label": "download format" }, h("option", { value: "txt" }, ".txt"), h("option", { value: "csv" }, ".csv"));
+  const csvCell = (v) => '"' + v.replaceAll('"', '""') + '"';
+  const csvRow = (t) => { // time, service, message
+    let m;
+    if ((m = JLINE.exec(t))) return [m[1], m[2], t.slice(m[0].length)];
+    if ((m = PLINE.exec(t))) return [m[2], m[1], t.slice(m[0].length)];
+    return ["", "", t];
+  };
   const download = () => {
     if (!lines.length) return toast("Nothing to download");
-    const text = Array.from(lines, (l) => l.textContent).join("\n") + "\n";
+    const csv = fmt.value === "csv";
+    const text = (csv ? ["time,service,message\n"] : []).concat(Array.from(lines, (l) => (csv ? csvRow(l.textContent).map(csvCell).join(",") : l.textContent) + "\n")).join("");
     const d = new Date();
-    const name = `${path.replaceAll("/", "-")}${service ? "-" + service : ""}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.txt`;
-    const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" })), download: name });
+    const name = `${path.replaceAll("/", "-")}${service ? "-" + service : ""}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}.${fmt.value}`;
+    const a = h("a", { href: URL.createObjectURL(new Blob([text], { type: csv ? "text/csv;charset=utf-8" : "text/plain;charset=utf-8" })), download: name });
     document.body.append(a);
     a.click();
     a.remove();
@@ -1140,13 +1156,12 @@ function logView({ path, service, services, hrefFor, fullHref }) {
   const el = h("div", { class: "grow" },
     h("form", { class: "logbar", onsubmit: (e) => { e.preventDefault(); start(); } },
       svcSel, grep,
-      h("label", { class: "dt" }, "from", from), h("label", { class: "dt" }, "to", to), clear,
       h("div", { class: "row end" },
         h("label", { class: "check" }, follow, "follow"),
         h("label", { class: "check" }, wrap, "wrap"),
         h("button", { class: "btn" }, icon("refresh"), "Reload"),
-        h("button", { type: "button", class: "btn", title: "Download the lines in view", onclick: download }, icon("download"), "Download .txt"),
-        fullHref ? h("a", { class: "btn icon", href: fullHref, title: "Full page", "aria-label": "full page" }, icon("expand")) : null)),
+        h("button", { type: "button", class: "btn", title: "Download the lines in view", onclick: download }, icon("download"), "Download"), fmt),
+      h("div", { class: "row daterow" }, h("label", { class: "dt" }, "from", from.el), h("label", { class: "dt" }, "to", to.el), clear)),
     h("div", { class: "logmeta" }, avail, loaded, more, h("span", { class: "spacer" }), status),
     view);
   return { el, start, stop: () => { cancel(); gen++; } };
