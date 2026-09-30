@@ -120,6 +120,14 @@ func (e *Engine) deployProject(ctx context.Context, w io.Writer, plan *Plan, pp 
 	if pp.Error != "" {
 		return errors.New(pp.Error)
 	}
+	// limits are the proxy's business, not the containers': a full apply of the project records them, RefreshRoutes sends them
+	if pp.Limits != "" && len(opts.Services) == 0 && !compose.IsPreview(pp.Path) && !pp.Gone {
+		if err := e.DB.SetLimits(pp.Path, pp.limits); err != nil {
+			return err
+		}
+		fmt.Fprintf(w, "%s: limits: %s\n", pp.Path, pp.Limits)
+		e.DB.Event(pp.Path, "config", "limits: %s", pp.Limits)
+	}
 	var errs []error
 	if len(pp.specs) > 0 && !pp.Gone && !pp.Disabled {
 		if err := e.ensureNetworks(ctx, w, pp, len(opts.Services) == 0); err != nil {
@@ -563,6 +571,12 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 		return err
 	}
 	flags, _ := e.DB.Projects()
+	limits := map[string]proxy.Limits{}
+	for p, f := range flags {
+		if f.Limits != "" {
+			limits[p] = *LimitsOf(f.Limits)
+		}
+	}
 	all := map[proxy.Key][2][]string{}
 	for _, c := range cs {
 		p := c.Labels[LProject]
@@ -575,7 +589,7 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 		v[1] = append(v[1], "127.0.0.1:"+c.Labels[LHostPort])
 		all[k] = v
 	}
-	e.Routes.Replace(all)
+	e.Routes.Replace(all, limits)
 	return nil
 }
 

@@ -4,24 +4,20 @@ Ideas with a design sketch. Done things move to README/reference; decisions to r
 
 ## Security and abuse (next)
 
-Facts today: sqlite is in WAL (`store.go`); all SQL is sqlc (parameterized); registry patterns are anchored RE2 (no ReDoS); sessions are HttpOnly/SameSite=Strict + `X-Vops` header; env is write-only.
+Facts today: sqlite is in WAL with foreign keys on (`store.go`); all SQL is sqlc (parameterized); users are admins/deployers with the rules in db checks and triggers; sessions are HttpOnly/SameSite=Strict + `X-Vops` header, tied to a user, purged by housekeeping; json bodies are capped at 1MB; env is write-only; the proxy rate-limits per project and tcp peer (`x-vops.rate`).
 
-- Login throttle is a global mutex + 1s sleep: an attacker's failed attempts queue in front of the real admin (lockout by spam) and nothing is per IP. Replace with per-IP backoff (token bucket, in memory) and keep the failed-login event. Same for registry basic auth failures.
-- Separate the dashboard admin from registry credentials: today `admin` is both the dashboard user and a registry user (pull all), and registry users have no dashboard access. Proposal: the registry never accepts the dashboard password; the daemon's own loopback pull keeps its in-memory token; `vops registry user add` gives pull-only and push tokens (`--pull-only`), each with pattern/repos. Optional: several dashboard users with roles (viewer/deployer/admin) and per-project scopes.
-- Tests to add (missing today): `UserAllows` (pattern anchoring, `a|b`, exact repos, invalid patterns), `ValidName` traversal cases (`../`, `%2e`, `blobs` as a path segment), login (wrong password, throttle, expired/deleted session, logout), every mutating route without the header / without a session (walk the mux and assert 401/403), sqlite injection strings through project/env/user names, oversized/malformed JSON bodies, `authCache` revocation (a deleted user's token works up to 5 min: clear the cache on user change).
-- Fuzz the registry path splitter and the compose loader.
-- Session cleanup: expired sessions are only checked, not purged (housekeeping tick).
-- Audit `X-Forwarded-*` handling before adding anything per-IP (only trust it when the proxy sits behind a known CDN).
+- Login throttle is still a global mutex + 1s sleep: an attacker's failed attempts queue in front of the real admins (lockout by spam) and nothing is per IP. Replace with per-IP backoff (token bucket, in memory, like the proxy's limiter) and keep the failed-login event. Same for registry basic auth failures.
+- Audit `X-Forwarded-*` handling before adding anything per-IP in the daemon (only trust it when the proxy sits behind a known CDN): the daemon trusts the proxy's `X-Forwarded-For`, and the proxy appends to whatever the client sent.
+- Optional: dashboard roles below admin (viewer, per-project scopes) and pull-only deployers, if someone needs them.
+- Fuzz more: the registry manifest parser, the log query parser.
 
 ## Proxy toggles
 
-Small in the proxy (stdlib, no dependency); the real question is where the setting lives, because `vops.yml`/compose are desired state and a dashboard-only toggle would be drift.
+Done: per-project `rate`/`burst`/`max_body` in compose's top-level `x-vops`, carried by the routing table (see decisions.md).
 
-- Decision to make: settings in git (`vops.yml` global, `x-vops` per project/service, shown in the dashboard read-only) vs. dashboard-editable stored in sqlite and sent in the routing table (`PUT /routes`, so the daemon stays the source of truth and the proxy keeps it on disk). Recommendation: routes carry per-route options from compose `x-vops` (git), and a dashboard "override" table for emergencies (block an IP, lower a limit) with an expiry, shown in the plan like pins.
-- Rate limit per IP: in-memory token bucket per (route, ip), `429` + `Retry-After`; options `rate: 20/s`, `burst`. Exempt the registry and dashboard hosts (dashboard gets its own strict limiter on `/api/login`).
-- Payload limit: `max_body: 10MB` per route via `http.MaxBytesReader` (`413`); registry stays unlimited (image pushes).
+- A dashboard "override" table for emergencies (block an IP, lower a limit) with an expiry, sent in the routing table and shown in the plan like pins.
+- Per-service limits (today they are per project) if a project needs an upload service next to a strict api.
 - Other toggles worth having: request/response header timeouts per route, max concurrent connections per IP, IP allow/deny list, basic-auth in front of a route (staging/previews), `x-vops.redirect` www→apex, security headers (HSTS is on).
-- Bump `proxy.Version` when it ships. Show active limits and 429/413 counters in `GET /status` and the dashboard.
 
 ## Releases
 
@@ -47,7 +43,7 @@ Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback` (images by pinning
 - Opt-out per project for pre-deploy snapshots (top-level `x-vops: {snapshots: false}` in compose; today it's host-wide in `vops.yml`).
 - `vops snapshot diff <id>`: `btrfs subvolume find-new` / sizes, to see how much a snapshot holds exclusively.
 - Show snapshot disk usage (needs quotas or `btrfs filesystem du`, which is slow; maybe only on demand).
-- Off-host backups: `btrfs send` of a snapshot to a file/ssh target (`vops snapshot export <id> > file`), incremental against the previous one.
+- Off-host backups exist (`vops snapshot export|import`, a .tar.gz). Next: scheduled export to a target (ssh, S3-compatible), and incremental `btrfs send` for big data.
 - Tag built images per commit (`localhost/vops/<project>-<service>:<commit>`, keep the last N) so built services can roll back too (today image rollback skips them: "can't roll back without the code").
 
 ## Other

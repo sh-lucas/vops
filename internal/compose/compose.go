@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -28,6 +29,7 @@ type Project struct {
 	Inactive []string // services left out by COMPOSE_PROFILES
 	Skipped  []string // services left out of a preview (x-vops.preview.skip)
 	Previews string   // top-level x-vops.previews: registry tags that create previews ("preview-*" when empty, "off")
+	Limits   Limits   // top-level x-vops rate, burst, max_body: the proxy applies them to every routed service
 	Warnings []string
 	Refs     map[string]bool                // every ${VAR} the files use
 	EnvRefs  map[string]map[string][]string // service -> environment key -> the ${VAR}s its value uses
@@ -695,14 +697,20 @@ func (p *Project) topVops(root *yaml.Node) error {
 			continue
 		}
 		v := root.Content[i+1]
-		if err := strictKeys(v, "previews"); err != nil {
+		if err := strictKeys(v, "previews", "rate", "burst", "max_body"); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
 		}
 		var top struct {
 			Previews string `yaml:"previews"`
+			Rate     string `yaml:"rate"`
+			Burst    *int   `yaml:"burst"`
+			MaxBody  string `yaml:"max_body"`
 		}
 		if err := v.Decode(&top); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
+		}
+		if err := p.limits(top.Rate, top.Burst, top.MaxBody); err != nil {
+			return fmt.Errorf("x-vops.%w", err)
 		}
 		if top.Previews == "" {
 			continue
@@ -716,6 +724,78 @@ func (p *Project) topVops(root *yaml.Node) error {
 		p.Previews = top.Previews
 	}
 	return nil
+}
+
+// Limits are the proxy's per-project request limits (zero = unlimited). Same fields as proxy.Limits.
+type Limits struct {
+	Rate    float64 // requests per second per client ip
+	Burst   int
+	MaxBody int64 // bytes
+}
+
+func (p *Project) limits(rate string, burst *int, maxBody string) error {
+	if rate == "" && burst == nil && maxBody == "" {
+		return nil
+	}
+	if p.Limits != (Limits{}) {
+		return errors.New("rate, burst and max_body are set in two compose files")
+	}
+	var l Limits
+	if rate != "" {
+		r, err := ParseRate(rate)
+		if err != nil {
+			return fmt.Errorf("rate: %w", err)
+		}
+		l.Rate, l.Burst = r, max(1, int(math.Ceil(r)))
+	}
+	if burst != nil {
+		if rate == "" {
+			return errors.New("burst: needs rate")
+		}
+		if *burst < 1 {
+			return fmt.Errorf("burst must be at least 1, got %d", *burst)
+		}
+		l.Burst = *burst
+	}
+	if maxBody != "" {
+		n, err := ParseSize(maxBody)
+		if err != nil {
+			return fmt.Errorf("max_body: %w", err)
+		}
+		l.MaxBody = n
+	}
+	p.Limits = l
+	return nil
+}
+
+// ParseRate reads "20/s", "600/m" or "1000/h" as requests per second.
+func ParseRate(s string) (float64, error) {
+	n, unit, ok := strings.Cut(s, "/")
+	per := map[string]float64{"s": 1, "m": 60, "h": 3600}[unit]
+	v, err := strconv.Atoi(n)
+	if !ok || per == 0 || err != nil || v < 1 {
+		return 0, fmt.Errorf("want a positive number of requests per s, m or h (20/s, 600/m), got %q", s)
+	}
+	return float64(v) / per, nil
+}
+
+// ParseSize reads "512KB", "10MB", "1GB" (1024-based) or a number of bytes.
+func ParseSize(s string) (int64, error) {
+	num, mult := s, int64(1)
+	for _, u := range []struct {
+		suffix string
+		size   int64
+	}{{"KB", 1 << 10}, {"MB", 1 << 20}, {"GB", 1 << 30}, {"B", 1}} {
+		if strings.HasSuffix(s, u.suffix) {
+			num, mult = strings.TrimSuffix(s, u.suffix), u.size
+			break
+		}
+	}
+	v, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || v < 1 || v > math.MaxInt64/mult {
+		return 0, fmt.Errorf("want a positive size in B, KB, MB or GB (1024-based: 10MB, 512KB), got %q", s)
+	}
+	return v * mult, nil
 }
 
 // previewGuardrails keeps a preview away from production: x-vops.preview.skip services don't run,

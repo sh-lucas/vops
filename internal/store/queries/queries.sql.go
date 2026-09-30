@@ -32,6 +32,31 @@ func (q *Queries) AddSnapshotVolume(ctx context.Context, arg AddSnapshotVolumePa
 	return err
 }
 
+const addUserRepo = `-- name: AddUserRepo :exec
+INSERT INTO user_repos (user, repo) VALUES (?, ?)
+`
+
+type AddUserRepoParams struct {
+	User string `json:"user"`
+	Repo string `json:"repo"`
+}
+
+func (q *Queries) AddUserRepo(ctx context.Context, arg AddUserRepoParams) error {
+	_, err := q.db.ExecContext(ctx, addUserRepo, arg.User, arg.Repo)
+	return err
+}
+
+const countAdmins = `-- name: CountAdmins :one
+SELECT count(*) FROM users WHERE role = 'admin'
+`
+
+func (q *Queries) CountAdmins(ctx context.Context) (int64, error) {
+	row := q.db.QueryRowContext(ctx, countAdmins)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createDeploy = `-- name: CreateDeploy :one
 INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, before_id, parts, result, error, summary, started_at, finished_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -98,41 +123,18 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) error 
 	return err
 }
 
-const createOrReplaceUser = `-- name: CreateOrReplaceUser :exec
-INSERT INTO users (name, token_hash, pattern, repos, created_at) VALUES (?, ?, ?, ?, ?)
-ON CONFLICT (name) DO UPDATE SET token_hash = excluded.token_hash, pattern = excluded.pattern, repos = excluded.repos
-`
-
-type CreateOrReplaceUserParams struct {
-	Name      string `json:"name"`
-	TokenHash string `json:"token_hash"`
-	Pattern   string `json:"pattern"`
-	Repos     string `json:"repos"`
-	CreatedAt int64  `json:"created_at"`
-}
-
-func (q *Queries) CreateOrReplaceUser(ctx context.Context, arg CreateOrReplaceUserParams) error {
-	_, err := q.db.ExecContext(ctx, createOrReplaceUser,
-		arg.Name,
-		arg.TokenHash,
-		arg.Pattern,
-		arg.Repos,
-		arg.CreatedAt,
-	)
-	return err
-}
-
 const createSession = `-- name: CreateSession :exec
-INSERT INTO sessions (id_hash, expires) VALUES (?, ?)
+INSERT INTO sessions (id_hash, user, expires) VALUES (?, ?, ?)
 `
 
 type CreateSessionParams struct {
 	IDHash  string `json:"id_hash"`
+	User    string `json:"user"`
 	Expires int64  `json:"expires"`
 }
 
 func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) error {
-	_, err := q.db.ExecContext(ctx, createSession, arg.IDHash, arg.Expires)
+	_, err := q.db.ExecContext(ctx, createSession, arg.IDHash, arg.User, arg.Expires)
 	return err
 }
 
@@ -162,22 +164,39 @@ func (q *Queries) CreateSnapshot(ctx context.Context, arg CreateSnapshotParams) 
 	return id, err
 }
 
-const deleteAllSessions = `-- name: DeleteAllSessions :exec
-DELETE FROM sessions
+const createUser = `-- name: CreateUser :exec
+INSERT INTO users (name, role, global, secret, created_at) VALUES (?, ?, ?, ?, ?)
 `
 
-func (q *Queries) DeleteAllSessions(ctx context.Context) error {
-	_, err := q.db.ExecContext(ctx, deleteAllSessions)
+type CreateUserParams struct {
+	Name      string `json:"name"`
+	Role      string `json:"role"`
+	Global    bool   `json:"global"`
+	Secret    string `json:"secret"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) error {
+	_, err := q.db.ExecContext(ctx, createUser,
+		arg.Name,
+		arg.Role,
+		arg.Global,
+		arg.Secret,
+		arg.CreatedAt,
+	)
 	return err
 }
 
-const deleteExpiredSessions = `-- name: DeleteExpiredSessions :exec
+const deleteExpiredSessions = `-- name: DeleteExpiredSessions :execrows
 DELETE FROM sessions WHERE expires < ?
 `
 
-func (q *Queries) DeleteExpiredSessions(ctx context.Context, expires int64) error {
-	_, err := q.db.ExecContext(ctx, deleteExpiredSessions, expires)
-	return err
+func (q *Queries) DeleteExpiredSessions(ctx context.Context, expires int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteExpiredSessions, expires)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const deletePin = `-- name: DeletePin :execrows
@@ -238,12 +257,24 @@ func (q *Queries) DeleteSnapshot(ctx context.Context, id int64) error {
 	return err
 }
 
-const deleteUser = `-- name: DeleteUser :exec
+const deleteUser = `-- name: DeleteUser :execrows
 DELETE FROM users WHERE name = ?
 `
 
-func (q *Queries) DeleteUser(ctx context.Context, name string) error {
-	_, err := q.db.ExecContext(ctx, deleteUser, name)
+func (q *Queries) DeleteUser(ctx context.Context, name string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteUser, name)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const deleteUserRepos = `-- name: DeleteUserRepos :exec
+DELETE FROM user_repos WHERE user = ?
+`
+
+func (q *Queries) DeleteUserRepos(ctx context.Context, user string) error {
+	_, err := q.db.ExecContext(ctx, deleteUserRepos, user)
 	return err
 }
 
@@ -312,15 +343,20 @@ func (q *Queries) GetPreview(ctx context.Context, arg GetPreviewParams) (Preview
 	return i, err
 }
 
-const getSessionExpiry = `-- name: GetSessionExpiry :one
-SELECT expires FROM sessions WHERE id_hash = ?
+const getSession = `-- name: GetSession :one
+SELECT user, expires FROM sessions WHERE id_hash = ?
 `
 
-func (q *Queries) GetSessionExpiry(ctx context.Context, idHash string) (int64, error) {
-	row := q.db.QueryRowContext(ctx, getSessionExpiry, idHash)
-	var expires int64
-	err := row.Scan(&expires)
-	return expires, err
+type GetSessionRow struct {
+	User    string `json:"user"`
+	Expires int64  `json:"expires"`
+}
+
+func (q *Queries) GetSession(ctx context.Context, idHash string) (GetSessionRow, error) {
+	row := q.db.QueryRowContext(ctx, getSession, idHash)
+	var i GetSessionRow
+	err := row.Scan(&i.User, &i.Expires)
+	return i, err
 }
 
 const getSnapshot = `-- name: GetSnapshot :one
@@ -342,7 +378,7 @@ func (q *Queries) GetSnapshot(ctx context.Context, id int64) (Snapshot, error) {
 }
 
 const getUser = `-- name: GetUser :one
-SELECT name, token_hash, pattern, repos, created_at FROM users WHERE name = ?
+SELECT name, role, global, secret, created_at FROM users WHERE name = ?
 `
 
 func (q *Queries) GetUser(ctx context.Context, name string) (User, error) {
@@ -350,9 +386,9 @@ func (q *Queries) GetUser(ctx context.Context, name string) (User, error) {
 	var i User
 	err := row.Scan(
 		&i.Name,
-		&i.TokenHash,
-		&i.Pattern,
-		&i.Repos,
+		&i.Role,
+		&i.Global,
+		&i.Secret,
 		&i.CreatedAt,
 	)
 	return i, err
@@ -438,7 +474,7 @@ func (q *Queries) ListAudit(ctx context.Context, limit int64) ([]AuditLog, error
 
 const listAutoSnapshotsToPrune = `-- name: ListAutoSnapshotsToPrune :many
 SELECT id, project, reason, note, commit_sha, created_at FROM snapshots
-WHERE project = ?1 AND reason != 'manual'
+WHERE project = ?1 AND reason NOT IN ('manual', 'upload')
 ORDER BY id DESC LIMIT -1 OFFSET ?2
 `
 
@@ -447,7 +483,7 @@ type ListAutoSnapshotsToPruneParams struct {
 	Keep    int64  `json:"keep"`
 }
 
-// automatic snapshots (not manual) of a project beyond the newest `keep`
+// automatic snapshots (not manual or uploaded) of a project beyond the newest `keep`
 func (q *Queries) ListAutoSnapshotsToPrune(ctx context.Context, arg ListAutoSnapshotsToPruneParams) ([]Snapshot, error) {
 	rows, err := q.db.QueryContext(ctx, listAutoSnapshotsToPrune, arg.Project, arg.Keep)
 	if err != nil {
@@ -708,7 +744,7 @@ func (q *Queries) ListPreviews(ctx context.Context, project interface{}) ([]Prev
 }
 
 const listProjects = `-- name: ListProjects :many
-SELECT path, disabled, commit_sha, applied_at FROM projects ORDER BY path
+SELECT path, disabled, commit_sha, applied_at, limits FROM projects ORDER BY path
 `
 
 func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
@@ -725,10 +761,38 @@ func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
 			&i.Disabled,
 			&i.CommitSha,
 			&i.AppliedAt,
+			&i.Limits,
 		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listReposOfUser = `-- name: ListReposOfUser :many
+SELECT repo FROM user_repos WHERE user = ? ORDER BY repo
+`
+
+func (q *Queries) ListReposOfUser(ctx context.Context, user string) ([]string, error) {
+	rows, err := q.db.QueryContext(ctx, listReposOfUser, user)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []string{}
+	for rows.Next() {
+		var repo string
+		if err := rows.Scan(&repo); err != nil {
+			return nil, err
+		}
+		items = append(items, repo)
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
@@ -808,8 +872,35 @@ func (q *Queries) ListSnapshots(ctx context.Context, project interface{}) ([]Sna
 	return items, nil
 }
 
+const listUserRepos = `-- name: ListUserRepos :many
+SELECT user, repo FROM user_repos ORDER BY user, repo
+`
+
+func (q *Queries) ListUserRepos(ctx context.Context) ([]UserRepo, error) {
+	rows, err := q.db.QueryContext(ctx, listUserRepos)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []UserRepo{}
+	for rows.Next() {
+		var i UserRepo
+		if err := rows.Scan(&i.User, &i.Repo); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUsers = `-- name: ListUsers :many
-SELECT name, token_hash, pattern, repos, created_at FROM users ORDER BY name
+SELECT name, role, global, secret, created_at FROM users ORDER BY name
 `
 
 func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
@@ -823,9 +914,9 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 		var i User
 		if err := rows.Scan(
 			&i.Name,
-			&i.TokenHash,
-			&i.Pattern,
-			&i.Repos,
+			&i.Role,
+			&i.Global,
+			&i.Secret,
 			&i.CreatedAt,
 		); err != nil {
 			return nil, err
@@ -1034,6 +1125,21 @@ func (q *Queries) SetProjectDisabled(ctx context.Context, arg SetProjectDisabled
 	return err
 }
 
+const setProjectLimits = `-- name: SetProjectLimits :exec
+INSERT INTO projects (path, limits) VALUES (?, ?)
+ON CONFLICT (path) DO UPDATE SET limits = excluded.limits
+`
+
+type SetProjectLimitsParams struct {
+	Path   string `json:"path"`
+	Limits string `json:"limits"`
+}
+
+func (q *Queries) SetProjectLimits(ctx context.Context, arg SetProjectLimitsParams) error {
+	_, err := q.db.ExecContext(ctx, setProjectLimits, arg.Path, arg.Limits)
+	return err
+}
+
 const unsetEnv = `-- name: UnsetEnv :exec
 DELETE FROM env WHERE project = ? AND key = ?
 `
@@ -1048,18 +1154,27 @@ func (q *Queries) UnsetEnv(ctx context.Context, arg UnsetEnvParams) error {
 	return err
 }
 
-const updateUserRules = `-- name: UpdateUserRules :execrows
-UPDATE users SET pattern = ?, repos = ? WHERE name = ?
+const updateUser = `-- name: UpdateUser :execrows
+UPDATE users SET role = ?1, global = ?2,
+    secret = CASE WHEN ?3 = '' THEN secret ELSE ?3 END
+WHERE name = ?4
 `
 
-type UpdateUserRulesParams struct {
-	Pattern string `json:"pattern"`
-	Repos   string `json:"repos"`
-	Name    string `json:"name"`
+type UpdateUserParams struct {
+	Role   string      `json:"role"`
+	Global bool        `json:"global"`
+	Secret interface{} `json:"secret"`
+	Name   string      `json:"name"`
 }
 
-func (q *Queries) UpdateUserRules(ctx context.Context, arg UpdateUserRulesParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, updateUserRules, arg.Pattern, arg.Repos, arg.Name)
+// an empty secret keeps the current one
+func (q *Queries) UpdateUser(ctx context.Context, arg UpdateUserParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, updateUser,
+		arg.Role,
+		arg.Global,
+		arg.Secret,
+		arg.Name,
+	)
 	if err != nil {
 		return 0, err
 	}

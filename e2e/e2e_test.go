@@ -4,7 +4,9 @@
 package e2e
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json/v2"
 	"fmt"
@@ -262,7 +264,7 @@ func TestEndToEnd(t *testing.T) {
 	w.vops(dev, "apply", "--yes")
 
 	// registry: a user for shop/*, push, deploy from it, push again -> redeployed by itself
-	out = w.vops(dev, "user", "add", "ci", "--pattern", "shop/.*")
+	out = w.vops(dev, "user", "add", "ci", "--repo", "shop/api", "--repo", "shop/web:latest")
 	tm := regexp.MustCompile(`token: (\S+)`).FindStringSubmatch(out)
 	if tm == nil {
 		t.Fatalf("no token:\n%s", out)
@@ -281,11 +283,25 @@ func TestEndToEnd(t *testing.T) {
 	if err := push("pushed-1", "ci:"+tm[1]); err != nil {
 		t.Fatal(err)
 	}
-	if err := push("nope", "admin:"+adminPW); err == nil {
-		t.Fatal("admin must not push")
+	if err := push("pushed-1", "admin:"+adminPW); err != nil {
+		t.Fatal("an admin pushes every repo:", err)
+	}
+	other := regexp.MustCompile(`token: (\S+)`).FindStringSubmatch(w.vops(dev, "user", "add", "other", "--repo", "other/app"))
+	if err := push("nope", "other:"+other[1]); err == nil {
+		t.Fatal("a deployer pushed a repo not in its list")
+	}
+	if ls := w.vops(dev, "user", "ls"); !regexp.MustCompile(`admin\s+admin\s+all`).MatchString(ls) || !regexp.MustCompile(`ci\s+deployer\s+shop/api,shop/web`).MatchString(ls) {
+		t.Fatalf("user ls:\n%s", ls)
+	}
+	if out, err := w.try(dev, "", "user", "add", "x", "--pattern", "shop/.*"); err == nil || !strings.Contains(out, "--global") {
+		t.Fatalf("--pattern must say it's gone: %v\n%s", err, out)
+	}
+	// a second admin: the password comes on stdin, never on argv
+	if out, err := w.try(dev, "ops password 1234\n", "user", "add", "ops", "--admin"); err != nil || strings.Contains(out, "ops password") {
+		t.Fatalf("user add --admin: %v\n%s", err, out)
 	}
 	// migrating from another registry: keep the password CI already has
-	if out, err := w.try(dev, "legacy-password-123\n", "user", "add", "legacy", "--pattern", "shop/.*", "--token-stdin"); err != nil || strings.Contains(out, "legacy-password-123") {
+	if out, err := w.try(dev, "legacy-password-123\n", "user", "add", "legacy", "--repo", "shop/api", "--token-stdin"); err != nil || strings.Contains(out, "legacy-password-123") {
 		t.Fatalf("token-stdin: %v\n%s", err, out)
 	}
 	if err := push("pushed-1", "legacy:legacy-password-123"); err != nil {
@@ -333,7 +349,7 @@ func TestEndToEnd(t *testing.T) {
 
 	// dashboard api: login, csrf header, env values never readable
 	client := &http.Client{}
-	login, _ := http.NewRequest("POST", "http://"+w.uiAddr+"/api/login", strings.NewReader(`{"password":"`+adminPW+`"}`))
+	login, _ := http.NewRequest("POST", "http://"+w.uiAddr+"/api/login", strings.NewReader(`{"user":"ops","password":"ops password 1234"}`))
 	login.Header.Set("X-Vops", "1")
 	resp, err := client.Do(login)
 	if err != nil || resp.StatusCode != 200 {
@@ -370,8 +386,8 @@ func TestEndToEnd(t *testing.T) {
 	if _, body := call("GET", "/api/env?project=shop", "", false); strings.Contains(body, "again") || !strings.Contains(body, "MSG") {
 		t.Fatalf("env api leaked or lost values: %s", body)
 	}
-	if code, _ := call("POST", "/api/admin/password", `{"password":"xxxxxxxxxxxxxxxx"}`, true); code != 404 && code != 405 {
-		t.Fatalf("admin password must only be settable over the socket: %d", code)
+	if code, body := call("GET", "/api/status", "", false); code != 200 || !strings.Contains(body, `"user":"ops"`) {
+		t.Fatalf("status must say who is logged in: %d", code)
 	}
 	if code, body := call("GET", "/", "", false); code != 200 || !strings.Contains(body, "vops") {
 		t.Fatalf("ui index: %d", code)
@@ -394,8 +410,9 @@ func TestEndToEnd(t *testing.T) {
 		return out
 	}
 	execNotes("write", "/data/f", "before")
-	if out := w.vops(dev, "snapshot", "create", "notes", "-m", "by hand"); !strings.Contains(out, "(manual)") {
-		t.Fatalf("snapshot create:\n%s", out)
+	byHand := w.vops(dev, "snapshot", "create", "notes", "-m", "by hand")
+	if !strings.Contains(byHand, "(manual)") {
+		t.Fatalf("snapshot create:\n%s", byHand)
 	}
 	w.write(dev, map[string]string{"notes/compose.yml": fmt.Sprintf(notes, "2")})
 	if out := w.vops(dev, "sync", "--yes"); !strings.Contains(out, "(pre-deploy)") {
@@ -410,6 +427,35 @@ func TestEndToEnd(t *testing.T) {
 	}
 	if got := execNotes("read", "/data/f"); got != "before" {
 		t.Fatalf("after rollback: %q", got)
+	}
+	// a backup through the ssh forwarding: a binary stream out on stdout, back in on stdin, restored
+	manualID := regexp.MustCompile(`#(\d+) \(manual\)`).FindStringSubmatch(byHand)[1]
+	tgz := filepath.Join(t.TempDir(), "notes.tar.gz")
+	f, _ := os.Create(tgz)
+	export := exec.Command(w.bin, "snapshot", "export", "notes", manualID)
+	export.Dir, export.Env, export.Stdout, export.Stderr = dev, w.env, f, os.Stderr
+	if err := export.Run(); err != nil {
+		t.Fatal("export:", err)
+	}
+	f.Seek(0, 0)
+	if gz, err := gzip.NewReader(f); err != nil {
+		t.Fatal("export is not gzip:", err)
+	} else if h, err := tar.NewReader(gz).Next(); err != nil || h.Name != "vops-backup.json" {
+		t.Fatalf("export: %v %+v", err, h)
+	}
+	f.Seek(0, 0)
+	execNotes("write", "/data/f", "changed")
+	imp := exec.Command(w.bin, "snapshot", "import", "notes")
+	imp.Dir, imp.Env, imp.Stdin = dev, w.env, f
+	impOut, err := imp.CombinedOutput()
+	f.Close()
+	up := regexp.MustCompile(`snapshot #(\d+) \(upload\)`).FindStringSubmatch(string(impOut))
+	if err != nil || up == nil || !strings.Contains(string(impOut), "vops rollback notes --snapshot "+up[1]) {
+		t.Fatalf("import: %v\n%s", err, impOut)
+	}
+	w.vops(dev, "rollback", "notes", "--snapshot", up[1], "--yes")
+	if got := execNotes("read", "/data/f"); got != "before" {
+		t.Fatalf("after restoring the uploaded backup: %q", got)
 	}
 	if audit := w.vops(dev, "audit"); !strings.Contains(audit, "snapshots insert notes") || !strings.Contains(audit, "env") || strings.Contains(audit, "again") {
 		t.Fatalf("audit:\n%s", audit)

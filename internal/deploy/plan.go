@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"os"
@@ -82,7 +83,10 @@ type ProjectPlan struct {
 	Gone     bool       `json:"gone,omitempty"` // directory removed from git
 	Error    string     `json:"error,omitempty"`
 	Actions  []Action   `json:"actions"`
-	Pins     []PinState `json:"pins,omitempty"` // services running a past image (image rollback)
+	Pins     []PinState `json:"pins,omitempty"`   // services running a past image (image rollback)
+	Limits   string     `json:"limits,omitempty"` // proxy limits from x-vops, when they change: "old -> new"
+
+	limits string // desired limits (json proxy.Limits, '' = none)
 
 	specs    map[string]*desired
 	actual   map[string][]podman.Container
@@ -122,7 +126,7 @@ func (p *Plan) Changes() bool {
 		return true
 	}
 	for _, pp := range p.Projects {
-		if pp.Error != "" || slices.ContainsFunc(pp.Pins, func(p PinState) bool { return p.Stale != "" }) {
+		if pp.Error != "" || pp.Limits != "" || slices.ContainsFunc(pp.Pins, func(p PinState) bool { return p.Stale != "" }) {
 			return true
 		}
 		for _, a := range pp.Actions {
@@ -175,6 +179,9 @@ func (p *Plan) Print(w io.Writer) {
 				line += "  (" + a.Reason + ")"
 			}
 			fmt.Fprintln(w, line)
+		}
+		if pp.Limits != "" {
+			fmt.Fprintf(w, "  ~ limits: %s\n", pp.Limits)
 		}
 		for _, pin := range pp.Pins {
 			if pin.Stale != "" {
@@ -317,6 +324,9 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			pp.Error = err.Error()
 			continue
 		}
+		if old := flags[p].Limits; old != pp.limits {
+			pp.Limits = LimitsOf(old).String() + " -> " + LimitsOf(pp.limits).String()
+		}
 		for _, name := range sortedKeys(pp.specs) {
 			for _, d := range pp.specs[name].spec.Domains {
 				if other, taken := domains[d]; taken {
@@ -363,6 +373,7 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 		s.Image, s.Build = src.images[svc], nil
 	}
 	pp.previews, pp.project = proj.Previews, proj
+	pp.limits = limitsJSON(proj.Limits)
 	specs, err := proj.Specs(domain, env)
 	if err != nil {
 		return err
@@ -678,4 +689,21 @@ func shortRef(ref string) string {
 		return ref[:i+20]
 	}
 	return ref
+}
+
+func limitsJSON(l compose.Limits) string {
+	if l == (compose.Limits{}) {
+		return ""
+	}
+	b, _ := json.Marshal(proxy.Limits(l))
+	return string(b)
+}
+
+// LimitsOf reads a project's applied limits (store.Project.Limits).
+func LimitsOf(s string) *proxy.Limits {
+	var l proxy.Limits
+	if s != "" {
+		json.Unmarshal([]byte(s), &l)
+	}
+	return &l
 }

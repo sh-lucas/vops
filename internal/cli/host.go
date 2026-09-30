@@ -19,6 +19,7 @@ import (
 
 	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/deploy"
+	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/store"
 )
@@ -57,9 +58,14 @@ func getJSON(c *client, path string, v any) error {
 	return json.UnmarshalRead(resp.Body, v, json.MatchCaseInsensitiveNames(true))
 }
 
+// rawBody is a request body sent as is (streamed), not as json.
+type rawBody struct{ io.Reader }
+
 func post(c *client, method, path string, body any, v any) error {
 	var r io.Reader
-	if body != nil {
+	if raw, ok := body.(rawBody); ok {
+		r = raw.Reader
+	} else if body != nil {
 		r = jsonBody(body)
 	}
 	resp, err := c.do(method, path, r)
@@ -90,7 +96,9 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	grep := fs.String("grep", "", "")
 	since := fs.String("since", "", "")
 	until := fs.String("until", "", "")
-	pattern := fs.String("pattern", "", "")
+	pattern := fs.String("pattern", "", "") // gone: only to say so
+	admin := fs.Bool("admin", false, "")
+	global := fs.Bool("global", false, "")
 	var repos multi
 	fs.Var(&repos, "repo", "")
 	fromStdin := fs.Bool("stdin", false, "")
@@ -300,9 +308,16 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		return fmt.Errorf("env %s: unknown", sub)
 
 	case "user":
-		sub, err := arg(0, "ls|add|rm|token")
+		sub, err := arg(0, "ls|add|rm|token|password")
 		if err != nil {
 			return err
+		}
+		if *pattern != "" {
+			return errors.New("--pattern is gone: use --global (every repo) or --repo name (repeatable)")
+		}
+		readLine := func() (string, error) {
+			b, err := io.ReadAll(stdin)
+			return strings.TrimRight(string(b), "\r\n"), err
 		}
 		switch sub {
 		case "ls":
@@ -311,61 +326,74 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 				return err
 			}
 			tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(tw, "NAME\tPATTERN\tREPOS")
+			fmt.Fprintln(tw, "NAME\tROLE\tACCESS")
 			for _, u := range users {
-				fmt.Fprintf(tw, "%s\t%s\t%s\n", u.Name, u.Pattern, strings.Join(u.Repos, ","))
+				access := strings.Join(u.Repos, ",")
+				if u.Global {
+					access = "all"
+				}
+				fmt.Fprintf(tw, "%s\t%s\t%s\n", u.Name, u.Role, access)
 			}
 			return tw.Flush()
-		case "add", "token":
+		case "add", "token", "password":
 			name, err := arg(1, "name")
 			if err != nil {
 				return err
 			}
-			body := map[string]any{"name": name, "pattern": *pattern, "repos": []string(repos), "new_token": sub == "token"}
-			chosen := ""
-			if *tokenStdin {
-				b, err := io.ReadAll(stdin)
+			body := map[string]any{"name": name}
+			switch {
+			case sub == "token":
+				body["new_token"] = true
+			case sub == "password" || *admin:
+				if !*fromStdin {
+					return fmt.Errorf("usage: user %s %s --stdin (the password comes on stdin)", sub, name)
+				}
+				pw, err := readLine()
 				if err != nil {
 					return err
 				}
-				chosen = strings.TrimRight(string(b), "\r\n")
-				body["token"] = chosen
-			}
-			if sub == "token" {
-				var users []store.User
-				getJSON(c, "/api/users", &users)
-				found := false
-				for _, u := range users {
-					if u.Name == name {
-						body["pattern"], body["repos"], found = u.Pattern, u.Repos, true
+				body["password"] = pw
+				if *admin {
+					body["role"] = store.Admin
+				}
+			default:
+				if !*global && len(repos) == 0 {
+					return errors.New("user add needs --admin, --global or --repo (what may this user push and pull?)")
+				}
+				body["role"], body["global"], body["repos"] = store.Deployer, *global, []string(repos)
+				if *tokenStdin {
+					tok, err := readLine()
+					if err != nil {
+						return err
 					}
+					body["token"] = tok
 				}
-				if !found {
-					return fmt.Errorf("no user %q", name)
-				}
-			} else if *pattern == "" && len(repos) == 0 {
-				return errors.New("user add needs --pattern and/or --repo (what may this user push?)")
 			}
-			var res struct{ Name, Token string }
+			var res struct{ Name, Role, Token string }
 			if err := post(c, "POST", "/api/users", body, &res); err != nil {
 				return err
 			}
-			if res.Token == "" {
-				fmt.Fprintf(out, "updated %s (token unchanged)\n", name)
-				return nil
-			}
-			if chosen != "" {
+			switch {
+			case res.Role == store.Admin:
+				fmt.Fprintf(out, "admin %s saved: dashboard login and podman login with that password\n", name)
+			case res.Token != "":
+				fmt.Fprintf(out, "user:  %s\ntoken: %s\n\nshown once. log in with:\n  podman login -u %s registry.<your domain>\n", name, res.Token, name)
+			case *tokenStdin:
 				fmt.Fprintf(out, "user %s saved with the token you gave\n", name)
-				return nil
+			default:
+				fmt.Fprintf(out, "updated %s (token unchanged)\n", name)
 			}
-			fmt.Fprintf(out, "user:  %s\ntoken: %s\n\nshown once. log in with:\n  podman login -u %s registry.<your domain>\n", name, res.Token, name)
 			return nil
 		case "rm":
 			name, err := arg(1, "name")
 			if err != nil {
 				return err
 			}
-			return post(c, "DELETE", "/api/users?name="+url.QueryEscape(name), nil, nil)
+			if err := post(c, "DELETE", "/api/users?name="+url.QueryEscape(name), nil, nil); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "deleted %s\n", name)
+			return nil
 		}
 		return fmt.Errorf("user %s: unknown", sub)
 
@@ -487,6 +515,37 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 				return err
 			}
 			fmt.Fprintf(out, "snapshot #%s deleted\n", id)
+			return nil
+		case "export":
+			project, err := arg(1, "project")
+			if err != nil {
+				return err
+			}
+			id, err := arg(2, "snapshot id")
+			if err != nil {
+				return err
+			}
+			resp, err := c.do("GET", "/api/snapshots/export?"+url.Values{"id": {strings.TrimPrefix(id, "#")}, "project": {project}}.Encode(), nil)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			if _, err := io.Copy(out, resp.Body); err != nil {
+				return fmt.Errorf("export cut short: %w", err)
+			}
+			return nil
+		case "import":
+			project, err := arg(1, "project")
+			if err != nil {
+				return err
+			}
+			var res struct {
+				Snapshot store.Snapshot `json:"snapshot"`
+			}
+			if err := post(c, "POST", "/api/snapshots/import?project="+url.QueryEscape(project), rawBody{stdin}, &res); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "snapshot #%d (upload): %s\nrestore it with: vops rollback %s --snapshot %d\n", res.Snapshot.ID, res.Snapshot.Note, project, res.Snapshot.ID)
 			return nil
 		}
 		return fmt.Errorf("snapshot %s: unknown", sub)
@@ -680,20 +739,6 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			fmt.Fprintf(out, "%s  %-9s %-6s %s  %s\n", time.Unix(l.At, 0).Format("2006-01-02 15:04:05"), l.Tbl, l.Op, l.Key, l.Detail)
 		}
 		return nil
-
-	case "admin":
-		if sub, _ := arg(0, ""); sub != "password" || !*fromStdin {
-			return errors.New("usage: admin password")
-		}
-		pw, err := bufio.NewReader(stdin).ReadString('\n')
-		if err != nil && pw == "" {
-			return err
-		}
-		if err := post(c, "POST", "/api/admin/password", map[string]string{"password": strings.TrimRight(pw, "\r\n")}, nil); err != nil {
-			return err
-		}
-		fmt.Fprintln(out, "dashboard password changed; every session was logged out")
-		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
 }
@@ -787,6 +832,8 @@ func printStatus(c *client, out io.Writer) error {
 			Commit    string
 			AppliedAt int64 `json:"applied_at"`
 			Services  []deploy.ServiceState
+			Limits    string
+			Refused   *proxy.Counters
 		}
 		Proxy struct {
 			Up      bool
@@ -820,6 +867,13 @@ func printStatus(c *client, out io.Writer) error {
 			note = "disabled"
 		}
 		fmt.Fprintf(tw, "%s\t\t%s\n", p.Path, note)
+		if p.Limits != "" {
+			line := "  limits: " + p.Limits
+			if r := p.Refused; r != nil {
+				line += fmt.Sprintf(" (refused %d too many requests, %d too large)", r.Limited, r.TooLarge)
+			}
+			fmt.Fprintf(tw, "%s\t\t\n", line)
+		}
 		if p.Error != "" {
 			fmt.Fprintf(tw, "  ✗ %s\t\t\n", p.Error)
 		}

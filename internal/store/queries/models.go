@@ -79,10 +79,12 @@ type Project struct {
 	Disabled  bool   `json:"disabled"`
 	CommitSha string `json:"commit_sha"`
 	AppliedAt int64  `json:"applied_at"`
+	Limits    string `json:"limits"`
 }
 
 type Session struct {
 	IDHash  string `json:"id_hash"`
+	User    string `json:"user"`
 	Expires int64  `json:"expires"`
 }
 
@@ -105,8 +107,13 @@ type SnapshotVolume struct {
 
 type User struct {
 	Name      string `json:"name"`
-	TokenHash string `json:"token_hash"`
-	Pattern   string `json:"pattern"`
-	Repos     string `json:"repos"`
+	Role      string `json:"role"`
+	Global    bool   `json:"global"`
+	Secret    string `json:"secret"`
 	CreatedAt int64  `json:"created_at"`
+}
+
+type UserRepo struct {
+	User string `json:"user"`
+	Repo string `json:"repo"`
 }

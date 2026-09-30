@@ -35,7 +35,7 @@ If sync has to merge the host's commits, CI pushes that merge to the host but no
 ## Push images from CI
 
 ```sh
-vops user add shop-ci --pattern 'shop/.*'     # prints a token once
+vops user add shop-ci --repo shop/web --repo shop/api   # a deployer; prints a token once (--global: every repo)
 ```
 
 ```yaml

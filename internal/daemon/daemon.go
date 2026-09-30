@@ -13,8 +13,6 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
-	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -45,6 +43,7 @@ type Daemon struct {
 	proxy      *proxy.Client
 	pushMu     sync.Mutex
 	proxyDirty atomic.Bool // the last push failed: retried every second
+	webRoutes  []string    // patterns of the web api, as API(false) registered them (tests walk them)
 }
 
 type cachedAuth struct {
@@ -164,6 +163,8 @@ type ProxyState struct {
 	Routes  int    `json:"routes"`
 	InSync  bool   `json:"in_sync"`
 	Error   string `json:"error,omitempty"`
+
+	Limited map[string]proxy.Counters `json:"limited,omitempty"` // per project: requests refused by x-vops limits
 }
 
 func (d *Daemon) proxyState(ctx context.Context) (ProxyState, []string) {
@@ -174,7 +175,7 @@ func (d *Daemon) proxyState(ctx context.Context) (ProxyState, []string) {
 		return ProxyState{Error: err.Error()}, []string{"the proxy is not running: sites are down until it is back (it restarts by itself; check: journalctl -u vops-proxy)"}
 	}
 	ours := d.Routes.Routes()
-	ps := ProxyState{Up: true, Version: st.Version, Binary: st.Binary, Routes: st.Routes, InSync: st.Hash == proxy.Hash(ours)}
+	ps := ProxyState{Up: true, Version: st.Version, Binary: st.Binary, Routes: st.Routes, InSync: st.Hash == proxy.Hash(ours), Limited: st.Limited}
 	var warns []string
 	if !ps.InSync {
 		warns = append(warns, fmt.Sprintf("the proxy serves %d routes, the daemon has %d: they are resent every minute (if it lasts, restart vops-proxy)", st.Routes, len(ours)))
@@ -215,7 +216,8 @@ func (d *Daemon) registryHost() string {
 
 // ---- auth
 
-// registryAuth: the internal user pulls everything; admin pulls everything and pushes nothing; users follow their rules.
+// registryAuth: the internal user pulls everything; admins and global deployers push and pull everything,
+// other deployers their repos. Push and pull are the same permission.
 func (d *Daemon) registryAuth(user, pass string) *registry.Perm {
 	all := func(string) bool { return true }
 	none := func(string) bool { return false }
@@ -229,32 +231,17 @@ func (d *Daemon) registryAuth(user, pass string) *registry.Perm {
 	if c, ok := d.authCache.Load(key); ok && time.Now().Before(c.(cachedAuth).expires) {
 		return c.(cachedAuth).perm
 	}
-	var perm *registry.Perm
-	if user == "admin" {
-		if d.DB.CheckAdmin(pass) {
-			perm = &registry.Perm{Name: user, Pull: all, Push: none}
-		}
-	} else if u, ok := d.DB.CheckUser(user, pass); ok {
-		allowed := UserAllows(u)
-		perm = &registry.Perm{Name: user, Pull: allowed, Push: allowed}
+	u, ok := d.DB.CheckUser(user, pass)
+	if !ok {
+		return nil
 	}
-	if perm != nil {
-		d.authCache.Store(key, cachedAuth{perm, time.Now().Add(5 * time.Minute)})
-	}
+	perm := &registry.Perm{Name: user, Pull: u.Allows, Push: u.Allows}
+	d.authCache.Store(key, cachedAuth{perm, time.Now().Add(5 * time.Minute)})
 	return perm
 }
 
-// UserAllows reports which repos a registry user may push and pull: exact names, or the anchored regex.
-func UserAllows(u store.User) func(string) bool {
-	var re *regexp.Regexp
-	if u.Pattern != "" {
-		re, _ = regexp.Compile("^(?:" + u.Pattern + ")$")
-	}
-	return func(repo string) bool {
-		return slices.Contains(u.Repos, repo) || re != nil && re.MatchString(repo)
-	}
-}
-
+// forgetAuth drops cached registry credentials: every user change calls it, so a deleted user or an old token
+// stops working at once.
 func (d *Daemon) forgetAuth() { d.authCache.Clear() }
 
 // ---- push trigger (the watchtower replacement, and previews from tags)
@@ -454,7 +441,7 @@ func (d *Daemon) retryProxy(ctx context.Context) {
 }
 
 // housekeeping: daily registry GC of uploads, route refresh in case a container restarted on its own
-// (which also resends the whole table to the proxy, so drift heals), expired previews.
+// (which also resends the whole table to the proxy, so drift heals), expired previews and sessions.
 func (d *Daemon) housekeeping(ctx context.Context) {
 	tick := time.NewTicker(time.Minute)
 	defer tick.Stop()
@@ -468,6 +455,7 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		n++
 		d.Engine.Lock(func() { d.Engine.RefreshRoutes(ctx) })
 		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
+		d.DB.PurgeSessions()
 		if n%(24*60) == 0 {
 			if res, err := d.gc(); err == nil && res.Blobs > 0 {
 				d.DB.Event("", "gc", "registry gc: %d manifests, %d blobs, %d bytes freed", res.Manifests, res.Blobs, res.Freed)

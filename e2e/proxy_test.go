@@ -33,7 +33,7 @@ func TestProxyOwnProcess(t *testing.T) {
 	if code, body := w.get("shop.vops.test"); code != 200 || body != "v1" {
 		t.Fatalf("site: %d %q", code, body)
 	}
-	if st := w.vops(dev, "status"); !strings.Contains(st, "proxy up (v1, 1 routes)") || strings.Contains(st, "! the proxy") {
+	if st := w.vops(dev, "status"); !strings.Contains(st, "proxy up (v2, 1 routes)") || strings.Contains(st, "! the proxy") {
 		t.Fatalf("status should show the proxy in sync:\n%s", st)
 	}
 
@@ -108,7 +108,7 @@ func TestProxyOwnProcess(t *testing.T) {
 	w.eventually("the proxy gets the new table", func() bool { _, body := w.get("shop.vops.test"); return body == "v3" })
 	w.eventually("status in sync", func() bool {
 		st := w.vops(dev, "status")
-		return strings.Contains(st, "proxy up (v1, 1 routes)") && !strings.Contains(st, "! the proxy")
+		return strings.Contains(st, "proxy up (v2, 1 routes)") && !strings.Contains(st, "! the proxy")
 	})
 	if ev := w.vops(dev, "events"); !strings.Contains(ev, "proxy unreachable") || !strings.Contains(ev, "proxy reachable again") {
 		t.Fatalf("events should record the proxy outage:\n%s", ev)

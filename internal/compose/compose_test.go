@@ -447,3 +447,49 @@ networks:
 		t.Error("pattern without * accepted")
 	}
 }
+
+func TestLimits(t *testing.T) {
+	svc := "services:\n  a:\n    image: x\n    x-vops: {port: 80}\n"
+	for _, c := range []struct {
+		top  string
+		want Limits
+	}{
+		{"", Limits{}},
+		{"x-vops: {rate: 20/s}\n", Limits{Rate: 20, Burst: 20}},
+		{"x-vops: {rate: 600/m, burst: 50}\n", Limits{Rate: 10, Burst: 50}},
+		{"x-vops: {rate: 30/m}\n", Limits{Rate: 0.5, Burst: 1}},
+		{"x-vops: {rate: 5000/h}\n", Limits{Rate: 5000.0 / 3600, Burst: 2}},
+		{"x-vops: {max_body: 10MB}\n", Limits{MaxBody: 10 << 20}},
+		{"x-vops: {max_body: 512KB, previews: off}\n", Limits{MaxBody: 512 << 10}},
+		{"x-vops: {max_body: 1GB}\n", Limits{MaxBody: 1 << 30}},
+		{"x-vops: {max_body: 4096}\n", Limits{MaxBody: 4096}},
+	} {
+		p, err := load(t, "p", c.top+svc, nil)
+		if err != nil || p.Limits != c.want {
+			t.Errorf("%q: %+v %v, want %+v", c.top, p.Limits, err, c.want)
+		}
+	}
+	for _, c := range []struct{ top, want string }{
+		{"x-vops: {rate: 20}\n", "rate"},
+		{"x-vops: {rate: 0/s}\n", "rate"},
+		{"x-vops: {rate: -1/s}\n", "rate"},
+		{"x-vops: {rate: 20/d}\n", "rate"},
+		{"x-vops: {rate: 1.5/s}\n", "rate"},
+		{"x-vops: {burst: 5}\n", "burst: needs rate"},
+		{"x-vops: {rate: 5/s, burst: 0}\n", "burst must be"},
+		{"x-vops: {rate: 5/s, burst: x}\n", "x-vops"},
+		{"x-vops: {max_body: 10mb}\n", "max_body"},
+		{"x-vops: {max_body: 10TB}\n", "max_body"},
+		{"x-vops: {max_body: 0}\n", "max_body"},
+		{"x-vops: {max_body: -5KB}\n", "max_body"},
+		{"x-vops: {max_body: 99999999999GB}\n", "max_body"},
+		{"x-vops: {rate_limit: 5/s}\n", "not supported"},
+	} {
+		if _, err := load(t, "p", c.top+svc, nil); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q: %v, want an error with %q", c.top, err, c.want)
+		}
+	}
+	if _, err := load(t, "p", "x-vops: {rate: 1/s}\n"+svc, nil, "b.compose.yml", "x-vops: {max_body: 1KB}\n"); err == nil || !strings.Contains(err.Error(), "two compose files") {
+		t.Errorf("limits in two files: %v", err)
+	}
+}

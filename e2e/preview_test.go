@@ -31,7 +31,7 @@ func TestPreviewsFromRegistry(t *testing.T) {
 		t.Fatalf("no admin password:\n%s", out)
 	}
 	w.startDaemon()
-	tm := regexp.MustCompile(`token: (\S+)`).FindStringSubmatch(w.vops(dev, "user", "add", "ci", "--pattern", "shop/.*"))
+	tm := regexp.MustCompile(`token: (\S+)`).FindStringSubmatch(w.vops(dev, "user", "add", "ci", "--global"))
 	ctx := context.Background()
 	push := func(repo, tag, msg string) {
 		t.Helper()
@@ -151,7 +151,7 @@ func TestPreviewsFromRegistry(t *testing.T) {
 		}
 		return resp.StatusCode, string(b)
 	}
-	_, session := call("POST", "/api/login", `{"password":"`+m[1]+`"}`, nil)
+	_, session := call("POST", "/api/login", `{"user":"admin","password":"`+m[1]+`"}`, nil)
 	cookie := &http.Cookie{Name: "vops_session", Value: session}
 	if code, b := call("GET", "/api/previews?project=shop", "", cookie); code != 200 || !strings.Contains(b, `"name":"pr-7"`) || !strings.Contains(b, `"name":"manual"`) || !strings.Contains(b, `"expires_at"`) {
 		t.Fatalf("GET /api/previews: %d %s", code, b)

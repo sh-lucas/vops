@@ -45,15 +45,20 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
                                      ls also shows each service's variables and where they come from)
   preview up <project> --name n [--image svc=ref]... [--ref r] [--from snapshot-id]
   preview ls [project] | rm <project> <name>   previews: <service>.<name>.<project>.<domain>, a copy of the data
-  user ls | add <name> [--pattern re] [--repo r]... [--token-stdin] | rm <name> | token <name>
+  user ls | rm <name>                users: admins (dashboard + every repo) and deployers (registry only)
+  user add <name> --admin            an admin (prompts its password; dashboard and podman login)
+  user add <name> --global | --repo r...   a deployer: every repo, or these (prints its token once;
+                                     --token-stdin: choose it)
+  user token <name> | password <name>   new token for a deployer | new password for an admin
   registry ls [repo] | rm <repo:tag> | gc
   snapshot ls [project] | create <project> [-m note] | rm <id>
+  snapshot export <project> <id> > f.tar.gz | import <project> < f.tar.gz   backups (btrfs), off-host
   rollback <project> [deploy-id] [--images] [--data] [--service s]... [--snapshot id] [-y]
                                      back to right before a deploy (default: the last one): its images
                                      (pinned by digest) and its data; undo: rollback <project> <rollback-id>
   unpin <project> [service...]       back to the images compose says (rolling)
   history <project> [-n N]           deploys, rollbacks and snapshots, newest first
-  admin password                     set the dashboard password
+  admin password                     same as user password admin
   events [project]                   what happened (deploys, pushes, config)
   audit [-n N]                       every write to the host's state
   version
@@ -130,11 +135,15 @@ func dispatch(g globals, cmd string, rest []string) (err error) {
 		err = cmdEnv(g, rest)
 	case "admin":
 		err = cmdAdmin(g, rest)
+	case "user":
+		err = cmdUser(g, rest)
+	case "snapshot":
+		err = cmdSnapshot(g, rest)
 	case "rollback":
 		err = cmdRollback(g, rest)
 	case "preview":
 		err = cmdPreview(g, rest)
-	case "status", "plan", "logs", "restart", "enable", "disable", "user", "registry", "events", "snapshot", "audit", "history", "unpin":
+	case "status", "plan", "logs", "restart", "enable", "disable", "registry", "events", "audit", "history", "unpin":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)

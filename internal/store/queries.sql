@@ -16,6 +16,10 @@ ON CONFLICT (path) DO UPDATE SET disabled = excluded.disabled;
 INSERT INTO projects (path, commit_sha, applied_at) VALUES (?, ?, ?)
 ON CONFLICT (path) DO UPDATE SET commit_sha = excluded.commit_sha, applied_at = excluded.applied_at;
 
+-- name: SetProjectLimits :exec
+INSERT INTO projects (path, limits) VALUES (?, ?)
+ON CONFLICT (path) DO UPDATE SET limits = excluded.limits;
+
 -- name: DeleteProject :exec
 DELETE FROM projects WHERE path = ?;
 
@@ -32,14 +36,16 @@ SELECT key, updated_at FROM env WHERE project = ? ORDER BY key;
 -- name: ListEnv :many
 SELECT key, value FROM env WHERE project = ?;
 
--- name: CreateOrReplaceUser :exec
-INSERT INTO users (name, token_hash, pattern, repos, created_at) VALUES (?, ?, ?, ?, ?)
-ON CONFLICT (name) DO UPDATE SET token_hash = excluded.token_hash, pattern = excluded.pattern, repos = excluded.repos;
+-- name: CreateUser :exec
+INSERT INTO users (name, role, global, secret, created_at) VALUES (?, ?, ?, ?, ?);
 
--- name: UpdateUserRules :execrows
-UPDATE users SET pattern = ?, repos = ? WHERE name = ?;
+-- name: UpdateUser :execrows
+-- an empty secret keeps the current one
+UPDATE users SET role = sqlc.arg(role), global = sqlc.arg(global),
+    secret = CASE WHEN sqlc.arg(secret) = '' THEN secret ELSE sqlc.arg(secret) END
+WHERE name = sqlc.arg(name);
 
--- name: DeleteUser :exec
+-- name: DeleteUser :execrows
 DELETE FROM users WHERE name = ?;
 
 -- name: ListUsers :many
@@ -48,20 +54,32 @@ SELECT * FROM users ORDER BY name;
 -- name: GetUser :one
 SELECT * FROM users WHERE name = ?;
 
--- name: CreateSession :exec
-INSERT INTO sessions (id_hash, expires) VALUES (?, ?);
+-- name: CountAdmins :one
+SELECT count(*) FROM users WHERE role = 'admin';
 
--- name: DeleteExpiredSessions :exec
+-- name: ListUserRepos :many
+SELECT * FROM user_repos ORDER BY user, repo;
+
+-- name: ListReposOfUser :many
+SELECT repo FROM user_repos WHERE user = ? ORDER BY repo;
+
+-- name: DeleteUserRepos :exec
+DELETE FROM user_repos WHERE user = ?;
+
+-- name: AddUserRepo :exec
+INSERT INTO user_repos (user, repo) VALUES (?, ?);
+
+-- name: CreateSession :exec
+INSERT INTO sessions (id_hash, user, expires) VALUES (?, ?, ?);
+
+-- name: DeleteExpiredSessions :execrows
 DELETE FROM sessions WHERE expires < ?;
 
--- name: GetSessionExpiry :one
-SELECT expires FROM sessions WHERE id_hash = ?;
+-- name: GetSession :one
+SELECT user, expires FROM sessions WHERE id_hash = ?;
 
 -- name: DeleteSession :exec
 DELETE FROM sessions WHERE id_hash = ?;
-
--- name: DeleteAllSessions :exec
-DELETE FROM sessions;
 
 -- name: CreateEvent :exec
 INSERT INTO events (at, project, kind, message) VALUES (?, ?, ?, ?);
@@ -90,9 +108,9 @@ ORDER BY id DESC;
 SELECT * FROM snapshot_volumes WHERE snapshot_id = ? ORDER BY name;
 
 -- name: ListAutoSnapshotsToPrune :many
--- automatic snapshots (not manual) of a project beyond the newest `keep`
+-- automatic snapshots (not manual or uploaded) of a project beyond the newest `keep`
 SELECT * FROM snapshots
-WHERE project = sqlc.arg(project) AND reason != 'manual'
+WHERE project = sqlc.arg(project) AND reason NOT IN ('manual', 'upload')
 ORDER BY id DESC LIMIT -1 OFFSET sqlc.arg(keep);
 
 -- name: DeleteSnapshot :exec

@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -127,13 +128,14 @@ type Project struct {
 	Disabled  bool   `json:"disabled"`
 	Commit    string `json:"commit"`
 	AppliedAt int64  `json:"applied_at"`
+	Limits    string `json:"limits,omitempty"` // proxy limits as applied (json proxy.Limits), '' = none
 }
 
 func (d *DB) Projects() (map[string]Project, error) {
 	rows, err := d.q.ListProjects(ctx)
 	out := map[string]Project{}
 	for _, r := range rows {
-		out[r.Path] = Project{r.Path, r.Disabled, r.CommitSha, r.AppliedAt}
+		out[r.Path] = Project{r.Path, r.Disabled, r.CommitSha, r.AppliedAt, r.Limits}
 	}
 	return out, err
 }
@@ -144,6 +146,11 @@ func (d *DB) SetDisabled(path string, disabled bool) error {
 
 func (d *DB) SetApplied(path, commit string) error {
 	return d.q.SetProjectApplied(ctx, queries.SetProjectAppliedParams{Path: path, CommitSha: commit, AppliedAt: now()})
+}
+
+// SetLimits records a project's applied proxy limits (json, ” = none).
+func (d *DB) SetLimits(path, limits string) error {
+	return d.q.SetProjectLimits(ctx, queries.SetProjectLimitsParams{Path: path, Limits: limits})
 }
 
 func (d *DB) DeleteProject(path string) error { return d.q.DeleteProject(ctx, path) }
@@ -197,73 +204,209 @@ func (d *DB) Env(project string) (map[string]string, error) {
 	return out, nil
 }
 
-// ---- registry users
+// ---- users: admins (dashboard, every repo) and deployers (registry only: every repo, or a list)
+
+const (
+	Admin    = "admin"
+	Deployer = "deployer"
+)
 
 type User struct {
 	Name      string   `json:"name"`
-	Pattern   string   `json:"pattern"`
-	Repos     []string `json:"repos"`
+	Role      string   `json:"role"`   // admin | deployer
+	Global    bool     `json:"global"` // push/pull every repo (always true for admins)
+	Repos     []string `json:"repos"`  // otherwise only these
 	CreatedAt int64    `json:"created_at"`
 }
 
-func userFrom(r queries.User) User {
-	u := User{Name: r.Name, Pattern: r.Pattern, CreatedAt: r.CreatedAt, Repos: []string{}}
-	json.Unmarshal([]byte(r.Repos), &u.Repos)
-	return u
+// Allows reports whether the user may push and pull repo (the same permission).
+func (u User) Allows(repo string) bool { return u.Global || slices.Contains(u.Repos, repo) }
+
+// NormalizeRepos trims names, drops what follows a ':' (shop/web:latest is shop/web), empties and duplicates.
+func NormalizeRepos(repos []string) []string {
+	out := []string{}
+	for _, r := range repos {
+		r, _, _ = strings.Cut(r, ":")
+		if r = strings.TrimSpace(r); r != "" && !slices.Contains(out, r) {
+			out = append(out, r)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
-// PutUser creates or updates a user. An empty token keeps the current one.
-func (d *DB) PutUser(u User, token string) error {
-	if u.Repos == nil {
-		u.Repos = []string{}
+// dbErr turns a trigger's RAISE into its message.
+func dbErr(err error) error {
+	if err == nil {
+		return nil
 	}
-	repos, _ := json.Marshal(u.Repos)
-	if token == "" {
-		n, err := d.q.UpdateUserRules(ctx, queries.UpdateUserRulesParams{Pattern: u.Pattern, Repos: string(repos), Name: u.Name})
-		if err == nil && n == 0 {
-			err = fmt.Errorf("user %q not found", u.Name)
+	msg := err.Error()
+	for _, m := range []string{"the last admin can't be deleted", "the last admin can't be demoted", "a global user has no repo list"} {
+		if strings.Contains(msg, m) {
+			return errors.New(m)
 		}
+	}
+	return err
+}
+
+// secretHash is how a secret is stored: pbkdf2 for admin passwords (typed by people), sha256 for generated tokens.
+func secretHash(role, secret string) (string, error) {
+	if role != Admin {
+		return Hash(secret), nil
+	}
+	salt := make([]byte, 16)
+	rand.Read(salt)
+	key, err := pbkdf2.Key(sha256.New, secret, salt, pbkdf2Iter, 32)
+	if err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(salt) + ":" + hex.EncodeToString(key), nil
+}
+
+func checkSecret(stored, secret string) bool {
+	salt, key, ok := strings.Cut(stored, ":")
+	if !ok {
+		return equalHash(stored, Hash(secret))
+	}
+	s, _ := hex.DecodeString(salt)
+	got, err := pbkdf2.Key(sha256.New, secret, s, pbkdf2Iter, 32)
+	return err == nil && equalHash(hex.EncodeToString(got), key)
+}
+
+// PutUser creates or updates a user and its repo list. secret is an admin's password or a deployer's token;
+// empty keeps the current one. The db enforces the rules (admins are global and have a password, the last
+// admin stays, global users have no list) and logs the user out on a demotion or a new secret.
+func (d *DB) PutUser(u User, secret string) error {
+	if u.Role == Admin {
+		u.Global = true
+	}
+	repos := NormalizeRepos(u.Repos)
+	if u.Global {
+		repos = nil
+	}
+	hash := ""
+	if secret != "" {
+		var err error
+		if hash, err = secretHash(u.Role, secret); err != nil {
+			return err
+		}
+	}
+	tx, err := d.sql.BeginTx(ctx, nil)
+	if err != nil {
 		return err
 	}
-	return d.q.CreateOrReplaceUser(ctx, queries.CreateOrReplaceUserParams{Name: u.Name, TokenHash: Hash(token), Pattern: u.Pattern, Repos: string(repos), CreatedAt: now()})
+	defer tx.Rollback()
+	q := d.q.WithTx(tx)
+	old, err := q.GetUser(ctx, u.Name)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		if hash == "" {
+			return fmt.Errorf("user %q needs a password or a token", u.Name)
+		}
+		err = q.CreateUser(ctx, queries.CreateUserParams{Name: u.Name, Role: u.Role, Global: u.Global, Secret: hash, CreatedAt: now()})
+	case err != nil:
+		return err
+	default:
+		if hash == "" && old.Role != u.Role {
+			return fmt.Errorf("user %q changes role: it needs a new %s", u.Name, map[bool]string{true: "password", false: "token"}[u.Role == Admin])
+		}
+		_, err = q.UpdateUser(ctx, queries.UpdateUserParams{Role: u.Role, Global: u.Global, Secret: hash, Name: u.Name})
+	}
+	if err != nil {
+		return dbErr(err)
+	}
+	if err := q.DeleteUserRepos(ctx, u.Name); err != nil {
+		return err
+	}
+	for _, r := range repos {
+		if err := q.AddUserRepo(ctx, queries.AddUserRepoParams{User: u.Name, Repo: r}); err != nil {
+			return dbErr(err)
+		}
+	}
+	return tx.Commit()
 }
 
-func (d *DB) DeleteUser(name string) error { return d.q.DeleteUser(ctx, name) }
+// DeleteUser removes a user, its repos and its sessions (cascade).
+func (d *DB) DeleteUser(name string) error {
+	n, err := d.q.DeleteUser(ctx, name)
+	if err == nil && n == 0 {
+		err = fmt.Errorf("no user %q", name)
+	}
+	return dbErr(err)
+}
 
 func (d *DB) Users() ([]User, error) {
 	rows, err := d.q.ListUsers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	repos, err := d.q.ListUserRepos(ctx)
+	if err != nil {
+		return nil, err
+	}
 	out := []User{}
 	for _, r := range rows {
-		out = append(out, userFrom(r))
+		u := User{Name: r.Name, Role: r.Role, Global: r.Global, Repos: []string{}, CreatedAt: r.CreatedAt}
+		for _, ur := range repos {
+			if ur.User == r.Name {
+				u.Repos = append(u.Repos, ur.Repo)
+			}
+		}
+		out = append(out, u)
 	}
-	return out, err
+	return out, nil
 }
 
-// CheckUser returns the user if name/token match.
-func (d *DB) CheckUser(name, token string) (User, bool) {
+// User returns one user; found is false when it doesn't exist.
+func (d *DB) User(name string) (u User, found bool, err error) {
 	r, err := d.q.GetUser(ctx, name)
-	if err != nil || !equalHash(r.TokenHash, Hash(token)) {
+	if errors.Is(err, sql.ErrNoRows) {
+		return User{}, false, nil
+	}
+	if err != nil {
+		return User{}, false, err
+	}
+	repos, err := d.q.ListReposOfUser(ctx, name)
+	return User{Name: r.Name, Role: r.Role, Global: r.Global, Repos: repos, CreatedAt: r.CreatedAt}, true, err
+}
+
+// CheckUser returns the user if name and secret (password or token) match.
+func (d *DB) CheckUser(name, secret string) (User, bool) {
+	r, err := d.q.GetUser(ctx, name)
+	if err != nil || !checkSecret(r.Secret, secret) {
 		return User{}, false
 	}
-	return userFrom(r), true
+	u, found, err := d.User(name)
+	return u, found && err == nil
 }
 
-// ---- sessions
+// HasAdmin reports whether someone can log into the dashboard.
+func (d *DB) HasAdmin() bool {
+	n, err := d.q.CountAdmins(ctx)
+	return err == nil && n > 0
+}
 
-func (d *DB) NewSession(ttl time.Duration) (string, error) {
+// ---- sessions (a session belongs to a user; the db drops them when the user goes, is demoted or gets a new secret)
+
+func (d *DB) NewSession(user string, ttl time.Duration) (string, error) {
 	id := Token()
 	d.q.DeleteExpiredSessions(ctx, now())
-	return id, d.q.CreateSession(ctx, queries.CreateSessionParams{IDHash: Hash(id), Expires: time.Now().Add(ttl).Unix()})
+	return id, d.q.CreateSession(ctx, queries.CreateSessionParams{IDHash: Hash(id), User: user, Expires: time.Now().Add(ttl).Unix()})
 }
 
-func (d *DB) CheckSession(id string) bool {
-	exp, err := d.q.GetSessionExpiry(ctx, Hash(id))
-	return err == nil && exp > now()
+// CheckSession returns the user of a live session.
+func (d *DB) CheckSession(id string) (string, bool) {
+	s, err := d.q.GetSession(ctx, Hash(id))
+	if err != nil || s.Expires <= now() {
+		return "", false
+	}
+	return s.User, true
 }
 
 func (d *DB) DeleteSession(id string) { d.q.DeleteSession(ctx, Hash(id)) }
 
-func (d *DB) DeleteSessions() { d.q.DeleteAllSessions(ctx) }
+// PurgeSessions deletes expired sessions and returns how many (the housekeeping tick).
+func (d *DB) PurgeSessions() (int64, error) { return d.q.DeleteExpiredSessions(ctx, now()) }
 
 // ---- events (for humans; retention is a trigger)
 
@@ -378,32 +521,8 @@ func (d *DB) SnapshotsToPrune(project string, keep int) ([]Snapshot, error) {
 
 func (d *DB) DeleteSnapshot(id int64) error { return d.q.DeleteSnapshot(ctx, id) }
 
-// ---- admin (dashboard login; can pull every image, push none)
-
+// pbkdf2 iterations for admin passwords
 const pbkdf2Iter = 600_000
-
-func (d *DB) SetAdminPassword(password string) error {
-	salt := make([]byte, 16)
-	rand.Read(salt)
-	key, err := pbkdf2.Key(sha256.New, password, salt, pbkdf2Iter, 32)
-	if err != nil {
-		return err
-	}
-	d.DeleteSessions()
-	return d.SetMeta("admin", hex.EncodeToString(salt)+":"+hex.EncodeToString(key))
-}
-
-func (d *DB) HasAdmin() bool { return d.Meta("admin") != "" }
-
-func (d *DB) CheckAdmin(password string) bool {
-	salt, key, ok := strings.Cut(d.Meta("admin"), ":")
-	if !ok {
-		return false
-	}
-	s, _ := hex.DecodeString(salt)
-	got, err := pbkdf2.Key(sha256.New, password, s, pbkdf2Iter, 32)
-	return err == nil && equalHash(hex.EncodeToString(got), key)
-}
 
 // ---- previews
 

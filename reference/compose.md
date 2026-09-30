@@ -6,7 +6,7 @@ vops reads compose files itself and runs `podman run`. It supports the subset be
 
 A project dir may have `compose.yml`, `compose.yaml`, `docker-compose.yml`, `docker-compose.yaml` and any `*.compose.yml`/`*.compose.yaml`. They are merged; a service defined twice is an error. Dir names must match `[A-Za-z0-9][A-Za-z0-9_-]*`.
 
-Top level: `services`, `volumes` (`name`, `external`), `networks` (see below), `version` and `name` (ignored), `x-vops` (`previews`, see x-vops). Not supported: `secrets`, `configs`.
+Top level: `services`, `volumes` (`name`, `external`), `networks` (see below), `version` and `name` (ignored), `x-vops` (`previews`, `rate`, `burst`, `max_body`, see x-vops). Not supported: `secrets`, `configs`.
 
 ## Service keys
 
@@ -100,7 +100,12 @@ services:
 
 x-vops:                     # top level: project settings
   previews: "preview-*"     # registry tags that create previews (default "preview-*"; "off" disables)
+  rate: 20/s                # requests per client ip, per s, m or h (600/m); default unlimited
+  burst: 40                 # requests allowed at once (default: rate per second rounded up, min 1)
+  max_body: 10MB            # request body size: B, KB, MB, GB, 1024-based (10MB = 10485760 bytes); default unlimited
 ```
+
+Limits apply in the proxy to every routed service of the project (and its previews), per client ip (the tcp peer; `X-Forwarded-For` is ignored): over `rate` the answer is `429` with `Retry-After`, a bigger body `413` (early on `Content-Length`, while streaming for chunked bodies). They are set in one compose file of the project. A change shows in the plan (`~ limits: unlimited -> rate 20/s burst 40`) and applies without restarting containers.
 
 Domains: project `shop/api` is `api.shop.<domain>`. Each routed service gets `<service>.api.shop.<domain>`; when a project has a single routed service it also gets `api.shop.<domain>`.
 

@@ -62,7 +62,10 @@ function toast(msg) {
 async function request(method, path, body) {
   const opts = { method, headers: {} };
   if (method !== "GET") opts.headers["X-Vops"] = "1";
-  if (body !== undefined) {
+  if (body instanceof Blob) {
+    opts.headers["Content-Type"] = "application/gzip"; // a file (backup upload): streamed as is
+    opts.body = body;
+  } else if (body !== undefined) {
     opts.headers["Content-Type"] = "application/json";
     opts.body = JSON.stringify(body);
   }
@@ -353,7 +356,8 @@ function renderChrome(st) {
   $hoststat.replaceChildren(
     h("span", { title: "~/vops on the host is at this commit" }, icon("commit"), h("span", { class: "mono" }, short(st.commit, 8) || "no commits")),
     h("span", { class: "dom", title: "domain (vops.yml)" }, icon("globe"), st.domain || "no domain"),
-    proxyChip(st.proxy));
+    proxyChip(st.proxy),
+    st.user ? h("span", { title: "logged in as " + st.user }, icon("user"), st.user) : null);
   $pending.hidden = !st.changes;
   const sig = JSON.stringify([st.projects.map((p) => [p.path, health(p)]), st.previews]);
   if (sig !== sideSig) {
@@ -390,6 +394,7 @@ function showLogin() {
   $shell.hidden = true;
   document.body.classList.remove("nav-open");
   if ($login.firstChild) return;
+  const user = h("input", { placeholder: "User", value: "admin", autocomplete: "username", "aria-label": "user", autocapitalize: "none" });
   const pw = h("input", { type: "password", placeholder: "Password", autocomplete: "current-password", "aria-label": "password" });
   const err = h("div", { class: "error small center" });
   const btn = h("button", { class: "btn primary" }, "Log in");
@@ -398,7 +403,7 @@ function showLogin() {
     err.textContent = "";
     await busy(btn, async () => {
       try {
-        await api("POST", "/login", { password: pw.value });
+        await api("POST", "/login", { user: user.value.trim(), password: pw.value });
         $login.replaceChildren();
         route();
       } catch (x) { err.textContent = x.message; }
@@ -406,8 +411,8 @@ function showLogin() {
   } },
     h("span", { class: "logo" }, "v"),
     h("h1", {}, "vops"),
-    h("p", { class: "muted small center" }, "Log in as admin"),
-    pw, btn, err)));
+    h("p", { class: "muted small center" }, "Admins only"),
+    user, pw, btn, err)));
   pw.focus();
 }
 
@@ -535,7 +540,8 @@ function projectHead(ctx) {
     });
   } }, p.disabled ? "Enable" : "Disable");
   return head({ title: name, crumbs: parts.length ? parts.join(" / ") + " / " : null, dot: healthDot(p, "lg"),
-    sub: [p.commit ? ["applied ", mono(short(p.commit, 8)), " · ", when(p.applied_at)] : "never applied", projectTags(p)],
+    sub: [p.commit ? ["applied ", mono(short(p.commit, 8)), " · ", when(p.applied_at)] : "never applied", projectTags(p),
+      p.limits ? [" ", sep(), " ", h("span", { title: "x-vops limits in the proxy" + (p.refused ? `; refused since it started: ${p.refused.limited} too many requests (429), ${p.refused.too_large} too large (413)` : "") }, p.limits)] : null],
     actions: [h("a", { class: "btn", href: "#/files?dir=" + enc(path) }, icon("file"), "Files"), toggle] });
 }
 
@@ -789,6 +795,8 @@ function changeLine(c) {
   return h("div", { class: "chg mono small wrapany" }, h("span", { class: "svc" }, c.service), " ", what);
 }
 
+const exportHref = (s) => "/api/snapshots/export?id=" + s.id + "&project=" + enc(s.project);
+
 function timelineTab(ctx, box) {
   const { path } = ctx;
   box.replaceChildren(loading());
@@ -822,6 +830,7 @@ function timelineTab(ctx, box) {
       const restore = dep ? h("button", { class: "btn sm", title: n.kind === "rollback" ? "Back to right before this rollback" : "Back to right before this deploy: its images, its data",
         onclick: () => rollbackDialog(ctx, dep.id) }, n.kind === "rollback" ? [icon("undo"), "Undo…"] : [icon("undo"), "Roll back…"])
         : s ? h("button", { class: "btn sm", title: "Put back this snapshot's data", onclick: () => restoreSnapshot(ctx, s) }, "Restore data") : null;
+      const download = n.kind === "snapshot" ? h("a", { class: "btn sm", href: exportHref(s), download: "", title: "This snapshot as a .tar.gz (vops snapshot import restores it, here or on another host)" }, icon("download"), "Download") : null;
       const del = n.kind === "snapshot" ? h("button", { class: "btn sm danger", onclick: async () => {
         if (!(await confirmDialog({ title: `Delete snapshot #${s.id}?`, ok: "Delete", danger: true,
           body: [`${s.reason} snapshot taken ${ago(s.created_at)}${s.note ? ` (${s.note})` : ""}. It can't be recovered.`] }))) return;
@@ -845,7 +854,7 @@ function timelineTab(ctx, box) {
           h("div", { class: "tl-foot" }, snapBadge(n), chips(n), h("span", { class: "spacer" }),
             h("div", { class: "actions" }, restore,
               h("button", { class: "btn sm", onclick: () => previewFrom(ctx, n, t), title: "A preview of this point: its commit and images" + (s ? ", on a copy of snapshot #" + s.id : ", on a copy of the current data") }, icon("git"), "Preview from here"),
-              del))));
+              download, del))));
     };
     // now: what runs, the data it has, and a manual snapshot
     const p = ctx.p;
@@ -860,6 +869,26 @@ function timelineTab(ctx, box) {
         load();
       });
     } }, note, takeBtn) : null;
+    // backups: download = a manual snapshot, then its .tar.gz; upload = a new snapshot, then the usual restore dialog
+    const off = !d.supported ? d.reason : !d.protected.length ? "no data to back up" : null;
+    const dlBtn = h("button", { class: "btn sm", disabled: !!off, title: off || "Takes a snapshot now and downloads it as a .tar.gz" }, icon("download"), "Download current data");
+    dlBtn.onclick = () => busy(dlBtn, async () => {
+      const r = await api("POST", "/snapshots", { project: path, note: "downloaded" });
+      location.href = exportHref(r.snapshot);
+      load();
+    });
+    const file = h("input", { type: "file", accept: ".gz,.tgz,application/gzip", hidden: true });
+    const upBtn = h("button", { class: "btn sm", disabled: !!off, title: off || "A .tar.gz from Download or vops snapshot export: it becomes a snapshot you can restore", onclick: () => file.click() }, "Upload backup");
+    file.onchange = () => {
+      const f = file.files[0];
+      file.value = "";
+      if (f) busy(upBtn, async () => {
+        const r = await api("POST", "/snapshots/import?project=" + enc(path), f);
+        toast("Uploaded as snapshot #" + r.snapshot.id);
+        await load();
+        restoreSnapshot(ctx, r.snapshot);
+      });
+    };
     const pending = p.services.some((x) => x.pending);
     const now = h("li", { class: "tl-node now" },
       h("span", { class: "tl-dot" }),
@@ -870,7 +899,7 @@ function timelineTab(ctx, box) {
         images.length ? h("div", { class: "tl-imgs" }, images.map(([svc, image, digest]) => h("span", { class: "tag mono", title: svc + ": " + image + (digest ? "@" + digest : "") }, imgName(image).startsWith(svc + ":") ? imgName(image) : [h("span", { class: "faint" }, svc), " " + imgName(image)]))) : null,
         h("div", { class: "tl-foot" },
           h("span", { class: "small muted" }, d.supported ? (d.protected.length ? ["Data: ", mono(d.protected.join(", "))] : "No data to snapshot") : "Snapshots unavailable"),
-          h("span", { class: "spacer" }), take)));
+          h("span", { class: "spacer" }), take, h("div", { class: "actions" }, dlBtn, upBtn, file))));
     put(box,
       !d.supported ? alertBox("warn", "Snapshots unavailable", h("span", { class: "small" }, d.reason + ". Deploys are still recorded; restoring data and branching from a point need snapshots.")) : null,
       d.unprotected && d.unprotected.length ? alertBox("warn", "Not covered by snapshots", h("span", { class: "small" }, "Not btrfs subvolumes: ", mono(d.unprotected.join(", ")))) : null,
@@ -1243,7 +1272,7 @@ async function registryPage(alive) {
       body: ["Pulls of this tag fail from now on; running containers keep running. Its layers are freed by the next garbage collection."] }))) return;
     try { await api("DELETE", "/registry?repo=" + enc(r.name) + "&tag=" + enc(t.name)); toast("Deleted " + r.name + ":" + t.name); registryPage(alive); } catch (x) { toast(x.message); }
   };
-  page(head({ title: "Registry", sub: [h("span", {}, "podman login ", mono(host)), sep(), "admin can pull everything and push nothing"], actions: gcBtn }),
+  page(head({ title: "Registry", sub: [h("span", {}, "podman login ", mono(host)), sep(), "admins and global users push and pull everything, others their repositories"], actions: gcBtn }),
     reg.repos.length ? h("div", { class: "stack" }, reg.repos.map((r) => panel(
       panelHead(icon("box"), h("h2", { class: "mono wrapany" }, r.name), h("span", { class: "tag" }, r.tags.length + " tag" + (r.tags.length === 1 ? "" : "s"))),
       table(["Tag", "Digest", "Size", "Pushed", ""], r.tags.map((t) => h("tr", {},
@@ -1255,50 +1284,72 @@ async function registryPage(alive) {
       : panel(empty("Nothing pushed yet", ["podman push ", h("span", { class: "mono" }, host + "/<project>/<image>:<tag>")])));
 }
 
-// ---- registry users
+// ---- users: admins (dashboard + every repo) and deployers (registry only)
 
 async function usersPage(alive, created) {
   let users;
   try { users = await api("GET", "/users"); } catch (e) { return failed(e, alive); }
   if (!alive()) return;
   const name = h("input", { placeholder: "shop-ci", required: true, pattern: "[a-z0-9][a-z0-9._-]*" });
-  const pattern = h("input", { placeholder: "shop/.*", class: "mono" });
+  const role = h("select", {}, h("option", { value: "deployer" }, "Deployer (registry only)"), h("option", { value: "admin" }, "Admin (dashboard + every repo)"));
+  const global = h("input", { type: "checkbox" });
   const repos = h("input", { placeholder: "shop/web, shop/api", class: "mono" });
+  const password = h("input", { type: "password", placeholder: "at least 12 characters", autocomplete: "new-password", minlength: 12 });
+  const globalBox = h("label", { class: "check" }, global, "Every repository");
+  const reposBox = h("label", { class: "field" }, "Repositories", repos);
+  const pwBox = h("label", { class: "field" }, "Password", password);
+  const sync = () => {
+    const admin = role.value === "admin";
+    globalBox.hidden = admin;
+    reposBox.hidden = admin || global.checked;
+    pwBox.hidden = !admin;
+  };
+  role.onchange = global.onchange = sync;
   const saveBtn = h("button", { class: "btn primary" }, "Save");
   const save = async (body) => {
     try {
       const r = await api("POST", "/users", body);
+      if (!r.token) toast("Saved " + r.name);
       usersPage(alive, r.token ? r : null);
     } catch (x) { toast(x.message); }
   };
   const form = h("form", { class: "inline", onsubmit: (e) => {
     e.preventDefault();
-    busy(saveBtn, () => save({ name: name.value, pattern: pattern.value, repos: repos.value.split(",").map((s) => s.trim()).filter(Boolean) }));
-  } }, h("label", { class: "field" }, "Name", name), h("label", { class: "field" }, "Regex (anchored)", pattern), h("label", { class: "field" }, "Or exact repositories", repos), saveBtn);
+    const body = { name: name.value, role: role.value };
+    if (role.value === "admin") { if (password.value) body.password = password.value; }
+    else { body.global = global.checked; body.repos = global.checked ? [] : repos.value.split(",").map((s) => s.trim()).filter(Boolean); }
+    busy(saveBtn, () => save(body));
+  } }, h("label", { class: "field" }, "Name", name), h("label", { class: "field" }, "Role", role), globalBox, reposBox, pwBox, saveBtn);
+  sync();
 
+  const edit = (u) => {
+    name.value = u.name; role.value = u.role; global.checked = u.global; repos.value = (u.repos || []).join(", "); password.value = "";
+    sync();
+    name.focus();
+  };
   const rotate = async (u) => {
     if (!(await confirmDialog({ title: `New token for ${u.name}?`, ok: "Generate new token", danger: true,
       body: ["The current token stops working right away: update it wherever it's used (CI secrets, other hosts)."] }))) return;
-    save({ name: u.name, pattern: u.pattern, repos: u.repos, new_token: true });
+    save({ name: u.name, new_token: true });
   };
   const del = async (u) => {
     if (!(await confirmDialog({ title: `Delete ${u.name}?`, ok: "Delete user", danger: true,
-      body: ["Its token stops working right away: anything logging in as it loses registry access. Images stay."] }))) return;
+      body: [u.role === "admin" ? "Its sessions end and its password stops working right away, in the dashboard and the registry." : "Its token stops working right away: anything logging in as it loses registry access. Images stay."] }))) return;
     try { await api("DELETE", "/users?name=" + enc(u.name)); toast("Deleted " + u.name); usersPage(alive); } catch (x) { toast(x.message); }
   };
   const dash = h("span", { class: "faint" }, "—");
-  page(head({ title: "Registry users", sub: "Each user can push and pull the repositories matching its regex or list." }),
+  page(head({ title: "Users", sub: "Admins log into the dashboard and push and pull every repository (podman login with their password). Deployers only use the registry, with a token: every repository, or a list." }),
     created ? alertBox("info", `Token for ${created.name} (shown once)`, [
       h("div", { class: "token mono" }, created.token),
       h("pre", {}, `podman login -u ${created.name} ${location.hostname.replace(/^vops\./, "registry.")}`)]) : null,
-    panel(users.length ? table(["Name", "Regex", "Repositories", "Created", ""], users.map((u) => h("tr", {},
-      h("td", { class: "mono" }, u.name),
-      h("td", { class: "mono small wrapany" }, u.pattern || dash.cloneNode(true)),
-      h("td", { class: "mono small wrapany" }, (u.repos || []).join(", ") || dash.cloneNode(true)),
+    panel(users.length ? table(["Name", "Role", "Access", "Created", ""], users.map((u) => h("tr", {},
+      h("td", { class: "mono" }, u.name, status && status.user === u.name ? h("span", { class: "tag" }, "you") : null),
+      h("td", {}, u.role),
+      h("td", { class: "mono small wrapany" }, u.global ? "every repository" : (u.repos || []).join(", ") || dash.cloneNode(true)),
       h("td", { class: "muted" }, when(u.created_at)),
       h("td", { class: "actions-cell" }, h("div", { class: "actions" },
-        h("button", { class: "btn sm", onclick: () => { name.value = u.name; pattern.value = u.pattern; repos.value = (u.repos || []).join(", "); name.focus(); } }, "Edit"),
-        h("button", { class: "btn sm", onclick: () => rotate(u) }, "New token"),
+        h("button", { class: "btn sm", onclick: () => edit(u) }, "Edit"),
+        u.role === "deployer" ? h("button", { class: "btn sm", onclick: () => rotate(u) }, "New token") : null,
         h("button", { class: "btn sm danger", onclick: () => del(u) }, "Delete"))))))
       : empty("No users yet", "Add one below to push from CI or another machine.")),
     h("div", { class: "section" }, h("div", { class: "section-head" }, h("h2", {}, "Add or edit")), panel(h("div", { class: "panel-body" }, form))));

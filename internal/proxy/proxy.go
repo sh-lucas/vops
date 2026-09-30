@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json/v2"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -29,12 +30,16 @@ type Table struct {
 	mu       sync.RWMutex
 	services map[Key]entry
 	hosts    map[string]Key
+	limits   map[string]*Limits // per project; a preview without its own uses its project's
+	limiter  *limiter
 
 	// OnChange runs after every Set/Replace, synchronously (the daemon pushes the table to the proxy process with it).
 	OnChange func()
 }
 
-func NewTable() *Table { return &Table{services: map[Key]entry{}, hosts: map[string]Key{}} }
+func NewTable() *Table {
+	return &Table{services: map[Key]entry{}, hosts: map[string]Key{}, limits: map[string]*Limits{}, limiter: newLimiter()}
+}
 
 // Set replaces the domains and backends ("127.0.0.1:port") of a service. No backends removes it.
 func (t *Table) Set(k Key, domains, backends []string) {
@@ -49,9 +54,15 @@ func (t *Table) Set(k Key, domains, backends []string) {
 	t.changed()
 }
 
-// Replace swaps the whole table (used when rebuilding from podman).
-func (t *Table) Replace(all map[Key][2][]string) {
+// Replace swaps the whole table and the projects' limits (used when rebuilding from podman).
+func (t *Table) Replace(all map[Key][2][]string, limits map[string]Limits) {
 	t.mu.Lock()
+	t.limits = map[string]*Limits{}
+	for p, l := range limits {
+		if l.set() {
+			t.limits[p] = &l
+		}
+	}
 	t.services = map[Key]entry{}
 	for k, v := range all {
 		if len(v[0]) > 0 && len(v[1]) > 0 {
@@ -65,12 +76,27 @@ func (t *Table) Replace(all map[Key][2][]string) {
 
 // SetRoutes swaps the whole table for a list of routes (what the proxy process receives).
 func (t *Table) SetRoutes(routes []Route) {
-	all := map[Key][2][]string{}
+	all, limits := map[Key][2][]string{}, map[string]Limits{}
 	for _, r := range routes {
 		all[Key{r.Project, r.Service}] = [2][]string{r.Domains, r.Backends}
+		if r.Limits != nil {
+			limits[r.Project] = *r.Limits
+		}
 	}
-	t.Replace(all)
+	t.Replace(all, limits)
 }
+
+// limitsOf is a project's limits; previews (project@name) inherit their project's.
+func (t *Table) limitsOf(project string) *Limits {
+	if l := t.limits[project]; l != nil {
+		return l
+	}
+	base, _, _ := strings.Cut(project, "@")
+	return t.limits[base]
+}
+
+// Limited is what the limits refused so far, per project.
+func (t *Table) Limited() map[string]Counters { return t.limiter.snapshot() }
 
 func (t *Table) changed() {
 	if t.OnChange != nil {
@@ -105,11 +131,17 @@ func (t *Table) Has(host string) bool {
 
 // Backends of a host, round-robin ordered starting at the next one.
 func (t *Table) Backends(host string) []string {
+	b, _, _ := t.lookup(host)
+	return b
+}
+
+// lookup is a host's backends (round-robin ordered), its project and that project's limits.
+func (t *Table) lookup(host string) ([]string, string, *Limits) {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	k, ok := t.hosts[host]
 	if !ok {
-		return nil
+		return nil, "", nil
 	}
 	e := t.services[k]
 	n := len(e.backends)
@@ -118,7 +150,7 @@ func (t *Table) Backends(host string) []string {
 	for i := range n {
 		out = append(out, e.backends[(start+i)%n])
 	}
-	return out
+	return out, k.Project, t.limitsOf(k.Project)
 }
 
 type Route struct {
@@ -126,6 +158,7 @@ type Route struct {
 	Service  string   `json:"service"`
 	Domains  []string `json:"domains"`
 	Backends []string `json:"backends"`
+	Limits   *Limits  `json:"limits,omitempty"`
 }
 
 func (t *Table) Routes() []Route {
@@ -133,7 +166,7 @@ func (t *Table) Routes() []Route {
 	defer t.mu.RUnlock()
 	out := []Route{}
 	for k, e := range t.services {
-		out = append(out, Route{k.Project, k.Service, e.domains, e.backends})
+		out = append(out, Route{k.Project, k.Service, e.domains, e.backends, t.limitsOf(k.Project)})
 	}
 	slices.SortFunc(out, func(a, b Route) int { return strings.Compare(a.Project+"/"+a.Service, b.Project+"/"+b.Service) })
 	return out
@@ -175,13 +208,20 @@ func Handler(t *Table) http.Handler {
 		},
 		Transport: transport,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if mbe := (*http.MaxBytesError)(nil); errors.As(err, &mbe) {
+				http.Error(w, "vops: request body too large", http.StatusRequestEntityTooLarge)
+				return
+			}
 			http.Error(w, "vops: upstream unavailable", http.StatusBadGateway)
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backends := t.Backends(Host(r.Host))
+		backends, project, limits := t.lookup(Host(r.Host))
 		if len(backends) == 0 {
 			http.Error(w, "vops: no such site", http.StatusNotFound)
+			return
+		}
+		if !t.limiter.limit(w, r, project, limits) {
 			return
 		}
 		rp.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, backends[0])))

@@ -434,14 +434,12 @@ func cmdPreview(g globals, args []string) error {
 	return forward(g, "preview", args, nil, os.Stdout)
 }
 
-func cmdAdmin(g globals, args []string) error {
-	if len(args) == 0 || args[0] != "password" {
-		return errors.New("usage: vops admin password")
+// cmdUser prompts an admin's password here (user add --admin, user password) and sends it over stdin.
+func cmdUser(g globals, args []string) error {
+	if len(args) < 2 || slices.Contains(args, "--stdin") || !(args[0] == "password" || args[0] == "add" && slices.Contains(args, "--admin")) {
+		return forward(g, "user", args, os.Stdin, os.Stdout)
 	}
-	if slices.Contains(args, "--stdin") {
-		return forward(g, "admin", args, os.Stdin, os.Stdout)
-	}
-	pw, err := readSecret("new dashboard password: ")
+	pw, err := readSecret("password for " + args[1] + ": ")
 	if err != nil {
 		return err
 	}
@@ -454,7 +452,26 @@ func cmdAdmin(g globals, args []string) error {
 			return errors.New("passwords differ")
 		}
 	}
-	return forward(g, "admin", []string{"password", "--stdin"}, strings.NewReader(pw+"\n"), os.Stdout)
+	return forward(g, "user", append(slices.Clone(args), "--stdin"), strings.NewReader(pw+"\n"), os.Stdout)
+}
+
+// cmdSnapshot forwards; export writes a .tar.gz to stdout and import reads one from stdin, never a terminal.
+func cmdSnapshot(g globals, args []string) error {
+	if len(args) > 0 && args[0] == "export" && isTerminal(os.Stdout) {
+		return errors.New("export writes a .tar.gz: redirect it (vops snapshot export <project> <id> > backup.tar.gz)")
+	}
+	if len(args) > 0 && args[0] == "import" && isTerminal(os.Stdin) {
+		return errors.New("import reads a .tar.gz from stdin: vops snapshot import <project> < backup.tar.gz")
+	}
+	return forward(g, "snapshot", args, os.Stdin, os.Stdout)
+}
+
+// cmdAdmin: `vops admin password` is `vops user password admin` since users have roles.
+func cmdAdmin(g globals, args []string) error {
+	if len(args) == 0 || args[0] != "password" {
+		return errors.New("usage: vops admin password (same as vops user password admin)")
+	}
+	return cmdUser(g, []string{"password", "admin"})
 }
 
 // ---- ui

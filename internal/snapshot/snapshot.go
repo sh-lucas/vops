@@ -45,13 +45,17 @@ func IsSubvolume(path string) bool {
 	return Supported(path) && syscall.Stat(path, &st) == nil && st.Ino == 256
 }
 
-// run runs a command as the owner of container files: directly as root, in `podman unshare` otherwise.
-func run(ctx context.Context, name string, args ...string) error {
+// Command is a command run as the owner of container files: directly as root, in `podman unshare` otherwise.
+func Command(ctx context.Context, name string, args ...string) *exec.Cmd {
 	if os.Getuid() != 0 {
 		args = append([]string{"unshare", name}, args...)
 		name = podman.Bin()
 	}
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	return exec.CommandContext(ctx, name, args...)
+}
+
+func run(ctx context.Context, name string, args ...string) error {
+	out, err := Command(ctx, name, args...).CombinedOutput()
 	if err != nil {
 		msg := strings.TrimSpace(string(out))
 		if strings.Contains(msg, "cross-device") || strings.Contains(msg, "Invalid cross-device link") {
@@ -87,6 +91,22 @@ func EnsureSubvolume(ctx context.Context, path string) (created bool, err error)
 		return false, fmt.Errorf("btrfs subvolume create %s: %s", path, strings.TrimSpace(string(out)))
 	}
 	return true, os.Chmod(path, mode)
+}
+
+// Create makes path a new empty subvolume (its parent is created if missing).
+func Create(ctx context.Context, path string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	if out, err := exec.CommandContext(ctx, "btrfs", "subvolume", "create", path).CombinedOutput(); err != nil {
+		return fmt.Errorf("btrfs subvolume create %s: %s", path, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// ReadOnly makes a subvolume read-only, like the snapshots Take makes.
+func ReadOnly(ctx context.Context, path string) error {
+	return run(ctx, "btrfs", "property", "set", "-ts", path, "ro", "true")
 }
 
 // Take creates a read-only snapshot of the subvolume src at dst.

@@ -1,8 +1,11 @@
 package deploy
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/json/v2"
 	"fmt"
 	"io"
 	"net/http"
@@ -243,14 +246,38 @@ func TestRollingLifecycle(t *testing.T) {
 		t.Fatalf("routes: %+v", r)
 	}
 
-	// routes survive a daemon restart (rebuilt from podman labels)
-	v.e.Routes.Replace(nil)
+	// proxy limits: a plan change of their own, applied without touching the containers
+	ids := slices.Sorted(func(yield func(string) bool) {
+		for _, c := range v.containers(p) {
+			yield(c.ID)
+		}
+	})
+	v.commit(map[string]string{p + "/compose.yml": "x-vops: {rate: 600/m, max_body: 1KB}\n" + strings.Replace(compose, "health: /health", "health: /health, replicas: 2", 1)})
+	plan, _ = v.e.Plan(context.Background())
+	if pp := plan.Projects[0]; !plan.Changes() || pp.Limits != "unlimited -> rate 10/s burst 10, max_body 1KB" || actions(plan) != p+"/app:none" {
+		t.Fatalf("limits plan: %q %s", pp.Limits, actions(plan))
+	}
+	v.mustApply()
+	if r := v.e.Routes.Routes(); len(r) != 1 || r[0].Limits == nil || r[0].Limits.Rate != 10 || r[0].Limits.MaxBody != 1024 {
+		t.Fatalf("routes without limits: %+v", r)
+	}
+	for _, c := range v.containers(p) {
+		if !slices.Contains(ids, c.ID) {
+			t.Fatal("a limits change recreated containers")
+		}
+	}
+
+	// routes (and their limits) survive a daemon restart (rebuilt from podman labels and the db)
+	v.e.Routes.Replace(nil, nil)
 	if code, _ := v.get(host); code != 404 {
 		t.Fatal("expected 404 with empty table")
 	}
 	v.e.RefreshRoutes(context.Background())
 	if code, body := v.get(host); code != 200 || body != "v2" {
 		t.Fatalf("after refresh: %d %q", code, body)
+	}
+	if r := v.e.Routes.Routes(); r[0].Limits == nil || r[0].Limits.Burst != 10 {
+		t.Fatalf("limits lost on refresh: %+v", r)
 	}
 
 	// containers stopped behind our back (reboot): plan says start, StartStopped fixes it
@@ -663,5 +690,66 @@ volumes:
 	}
 	if st := v.e.DataState(ctx, p); !st.Supported || len(st.Protected) != 2 || len(st.Unprotected) != 0 {
 		t.Fatalf("data state %+v", st)
+	}
+
+	// backups: export a snapshot, import it back (upload), restore it: same data, same owner (uid 999)
+	toExport, err := v.e.Snapshot(ctx, io.Discard, p, "to export")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tgz bytes.Buffer
+	if err := v.e.ExportSnapshot(ctx, &tgz, toExport.ID, "test"); err != nil {
+		t.Fatal(err)
+	}
+	write("D")
+	slugDir := filepath.Join(v.e.SnapshotDir, strings.ReplaceAll(p, "/", "."))
+	before, _ := os.ReadDir(slugDir)
+	if len(before) == 0 {
+		t.Fatalf("no snapshots in %s", slugDir)
+	}
+	corrupt := tgz.Bytes()[:tgz.Len()-100] // cut: the import fails after extracting some of it
+	if _, err := v.e.ImportSnapshot(ctx, io.Discard, p, bytes.NewReader(corrupt)); err == nil {
+		t.Fatal("a truncated backup imported")
+	}
+	if after, _ := os.ReadDir(slugDir); len(after) != len(before) {
+		t.Fatalf("a failed import left %d dirs behind", len(after)-len(before))
+	}
+	up, err := v.e.ImportSnapshot(ctx, io.Discard, p, bytes.NewReader(tgz.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if up.Reason != "upload" || len(up.Volumes) != 2 || !strings.Contains(up.Note, fmt.Sprintf("#%d", toExport.ID)) {
+		t.Fatalf("uploaded snapshot: %+v", up)
+	}
+	if err := v.e.Rollback(ctx, io.Discard, RollbackOpts{Project: p, Snapshot: up.ID}); err != nil {
+		t.Fatal(err)
+	}
+	if got := read(); got != "C|C" {
+		t.Fatalf("restored from the backup: %q", got)
+	}
+	if out, err := snapshot.Command(ctx, "stat", "-c", "%u", filepath.Join(vol, "f")).Output(); err != nil || strings.TrimSpace(string(out)) != "999" {
+		t.Fatalf("owner after the round trip: %q %v", out, err)
+	}
+	write("E") // still writable by the container's user
+	for i := 6; i <= 8; i++ {
+		v.commit(map[string]string{p + "/compose.yml": compose(fmt.Sprint(i))})
+		if _, out, err := v.apply(ApplyOpts{}); err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+	}
+	if _, err := v.e.DB.Snapshot(up.ID); err != nil {
+		t.Fatal("retention pruned an uploaded snapshot")
+	}
+	other := BackupManifest{Format: 1, Volumes: []BackupVolume{{Kind: "volume", Name: "vops-other-data", Dir: "0-x"}}}
+	b, _ := json.Marshal(other)
+	var buf2 bytes.Buffer
+	gz := gzip.NewWriter(&buf2)
+	tw := tar.NewWriter(gz)
+	tw.WriteHeader(&tar.Header{Name: ManifestName, Mode: 0o644, Size: int64(len(b)), Typeflag: tar.TypeReg})
+	tw.Write(b)
+	tw.Close()
+	gz.Close()
+	if _, err := v.e.ImportSnapshot(ctx, io.Discard, p, &buf2); err == nil || !strings.Contains(err.Error(), "is not data of") {
+		t.Fatalf("a backup of other volumes: %v", err)
 	}
 }

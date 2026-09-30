@@ -26,7 +26,7 @@ import (
 
 // Version is the proxy's behaviour plus the daemon<->proxy protocol. Bump it when either changes:
 // `vops setup` restarts the running proxy (every site blinks) only when it reports another Version.
-const Version = 1
+const Version = 2
 
 // ControlSocket is where the proxy takes its routing table from the daemon.
 func ControlSocket(vopsHome string) string { return filepath.Join(vopsHome, "proxy.sock") }
@@ -48,6 +48,8 @@ type Status struct {
 	Hash    string `json:"hash"`
 	Started int64  `json:"started"`
 	Synced  int64  `json:"synced"` // last table from the daemon (unix seconds); 0: only what was on disk
+
+	Limited map[string]Counters `json:"limited,omitempty"` // requests refused by x-vops limits (429, 413), per project
 }
 
 type tableFile struct {
@@ -105,7 +107,7 @@ func (s *Server) hostPolicy(_ context.Context, host string) error {
 
 func (s *Server) status() Status {
 	routes := s.table.Routes()
-	return Status{Version, s.Binary, os.Getpid(), len(routes), Hash(routes), s.started.Unix(), s.synced.Load()}
+	return Status{Version, s.Binary, os.Getpid(), len(routes), Hash(routes), s.started.Unix(), s.synced.Load(), s.table.Limited()}
 }
 
 // save writes the table atomically (write + rename). The proxy is the only writer: the file is always

@@ -125,17 +125,17 @@ func cmdSetup(args []string) error {
 		say("btrfs: snapshots and rollback enabled")
 	}
 
-	// dashboard password
+	// the first admin (a user row: dashboard login and podman login)
 	db, err := store.Open(filepath.Join(vh, "vops.db"), filepath.Join(vh, "secret.key"))
 	if err != nil {
 		return err
 	}
 	if !db.HasAdmin() {
 		pw := store.Token()[:24]
-		if err := db.SetAdminPassword(pw); err != nil {
+		if err := db.PutUser(store.User{Name: "admin", Role: store.Admin}, pw); err != nil {
 			return err
 		}
-		fmt.Printf("\n  dashboard login: admin / %s\n  (shown once; change it with `vops admin password`)\n\n", pw)
+		fmt.Printf("\n  dashboard login: admin / %s\n  (shown once; change it with `vops user password admin`)\n\n", pw)
 	}
 	db.Close()
 

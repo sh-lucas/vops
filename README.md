@@ -83,7 +83,8 @@ git add -A && git commit -m site && vops sync
 - Images roll back without git: each service runs the image it ran then, by digest, with a rolling release (no downtime). The service is **pinned**: `vops status`, `vops plan` and the dashboard show `web pinned to #12, compose says shop/web:latest`, and nothing is pending. A pin ends by itself when a newer version arrives (a push of the tag it runs, or another `image:` in compose; other compose changes keep it), or with `vops unpin <project> [service]`. Built images (`build:`) and local images without a digest can't roll back without the code: they are skipped and the plan says so.
 - Data rollback stops the project, snapshots the current data (`pre-rollback`), restores, and starts it again (with the pinned images when both roll back). It is always of the whole project: every volume goes back to the same instant. There is no per-service restore on purpose: the db back an hour and the uploads dir not is data that no longer matches. Compose and code are not touched; the snapshot says which commit its data belongs to.
 - Every rollback can be undone: `vops rollback <project> <rollback-id>` goes back to right before it, with the same parts.
-- `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `vops.yml`); manual ones stay until deleted.
+- `vops snapshot ls|create|rm`, and the same in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep` in `vops.yml`); manual and uploaded ones stay until deleted.
+- Backups off the host: `vops snapshot export shop 12 > shop.tar.gz` (or Download on a snapshot, or "Download current data" in the timeline) streams a snapshot as a .tar.gz with owners, modes and xattrs kept. `vops snapshot import shop < shop.tar.gz` (or "Upload backup") turns one back into a snapshot of the same project, which restores like any other (`vops rollback shop --snapshot <id>`, undoable). Imports are checked entry by entry (no absolute paths, `..`, devices, or writes through symlinks) and a failed one leaves nothing behind.
 - Deploy history: every apply that changes a project (sync, apply, dashboard, registry push) and every rollback is recorded with its commit, the images that ran (by digest when known), its result and the snapshot of the data right before it. `vops history <project>`, or the project's Timeline tab.
 - Timeline (dashboard): newest first, "now" on top. Each point shows its commit and message, image changes (`web: v1 → v2`), result, snapshot and the previews branched from it. "Roll back…" opens a dialog with a checkbox per service (current → target image; unavailable ones disabled with the reason) and one for the data (and tells you the git command if the code differs); snapshot nodes restore data only. "Preview from here" opens a preview of that point: its commit, its images by digest, a copy of its snapshot. After a rollback the project shows "Rolled back to before #N (images, data) · Undo" until its next deploy; pinned services have a "pinned · #N" badge with Unpin, and the overview lists them as warnings.
 - The registry keeps the images of the last `image_keep` (10) deploys of every project, of pins and of previews, even once their tag moved on, so rollback and "Preview from here" work for them. Older points show their image as gone.
@@ -98,7 +99,7 @@ git add -A && git commit -m site && vops sync
 - Guardrails by default: previews are off the shared network (they can't reach production, nothing reaches them), services with `x-vops.preview: {skip: true}` (workers, crons) don't run, no host ports, no extra domains. At most `preview_max: 5` at once; a preview not updated for `preview_ttl: 3d` is removed (both in `vops.yml`). `rm` leaves nothing behind: containers, networks, volumes, data, worktree.
 
 ### Audit log
-- Every write to the host's database (env changes, users, logins, snapshots, projects) is recorded by sqlite triggers, so no code path can forget it. Secrets never land there. `vops audit`, or the Events page.
+- Every write to the host's database (env changes, users and their repos, logins, snapshots, projects and their limits) is recorded by sqlite triggers, so no code path can forget it. Secrets never land there. `vops audit`, or the Events page.
 
 ### Config
 - Everything is in `vops.yml` at the repo root (`vops init` writes it with comments): domain, email, listeners, tls, snapshots, images kept, preview limits. Changes show up in the plan and take effect on apply, like compose files.
@@ -106,8 +107,7 @@ git add -A && git commit -m site && vops sync
 
 ### Registry
 - Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).
-- Users are simple: a name, a generated token, and a regex and/or a list of repos they may push/pull. `vops user add ci --pattern 'shop/.*'`.
-- The dashboard admin pulls everything and pushes nothing.
+- Users are admins or deployers. Admins log into the dashboard and push/pull every repo with their password (`vops user add ops --admin` prompts it). Deployers only use the registry, with a generated token: every repo (`--global`) or a list (`vops user add ci --repo shop/web --repo shop/api`; a tag suffix like `:latest` is ignored). Push and pull are the same permission. `vops user ls|token|password|rm`, or the Users page.
 - Pushing a tag that a service runs redeploys it (rolling). No watchtower. Opt out with `x-vops.watch: false`. Tags like `preview-pr-42` create previews instead (see Previews).
 - Garbage collection: dashboard button, `vops registry gc`, and daily. It keeps untagged images that pins, previews and the last `image_keep` deploys of each project run.
 
@@ -116,9 +116,10 @@ git add -A && git commit -m site && vops sync
 - The daemon crashing, deadlocking (a watchdog restarts both) or being upgraded never takes the sites down; the dashboard and registry hosts answer 502 until it's back. `vops install` restarts the proxy only when the proxy itself changed.
 - The daemon sends it the routing table on every change and waits for the swap (rolling releases stay zero-downtime); the proxy keeps its last table on disk, so it restarts with the right routes even with the daemon down.
 - `vops status` and the dashboard's top bar show whether it is up, its version and routes, and warn when it is down or out of sync.
+- Per-project limits in compose (`x-vops: {rate: 20/s, burst: 40, max_body: 10MB}` at the top level): a token bucket per client ip (`429` + `Retry-After`) and a request body limit (`413`), for every routed service of the project and its previews. The dashboard and the registry are never limited. `vops status` and the project header show them and what they refused.
 
 ### Dashboard
-- `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`, so it is a web login (admin password, session cookie), not ssh. Anything you do from it (apply, rollback, env, users) is available to whoever has that password.
+- `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`, so it is a web login (an admin's user and password, session cookie), not ssh; deployers can't log in. Anything you do from it (apply, rollback, env, users) is available to every admin. The top bar shows who is logged in.
 - Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart, unpin), timeline (deploys, rollbacks, snapshots; roll back images and/or data, preview from a point), previews, logs (live, search, date range, download), env vars (production or previews), events. Also registry images and users, git-tracked files (text only), events and audit log. Works on a phone.
 
 ### Logs
@@ -136,7 +137,7 @@ Know these before putting something important on it:
 - **Env values are hidden from the api and dashboard, not from the host:** anyone with a shell on the host can see them with `podman inspect`.
 - **Recreate means downtime:** services with published `ports`, without `x-vops.port`, or on a network whose definition changed are stopped before the new container starts.
 - **Snapshots need btrfs** and cover only named volumes and bind mounts inside the project dir (not external volumes or absolute host paths). Data created before vops made it a subvolume (non-empty plain dirs) is left alone and shown as "not covered".
-- **Snapshots are crash-consistent**, like pulling the plug: fine for postgres, mysql/innodb, sqlite, anything with a journal; not a replacement for application-level backups, and they live on the same disk (no off-host copy yet).
+- **Snapshots are crash-consistent**, like pulling the plug: fine for postgres, mysql/innodb, sqlite, anything with a journal; not a replacement for application-level backups, and they live on the same disk: copying them off the host (`vops snapshot export`) is up to you, nothing is sent anywhere by itself.
 - **Rollback restores images and data, not compose config or code.** Env, ports and the compose file stay as they are; built images (`build:`) need git to go back (the dashboard shows the command). Restoring data stops the project's containers while it runs (seconds); rolling back only images doesn't.
 - **Previews hold production data.** Personal data, and whatever the code does with it: a queue of real emails, webhooks, a scheduled charge. Their env is not production's, but the data keeps production's own credentials (db users and passwords), and anything the preview's env doesn't redirect still goes out for real. Skip workers and crons, point SMTP and payment keys at test ones.
 - **Previews need btrfs for data** (without it they start empty) and can't be made of projects with external volumes or fixed-subnet networks. Absolute bind mounts and external networks are shared with production. Registry tags pushed for previews stay until `vops registry rm`.
@@ -150,16 +151,16 @@ vops init | install user@host [--force] | sync [-y] | ui
 vops status | plan | apply [-y] [project...]
 vops logs <project> [service] [-f] [-n N] [--grep s] [--since t] [--until t]
 vops restart <project> [service] | enable <project> | disable <project>
-vops env ls|set|rm <project> [--preview] ...   vops user ls|add|rm|token ...
-vops registry ls|rm|gc                    vops admin password | events | audit | version
-vops snapshot ls|create|rm ...            vops history <project> [-n N]
+vops env ls|set|rm <project> [--preview] ...   vops user ls|add|rm|token|password ...
+vops registry ls|rm|gc                    vops events | audit | version
+vops snapshot ls|create|rm|export|import ...   vops history <project> [-n N]
 vops rollback <project> [deploy-id] [--images] [--data] [--service s]... [--snapshot id] [-y]
 vops unpin <project> [service...]
 vops preview up <project> --name n [--image svc=ref]... [--ref r] [--from id]
 vops preview ls [project] | rm <project> <name>
 ```
 
-Inside a linked repo commands run on the host over ssh (`sync`, `apply` and `install` only work that way); on the host they talk to the daemon directly. The web-facing parts are the dashboard (admin password) and the registry (per-user tokens), see Dashboard and Registry. On the host, systemd runs `vops daemon` and `vops proxy`.
+Inside a linked repo commands run on the host over ssh (`sync`, `apply` and `install` only work that way); on the host they talk to the daemon directly. The web-facing parts are the dashboard (admins) and the registry (admins' passwords, deployers' tokens), see Dashboard and Registry. On the host, systemd runs `vops daemon` and `vops proxy`.
 
 ## Development
 
@@ -171,4 +172,4 @@ just gen        # sqlc generate (after editing internal/store/queries.sql or mig
 just vps-test   # systemd + real sshd + podman in a container as the host (slow, needs network)
 ```
 
-Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, the dashboard api, previews from registry tags, a push recorded in the history, a preview of a past deploy by digest, an image rollback with its pin and unpin; the proxy as its own process: a rolling release through it with zero failed requests, the daemon SIGKILLed while sites answer, the proxy restarting from its table on disk with the daemon dead, a deploy while the proxy is down; cli/host version mismatches, upgrade and refused downgrade), `just vps-test` upgrades a real v1.2 host (systemd) in place and checks an upgrade and a daemon SIGKILL under load with zero failed requests, `internal/deploy` checks zero failed requests during a rolling release, runs a destructive migration in a preview of a real postgres, walks the deploy history (deploys, a failed one, rollback and undo, a preview from a past deploy) and rolls images back through its own registry (zero failed requests, pins ending on a push or a compose change, images and data together, gc keeping what rollback needs), `internal/registry` pushes and pulls with real podman.
+Tests are end to end on purpose: `e2e/` drives the real binary (install, sync over a fake ssh, registry push, auto redeploy, a second developer, users (an admin pushes everything, a deployer only its repos, `--pattern` refused), the dashboard api with a second admin, a backup exported and imported through the ssh forwarding and restored, previews from registry tags, a push recorded in the history, a preview of a past deploy by digest, an image rollback with its pin and unpin; the proxy as its own process: a rolling release through it with zero failed requests, the daemon SIGKILLed while sites answer, the proxy restarting from its table on disk with the daemon dead, a deploy while the proxy is down; cli/host version mismatches, upgrade and refused downgrade), `just vps-test` upgrades a real v1.2 host (systemd) in place and checks an upgrade and a daemon SIGKILL under load with zero failed requests, `internal/deploy` checks zero failed requests during a rolling release, runs a destructive migration in a preview of a real postgres, walks the deploy history (deploys, a failed one, rollback and undo, a preview from a past deploy) and rolls images back through its own registry (zero failed requests, pins ending on a push or a compose change, images and data together, gc keeping what rollback needs), round-trips a backup (export, a truncated import leaving nothing, import, restore, owners kept, never pruned) and applies proxy limits without recreating containers, `internal/registry` pushes and pulls with real podman and refuses traversal in names. Unit tests cover the proxy limiter (429 + Retry-After, burst, per ip, 413 on Content-Length and chunked, limits surviving a restart), the users rules in sqlite (last admin, cascades, sessions dropped) and the migration from the regex users, registry auth and login, every web route needing a session and the CSRF header, json body limits, backup archive checks (traversal, absolute paths, devices, symlinks, unknown volumes); `FuzzSplitPath` and `FuzzLoad` fuzz the registry path splitter and the compose loader (`go test -fuzz`).

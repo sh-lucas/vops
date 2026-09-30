@@ -24,11 +24,11 @@ func TestAuditTriggers(t *testing.T) {
 	db.SetEnv("shop", "DB_PASSWORD", "hunter2")
 	db.SetEnv("shop", "DB_PASSWORD", "hunter3")
 	db.UnsetEnv("shop", "DB_PASSWORD")
-	db.PutUser(User{Name: "ci", Pattern: "shop/.*"}, "tok-secret")
-	db.PutUser(User{Name: "ci", Pattern: "shop/.*"}, "tok-secret-2")
+	db.PutUser(User{Name: "ci", Role: Deployer, Repos: []string{"shop/web"}}, "tok-secret")
+	db.PutUser(User{Name: "ci", Role: Deployer, Global: true}, "tok-secret-2")
 	db.DeleteUser("ci")
-	db.SetAdminPassword("correct horse battery")
-	id, _ := db.NewSession(time.Hour)
+	db.PutUser(User{Name: "admin", Role: Admin}, "correct horse battery")
+	id, _ := db.NewSession("admin", time.Hour)
 	db.DeleteSession(id)
 	sid, _ := db.AddSnapshot(Snapshot{Project: "shop", Reason: "manual", Volumes: []SnapshotVolume{{"volume", "v", "/a", "/b"}}})
 	db.DeleteSnapshot(sid)
@@ -54,12 +54,14 @@ func TestAuditTriggers(t *testing.T) {
 		"env insert shop DB_PASSWORD",
 		"env update shop DB_PASSWORD value changed",
 		"env delete shop DB_PASSWORD",
-		"users insert ci pattern=shop/.* repos=[]",
-		"users update ci new token pattern=shop/.* repos=[]",
+		"users insert ci role=deployer",
+		"user_repos insert ci shop/web",
+		"users update ci new token global",
+		"user_repos delete ci shop/web",
 		"users delete ci",
-		"meta insert admin",
+		"users insert admin role=admin global",
 		"sessions insert",
-		"logout",
+		"logout admin",
 		"snapshots insert shop #1 manual",
 		"snapshots delete shop #1 manual",
 		"deploys insert shop #1 rollback commit abcdef123456 ok restored #7",

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"slices"
@@ -14,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/deploy"
+	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/store"
 )
@@ -30,17 +33,42 @@ func httpErr(w http.ResponseWriter, status int, format string, args ...any) {
 	json.MarshalWrite(w, map[string]string{"error": fmt.Sprintf(format, args...)})
 }
 
+// maxJSON bounds every json request body (a backup upload is the only unbounded body, and it isn't json).
+const maxJSON = 1 << 20
+
+var errTooLarge = fmt.Errorf("request body too large (at most %d bytes of json)", maxJSON)
+
 func readJSON(r *http.Request, v any) error {
-	return json.UnmarshalRead(io.LimitReader(r.Body, 1<<20), v, json.MatchCaseInsensitiveNames(true))
+	b, err := io.ReadAll(io.LimitReader(r.Body, maxJSON+1))
+	if err != nil {
+		return err
+	}
+	if len(b) > maxJSON {
+		return errTooLarge
+	}
+	if err := json.Unmarshal(b, v, json.MatchCaseInsensitiveNames(true)); err != nil {
+		return fmt.Errorf("invalid json: %w", err)
+	}
+	return nil
 }
 
 // API is the json api. trusted=true is the unix socket (ssh already authenticated the caller).
 func (d *Daemon) API(trusted bool) http.Handler {
 	mux := http.NewServeMux()
+	if !trusted {
+		d.webRoutes = nil
+	}
 	h := func(pattern string, fn func(w http.ResponseWriter, r *http.Request) error) {
+		if !trusted {
+			d.webRoutes = append(d.webRoutes, pattern)
+		}
 		mux.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
 			if err := fn(w, r); err != nil {
-				httpErr(w, http.StatusBadRequest, "%v", err)
+				status := http.StatusBadRequest
+				if errors.Is(err, errTooLarge) {
+					status = http.StatusRequestEntityTooLarge
+				}
+				httpErr(w, status, "%v", err)
 			}
 		})
 	}
@@ -60,7 +88,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Commit     string                `json:"commit"`
 			AppliedAt  int64                 `json:"applied_at"`
 			Services   []deploy.ServiceState `json:"services"`
-			LastDeploy *store.Deploy         `json:"last_deploy"` // a rollback here: rolled back since the last deploy (the banner)
+			LastDeploy *store.Deploy         `json:"last_deploy"`       // a rollback here: rolled back since the last deploy (the banner)
+			Limits     string                `json:"limits,omitempty"`  // proxy limits in effect ("rate 20/s burst 20, max_body 10MB")
+			Refused    *proxy.Counters       `json:"refused,omitempty"` // what they refused since the proxy started
 		}
 		type preview struct {
 			Project string `json:"project"`
@@ -75,14 +105,23 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Projects []project  `json:"projects"`
 			Previews []preview  `json:"previews"`
 			Proxy    ProxyState `json:"proxy"`
-		}{plan.Domain, plan.Commit, plan.Changes(), append(pwarns, plan.Warnings...), []project{}, []preview{}, px}
+			User     string     `json:"user"` // who is logged in ("cli" on the socket)
+		}{plan.Domain, plan.Commit, plan.Changes(), append(pwarns, plan.Warnings...), []project{}, []preview{}, px, actor(r)}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
 			var ld *store.Deploy
 			if x, ok := last[pp.Path]; ok {
 				ld = &x
 			}
-			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld})
+			var lim string
+			if f.Limits != "" {
+				lim = deploy.LimitsOf(f.Limits).String()
+			}
+			var refused *proxy.Counters
+			if c, ok := px.Limited[pp.Path]; ok {
+				refused = &c
+			}
+			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld, lim, refused})
 		}
 		pvs, _ := d.DB.Previews("")
 		for _, pv := range pvs {
@@ -314,7 +353,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		return nil
 	})
 
-	// ---- registry users
+	// ---- users: admins (dashboard + every repo), deployers (registry: every repo or a list)
 
 	h("GET /api/users", func(w http.ResponseWriter, r *http.Request) error {
 		users, err := d.DB.Users()
@@ -324,52 +363,92 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		writeJSON(w, users)
 		return nil
 	})
+	// POST /api/users creates a user or changes what is given (role, global, repos, secret); omitted fields stay.
+	// Deployers get a generated token (on creation, new_token, or a demotion), or a chosen one; admins a password.
 	h("POST /api/users", func(w http.ResponseWriter, r *http.Request) error {
 		var in struct {
-			Name     string   `json:"name"`
-			Pattern  string   `json:"pattern"`
-			Repos    []string `json:"repos"`
-			NewToken bool     `json:"new_token"`
-			Token    string   `json:"token"` // optional: keep an existing password (migrations); generated otherwise
+			Name     string    `json:"name"`
+			Role     *string   `json:"role"`
+			Global   *bool     `json:"global"`
+			Repos    *[]string `json:"repos"`
+			NewToken bool      `json:"new_token"`
+			Token    string    `json:"token"`    // a deployer's chosen token (migrations); generated otherwise
+			Password string    `json:"password"` // an admin's password
 		}
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		if !userRe.MatchString(in.Name) || in.Name == "admin" || in.Name == "vops-internal" {
-			return fmt.Errorf("invalid user name %q (must match %s, not admin)", in.Name, userRe)
+		if !userRe.MatchString(in.Name) || in.Name == "vops-internal" {
+			return fmt.Errorf("invalid user name %q (must match %s, not vops-internal)", in.Name, userRe)
 		}
-		if in.Pattern != "" {
-			if _, err := regexp.Compile(in.Pattern); err != nil {
-				return fmt.Errorf("pattern: %w", err)
+		old, found, err := d.DB.User(in.Name)
+		if err != nil {
+			return err
+		}
+		u := old
+		if !found {
+			u = store.User{Name: in.Name, Role: store.Deployer}
+		}
+		if in.Role != nil {
+			if *in.Role != store.Admin && *in.Role != store.Deployer {
+				return fmt.Errorf("role must be admin or deployer, got %q", *in.Role)
+			}
+			u.Role = *in.Role
+		}
+		if in.Global != nil {
+			u.Global = *in.Global
+		}
+		if in.Repos != nil {
+			u.Repos = store.NormalizeRepos(*in.Repos)
+			for _, rp := range u.Repos {
+				if !registry.ValidName(rp) {
+					return fmt.Errorf("invalid repository name %q", rp)
+				}
 			}
 		}
-		var repos []string
-		for _, rp := range in.Repos {
-			if rp = strings.TrimSpace(rp); rp == "" {
-				continue
+		secret, token := "", ""
+		if u.Role == store.Admin {
+			if in.Token != "" || in.NewToken {
+				return errors.New("admins log in with a password, not a token")
 			}
-			if !registry.ValidName(rp) {
-				return fmt.Errorf("invalid repository name %q", rp)
+			if in.Password != "" && len(in.Password) < 12 {
+				return errors.New("password must have at least 12 characters")
 			}
-			repos = append(repos, rp)
-		}
-		exists := slices.ContainsFunc(must(d.DB.Users()), func(u store.User) bool { return u.Name == in.Name })
-		token := ""
-		if !exists || in.NewToken {
-			token = store.Token()
-		}
-		if in.Token != "" {
-			if len(in.Token) < 12 {
-				return errors.New("a chosen token needs at least 12 characters")
+			if in.Password == "" && (!found || old.Role != store.Admin) {
+				return errors.New("an admin needs a password")
 			}
-			token = in.Token
+			secret = in.Password
+		} else {
+			if in.Password != "" {
+				return errors.New("deployers use a generated token, not a password")
+			}
+			if !u.Global && len(u.Repos) == 0 {
+				return errors.New("a deployer needs global or at least one repo (what may it push and pull?)")
+			}
+			switch {
+			case in.Token != "":
+				if len(in.Token) < 12 {
+					return errors.New("a chosen token needs at least 12 characters")
+				}
+				secret, token = in.Token, in.Token
+			case !found || in.NewToken || old.Role == store.Admin:
+				secret = store.Token()
+				token = secret
+			}
 		}
-		if err := d.DB.PutUser(store.User{Name: in.Name, Pattern: in.Pattern, Repos: repos}, token); err != nil {
+		if err := d.DB.PutUser(u, secret); err != nil {
 			return err
 		}
 		d.forgetAuth()
-		d.DB.Event("", "config", "registry user %s saved", in.Name)
-		writeJSON(w, map[string]string{"name": in.Name, "token": token})
+		what := "saved"
+		if secret != "" && found {
+			what = map[bool]string{true: "saved (new password)", false: "saved (new token)"}[u.Role == store.Admin]
+		}
+		d.DB.Event("", "auth", "user %s (%s) %s by %s", in.Name, u.Role, what, actor(r))
+		if in.Token != "" {
+			token = "" // the caller knows it
+		}
+		writeJSON(w, map[string]string{"name": in.Name, "role": u.Role, "token": token})
 		return nil
 	})
 	h("DELETE /api/users", func(w http.ResponseWriter, r *http.Request) error {
@@ -378,7 +457,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return err
 		}
 		d.forgetAuth()
-		d.DB.Event("", "config", "registry user %s deleted", name)
+		d.DB.Event("", "auth", "user %s deleted by %s", name, actor(r))
 		writeJSON(w, map[string]bool{"ok": true})
 		return nil
 	})
@@ -473,6 +552,38 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return err
 		}
 		writeJSON(w, map[string]bool{"ok": true})
+		return nil
+	})
+	// backups: a snapshot as a .tar.gz (streamed both ways; the upload is the one body without a size limit)
+	h("GET /api/snapshots/export", func(w http.ResponseWriter, r *http.Request) error {
+		id, err := strconv.ParseInt(r.URL.Query().Get("id"), 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid id")
+		}
+		s, err := d.Engine.BackupCheck(id)
+		if err != nil {
+			return err
+		}
+		if p := r.URL.Query().Get("project"); p != "" && p != s.Project {
+			return fmt.Errorf("snapshot #%d is of %s, not %s", id, s.Project, p)
+		}
+		name := fmt.Sprintf("%s-snapshot-%d-%s.tar.gz", compose.Slug(s.Project), s.ID, time.Unix(s.CreatedAt, 0).UTC().Format("20060102-1504"))
+		w.Header().Set("Content-Type", "application/gzip")
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		if err := d.Engine.ExportSnapshot(r.Context(), w, id, d.Version); err != nil {
+			log.Printf("export snapshot #%d: %v", id, err)
+			panic(http.ErrAbortHandler) // the status is sent: cut the stream so the download fails instead of looking complete
+		}
+		return nil
+	})
+	h("POST /api/snapshots/import", func(w http.ResponseWriter, r *http.Request) error {
+		project := r.URL.Query().Get("project")
+		var log strings.Builder
+		s, err := d.Engine.ImportSnapshot(r.Context(), &log, project, r.Body)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, map[string]any{"snapshot": s, "log": log.String()})
 		return nil
 	})
 	// rollback: GET shows what it would do (format=text for the cli), POST does it and streams progress like apply
@@ -578,25 +689,6 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return nil
 		})
 
-		h("POST /api/admin/password", func(w http.ResponseWriter, r *http.Request) error {
-			var in struct{ Password string }
-			if err := readJSON(r, &in); err != nil {
-				return err
-			}
-			if len(in.Password) < 12 {
-				return errors.New("password must have at least 12 characters")
-			}
-			if err := d.DB.SetAdminPassword(in.Password); err != nil {
-				return err
-			}
-			d.forgetAuth()
-			writeJSON(w, map[string]bool{"ok": true})
-			return nil
-		})
-		h("GET /api/admin", func(w http.ResponseWriter, r *http.Request) error {
-			writeJSON(w, map[string]bool{"has_password": d.DB.HasAdmin()})
-			return nil
-		})
 	}
 	return mux
 }
@@ -640,7 +732,20 @@ func (f flushWriter) Write(p []byte) (int, error) {
 
 const sessionCookie = "vops_session"
 
-var loginMu sync.Mutex
+var (
+	loginMu    sync.Mutex
+	loginDelay = time.Second // what a failed login costs (tests shorten it)
+)
+
+type userKey struct{}
+
+// actor is who made a request: the logged-in admin, or "cli" on the socket (ssh authenticated it).
+func actor(r *http.Request) string {
+	if u, ok := r.Context().Value(userKey{}).(string); ok {
+		return u
+	}
+	return "cli"
+}
 
 func (d *Daemon) sessionAuth(api http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -650,29 +755,35 @@ func (d *Daemon) sessionAuth(api http.Handler) http.Handler {
 		}
 		switch r.URL.Path {
 		case "/api/login":
-			var in struct{ Password string }
+			var in struct{ User, Password string }
 			if err := readJSON(r, &in); err != nil {
 				httpErr(w, 400, "%v", err)
 				return
 			}
+			if in.User == "" {
+				in.User = "admin"
+			}
+			// only admins log in; a deployer's right token fails exactly like a wrong password
 			loginMu.Lock() // one attempt at a time, and a failed one costs a second
-			ok := d.DB.HasAdmin() && d.DB.CheckAdmin(in.Password)
+			u, ok := d.DB.CheckUser(in.User, in.Password)
+			ok = ok && u.Role == store.Admin
 			if !ok {
-				time.Sleep(time.Second)
+				time.Sleep(loginDelay)
 			}
 			loginMu.Unlock()
 			if !ok {
-				d.DB.Event("", "auth", "failed dashboard login from %s", r.RemoteAddr)
-				httpErr(w, http.StatusUnauthorized, "wrong password")
+				d.DB.Event("", "auth", "failed dashboard login as %q from %s", in.User, r.RemoteAddr)
+				httpErr(w, http.StatusUnauthorized, "wrong user or password")
 				return
 			}
-			id, err := d.DB.NewSession(7 * 24 * time.Hour)
+			id, err := d.DB.NewSession(u.Name, 7*24*time.Hour)
 			if err != nil {
 				httpErr(w, 500, "%v", err)
 				return
 			}
+			d.DB.Event("", "auth", "dashboard login: %s from %s", u.Name, r.RemoteAddr)
 			http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: id, Path: "/", HttpOnly: true, SameSite: http.SameSiteStrictMode, Secure: r.TLS != nil, MaxAge: 7 * 24 * 3600})
-			writeJSON(w, map[string]bool{"ok": true})
+			writeJSON(w, map[string]any{"ok": true, "user": u.Name})
 			return
 		case "/api/logout":
 			if c, err := r.Cookie(sessionCookie); err == nil {
@@ -683,10 +794,16 @@ func (d *Daemon) sessionAuth(api http.Handler) http.Handler {
 			return
 		}
 		c, err := r.Cookie(sessionCookie)
-		if err != nil || !d.DB.CheckSession(c.Value) {
+		if err != nil {
 			httpErr(w, http.StatusUnauthorized, "login required")
 			return
 		}
+		user, ok := d.DB.CheckSession(c.Value)
+		if !ok {
+			httpErr(w, http.StatusUnauthorized, "login required")
+			return
+		}
+		r = r.WithContext(context.WithValue(r.Context(), userKey{}, user))
 		api.ServeHTTP(w, r)
 	})
 }

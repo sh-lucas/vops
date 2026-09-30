@@ -348,3 +348,46 @@ func TestSplitPath(t *testing.T) {
 		t.Error("reserved component accepted")
 	}
 }
+
+// Repository names never escape the storage: no .., no encoded dots, no reserved path segments.
+func TestNamesRefuseTraversal(t *testing.T) {
+	for _, n := range []string{"..", "../x", "a/../b", "a/..", "./a", ".", "%2e%2e/x", "a/%2e%2e", "/a", "a/", "a//b", "A/b", "a\\b", "blobs", "a/blobs", "a/manifests/b", "tags/a", "a/b\x00", strings.Repeat("a", 256)} {
+		if ValidName(n) {
+			t.Errorf("ValidName(%q) = true", n)
+		}
+	}
+	for _, n := range []string{"a", "shop/web", "a.b/c_d/e--f", "blob", "my-tags/x"} {
+		if !ValidName(n) {
+			t.Errorf("ValidName(%q) = false", n)
+		}
+	}
+	_, srv, _ := testRegistry(t)
+	c := client{t, srv.URL, "admin"}
+	for _, p := range []string{"/v2/%2e%2e/%2e%2e/manifests/latest", "/v2/app/%2e%2e/%2e%2e/%2e%2e/etc/manifests/latest", "/v2/../../x/tags/list", "/v2/a/blobs/b/blobs/uploads/"} {
+		if r := c.do("GET", p, nil); r.StatusCode != 404 {
+			t.Errorf("%s: %d", p, r.StatusCode)
+		}
+	}
+}
+
+func FuzzSplitPath(f *testing.F) {
+	for _, s := range []string{"a/b/blobs/uploads/", "a/manifests/latest", "a/blobs/x/manifests/v1", "../x/tags/list", "a/referrers/sha256:ab", "a/blobs/uploads/../../x", "%2e%2e/blobs/sha256:00"} {
+		f.Add(s)
+	}
+	root := f.TempDir()
+	f.Fuzz(func(t *testing.T, p string) {
+		name, kind, rest, ok := splitPath(p)
+		if !ok {
+			return
+		}
+		if strings.Contains(rest, "/") || !strings.HasPrefix(p, name) || kind == "" {
+			t.Fatalf("splitPath(%q) = %q %q %q", p, name, kind, rest)
+		}
+		if ValidName(name) {
+			dir := filepath.Join(root, "repos", name)
+			if !strings.HasPrefix(dir, filepath.Join(root, "repos")+string(filepath.Separator)) || strings.Contains(name, "..") {
+				t.Fatalf("valid name %q escapes: %s", name, dir)
+			}
+		}
+	})
+}
