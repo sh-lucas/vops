@@ -6,7 +6,7 @@ vops reads compose files itself and runs `podman run`. It supports the subset be
 
 A project dir may have `compose.yml`, `compose.yaml`, `docker-compose.yml`, `docker-compose.yaml` and any `*.compose.yml`/`*.compose.yaml`. They are merged; a service defined twice is an error. Dir names must match `[A-Za-z0-9][A-Za-z0-9_-]*`.
 
-Top level: `services`, `volumes` (`name`, `external`), `networks` (see below), `version` and `name` (ignored), `x-vops` (`previews`, `rate`, `burst`, `max_body`, see x-vops). Not supported: `secrets`, `configs`.
+Top level: `services`, `volumes` (`name`, `external`), `networks` (see below), `version` and `name` (ignored), `x-vops` (`rate`, `burst`, `max_body`, see x-vops). Not supported: `secrets`, `configs`.
 
 ## Service keys
 
@@ -96,10 +96,11 @@ services:
       strategy: rolling     # rolling (default when routed, no host ports) | recreate
       timeout: 60s          # readiness timeout
       watch: true           # redeploy when this tag is pushed to the vops registry (it also ends an image rollback pin)
-      preview: {skip: true} # don't run it in previews (workers, crons)
+      preview:              # this service can get a preview (`preview: {}` = just itself; see Previews)
+        with: [redis]       # services that run with it in a preview
+        copy: [db]          # services whose data is copied from production (they run with it too)
 
 x-vops:                     # top level: project settings
-  previews: "preview-*"     # registry tags that create previews (default "preview-*"; "off" disables)
   rate: 20/s                # requests per client ip, per s, m or h (600/m); default unlimited
   burst: 40                 # requests allowed at once (default: rate per second rounded up, min 1)
   max_body: 10MB            # request body size: B, KB, MB, GB, 1024-based (10MB = 10485760 bytes); default unlimited
@@ -113,18 +114,33 @@ Readiness, in order: compose `healthcheck` → `x-vops.health` → any HTTP answ
 
 ## Previews
 
+Previews are opt-in per service: only a service with `x-vops.preview` can get one, and it says what runs with it and whose data is copied.
+
+```yaml
+services:
+  web:
+    image: registry.example.com/shop/web
+    x-vops:
+      preview:
+        with: [redis]   # runs with it, starts empty
+        copy: [db]      # runs with it, on a copy of production's data
+  db: ...
+  redis: ...
+  worker: ...           # in no declaration: never runs in a preview
+```
+
 A preview (`vops preview up shop --name pr-42`, or a push of `shop/web:preview-pr-42`) runs the same compose files as project `shop@pr-42`, with these differences:
 
+- **What runs**: the services the preview is for (the ones pushed or given with `--image`; none = every service with `x-vops.preview`), plus their `with` and `copy`. Nothing else. A required `depends_on` on a service outside that set is an error when the compose loads (`add db to x-vops.preview.with of web`); `with` and `copy` must name services of the project. `--image` of a service that doesn't run in the preview is an error; it can pin a `with`/`copy` service's image.
+- **Data**: the volumes and bind mounts inside the project dir of `copy` services start as a copy of production's (btrfs; empty without it), made once when the preview is created. Every other volume starts empty; volumes only non-running services use aren't created. A volume shared by a copied service and another running one is copied (the plan warns).
 - **Env**: production's env is not used. Variables come from `preview.env` in the project dir (committed, `KEY=VALUE` lines like `env_file`, for non-secret overrides such as `SMTP_HOST=mailpit`), then from preview secrets (`vops env set shop --preview KEY`), which win. `COMPOSE_PROFILES` too. `VOPS_PREVIEW` is the preview's name.
-- **Data**: volumes and bind mounts inside the project dir start as a copy of production's (btrfs; empty without it).
 - **Code**: the compose files, build contexts and bind paths come from a git worktree of the preview's commit.
-- Services with `x-vops.preview.skip` don't run; a `depends_on` on them is dropped.
 - No shared `vops` network: a service that lists it gets the preview's `default` network instead. Other projects can't reach the preview, and it can't reach them.
 - No published `ports` (dropped with a warning) and no `x-vops.domains`.
-- `name:` of volumes and networks is ignored (it would be production's). `external` volumes are an error; `external` networks and absolute bind mounts are shared with production (the plan warns about the latter).
+- `name:` of volumes and networks is ignored (it would be production's). `external` volumes used by running services are an error; `external` networks and absolute bind mounts are shared with production (the plan warns about the latter).
 - Networks with a fixed `ipam` subnet can't be created twice, so their projects can't have previews.
 
-Tags: with `previews: "preview-*"`, a pushed tag `preview-pr-42` is preview `pr-42` (the `*` part, lowercased, `_` and `.` become `-`). It sets that tag on every service running the pushed repo. A tag matching the pattern never redeploys production.
+Tags: a pushed tag `preview-pr-42` is preview `pr-42` (the part after `preview-`, lowercased, `_` and `.` become `-`). It sets that tag on every service running the pushed repo that has `x-vops.preview`, and adds them to what the preview is for (pushing `web` then `api` runs both declarations). Services running the repo without it are skipped (an event says so). A `preview-*` tag never redeploys production.
 
 ## Interpolation
 

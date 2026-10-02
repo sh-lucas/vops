@@ -8,6 +8,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -27,7 +28,9 @@ import (
 //	env:    preview.env from the project dir + the project's preview secrets, never production's env
 //	images: the project's, with overrides (--image, registry pushes of preview tags)
 //
-// Guardrails live in compose (no shared network, no skipped services, no host ports, no extra domains).
+// What runs is opt-in per service (x-vops.preview, compose.PreviewRun): the services with image overrides (none =
+// every declared one) plus their `with` and `copy`; only the data of `copy` services is copied.
+// Guardrails live in compose (no shared network, no host ports, no extra domains).
 // Previews are not in the plan: git doesn't describe them, the previews table does.
 
 const (
@@ -170,6 +173,16 @@ func (e *Engine) PreviewUp(ctx context.Context, w io.Writer, o PreviewOpts) erro
 		}
 	}
 	maps.Copy(pv.Images, o.Images)
+	// the overridden services are what the preview is for; a timeline node's images only pin what runs, and a
+	// preview of every declared service stays one
+	if o.Deploy == 0 && (!found || len(pv.Services) > 0) {
+		for svc := range o.Images {
+			if !slices.Contains(pv.Services, svc) {
+				pv.Services = append(pv.Services, svc)
+			}
+		}
+		slices.Sort(pv.Services)
+	}
 
 	root := e.previewRoot(path)
 	if err := e.worktree(ctx, root, pv.Commit); err != nil {
@@ -188,6 +201,13 @@ func (e *Engine) PreviewUp(ctx context.Context, w io.Writer, o PreviewOpts) erro
 	}
 	for _, warn := range warns {
 		fmt.Fprintf(w, "  ! %s\n", warn)
+	}
+	if o.Deploy == 0 {
+		for _, svc := range sortedKeys(o.Images) {
+			if _, ok := pp.specs[svc]; !ok {
+				return fail(fmt.Errorf("--image %s: %s doesn't run in this preview: give it x-vops.preview, or name it in x-vops.preview.with of a service that has one", svc, svc))
+			}
+		}
 	}
 	if !found {
 		if pv.Data, err = e.previewData(ctx, w, pv, pp.project, root, o.From); err != nil {
@@ -273,7 +293,7 @@ func (e *Engine) planPreview(ctx context.Context, pv store.Preview, domain strin
 	if err != nil {
 		return pp, err
 	}
-	return pp, e.planProject(ctx, pp, source{root: root, files: files, env: env, images: pv.Images}, domain, warns)
+	return pp, e.planProject(ctx, pp, source{root: root, files: files, env: env, images: pv.Images, services: pv.Services}, domain, warns)
 }
 
 // previewEnv is a preview's env: preview.env (committed, not secret) overridden by the project's preview
@@ -296,11 +316,19 @@ func (e *Engine) previewEnv(projectDir, project string) (map[string]string, erro
 	return env, nil
 }
 
-// previewData gives a new preview a copy of its project's data: every volume and bind of the project
-// (the live data, or snapshot from) becomes a writable btrfs snapshot under the preview's names. O(1),
-// copy-on-write. Live data is copied with its containers paused (milliseconds), like a pre-deploy snapshot.
+// previewData gives a new preview a copy of its project's data: the volumes and binds (inside the project dir)
+// of its x-vops.preview.copy services (the live data, or snapshot from) become writable btrfs snapshots under
+// the preview's names. O(1), copy-on-write. Live data is copied with its containers paused (milliseconds), like
+// a pre-deploy snapshot. Everything else the preview mounts starts empty.
 func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview, proj *compose.Project, root string, from int64) (string, error) {
 	path := proj.Path
+	if len(proj.Copied) == 0 {
+		if from != 0 {
+			return "", errors.New("--from copies the data of x-vops.preview.copy services, and this preview copies none")
+		}
+		fmt.Fprintf(w, "%s: starting with empty data (no x-vops.preview.copy)\n", path)
+		return "empty (nothing to copy)", nil
+	}
 	if !e.snapshotsOn() || !snapshot.Supported(e.SnapshotDir) {
 		if from != 0 {
 			return "", errors.New("--from needs snapshots (btrfs, snapshots: on)")
@@ -310,10 +338,18 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 	}
 	base := *proj
 	base.Path = pv.Project
-	volumes := map[string]string{} // production volume -> preview volume
-	for key, v := range proj.Volumes {
-		if !v.External {
-			volumes[base.VolumeName(key)] = proj.VolumeName(key)
+	projectDir := filepath.Join(root, filepath.FromSlash(pv.Project))
+	volumes := map[string]string{} // production volume of a copy service -> preview volume
+	binds := map[string]bool{}     // repo-relative binds of copy services
+	for _, svc := range proj.Copied {
+		for _, m := range proj.Services[svc].Volumes {
+			switch {
+			case m.Type == "volume" && m.Source != "":
+				volumes[base.VolumeName(m.Source)] = proj.VolumeName(m.Source)
+			case m.Type == "bind" && within(m.Source, projectDir):
+				rel, _ := filepath.Rel(root, m.Source)
+				binds[filepath.ToSlash(rel)] = true
+			}
 		}
 	}
 	var vols []store.SnapshotVolume
@@ -339,7 +375,6 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 		}
 	}
 	defer pause(ctx, users)()
-	projectDir := filepath.Join(root, filepath.FromSlash(pv.Project))
 	var copied []string
 	for _, v := range vols {
 		target := ""
@@ -347,8 +382,7 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 		case "volume":
 			name, ok := volumes[v.Name]
 			if !ok {
-				fmt.Fprintf(w, "%s: %s is not in the preview's compose, not copied\n", path, v.Name)
-				continue
+				continue // not mounted by a copy service: the preview starts it empty
 			}
 			if podman.VolumePath(ctx, name) == "" {
 				if _, err := podman.Run(ctx, "volume", "create", "--label", LProject+"="+path, name); err != nil {
@@ -357,7 +391,7 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 			}
 			target = podman.VolumePath(ctx, name)
 		case "bind":
-			if target = filepath.Join(root, filepath.FromSlash(v.Name)); !within(target, projectDir) {
+			if target = filepath.Join(root, filepath.FromSlash(v.Name)); !binds[v.Name] || !within(target, projectDir) {
 				continue
 			}
 		}
@@ -367,7 +401,7 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 		copied = append(copied, v.Name)
 	}
 	if len(copied) == 0 {
-		fmt.Fprintf(w, "%s: %s has no data to copy (no btrfs volumes or binds)\n", path, pv.Project)
+		fmt.Fprintf(w, "%s: %s has no data to copy (%s mount no btrfs volumes or binds)\n", path, pv.Project, strings.Join(proj.Copied, ", "))
 		return "empty (nothing to copy)", nil
 	}
 	fmt.Fprintf(w, "%s: data is a %s: %s\n", path, desc, strings.Join(copied, ", "))
@@ -525,21 +559,24 @@ type PreviewTarget struct {
 	Images        map[string]string // service -> the pushed image
 }
 
-// PreviewTargets: pushing repo:tag, where tag matches a project's x-vops.previews pattern ("preview-*"),
-// creates or updates the preview named by the * part, with that tag on every service running repo.
-func (p *Plan) PreviewTargets(repo, tag string) []PreviewTarget {
-	var out []PreviewTarget
+// PreviewTargets: pushing repo:preview-<name> creates or updates preview <name>, with that tag on every
+// service running repo that declares x-vops.preview. skipped lists the services running repo without it.
+func (p *Plan) PreviewTargets(repo, tag string) (out []PreviewTarget, skipped []proxy.Key) {
+	name, ok := compose.PreviewName(tag)
+	if !ok {
+		return nil, nil
+	}
 	for _, pp := range p.Projects {
 		if pp.Disabled || pp.Gone || pp.Error != "" {
 			continue
 		}
-		name, ok := compose.PreviewName(pp.previews, tag)
-		if !ok {
-			continue
-		}
 		images := map[string]string{}
-		for svc, d := range pp.specs {
-			if d.repo == repo {
+		for _, svc := range sortedKeys(pp.specs) {
+			if d := pp.specs[svc]; d.repo == repo {
+				if s := pp.project.Services[svc]; s == nil || s.Vops.Preview == nil {
+					skipped = append(skipped, proxy.Key{Project: pp.Path, Service: svc})
+					continue
+				}
 				images[svc] = withTag(d.spec.Image, tag)
 			}
 		}
@@ -547,7 +584,7 @@ func (p *Plan) PreviewTargets(repo, tag string) []PreviewTarget {
 			out = append(out, PreviewTarget{Project: pp.Path, Name: name, Images: images})
 		}
 	}
-	return out
+	return out, skipped
 }
 
 // withTag replaces the tag (or digest) of an image ref.

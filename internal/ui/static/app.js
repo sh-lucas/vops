@@ -926,7 +926,7 @@ function previewsTab(ctx, box) {
     const go = h("button", { class: "btn primary" }, "Create preview");
     api("GET", "/snapshots?project=" + enc(path)).then((r) => from.append(...r.snapshots.map((x) =>
       h("option", { value: x.id }, `Snapshot #${x.id} · ${x.reason} · ${ago(x.created_at)}${x.note ? " · " + x.note : ""}`)))).catch(() => {});
-    put(formBox, panel(panelHead(h("h2", {}, "New preview"), h("span", { class: "muted small" }, "a full copy of " + path + " on its own urls")),
+    put(formBox, panel(panelHead(h("h2", {}, "New preview"), h("span", { class: "muted small" }, "what " + path + "'s x-vops.preview declarations run, on their own urls")),
       h("form", { class: "panel-body pvform", onsubmit: (e) => {
         e.preventDefault();
         const imgs = {};
@@ -951,12 +951,23 @@ function previewsTab(ctx, box) {
     try { pvs = await api("GET", "/previews?project=" + enc(path)); } catch (e) { return list.replaceChildren(errorBox(e)); }
     if (!pvs.length) {
       const reg = st.domain ? "registry." + st.domain : "registry.<domain>";
-      const own = ctx.p.services.find((x) => x.image.startsWith(reg + "/"));
-      const repo = own ? own.image.slice(reg.length + 1).replace(/[:@].*$/, "") : path + "/" + ((ctx.p.services[0] || {}).name || "web");
-      const dom = ((own && own.domains.length ? own : ctx.p.services.find((x) => x.domains.length)) || { domains: [] }).domains[0];
+      const svcs = ctx.p.services, declared = svcs.filter((x) => x.preview);
+      if (!declared.length) {
+        // previews are opt-in per service: show the declaration to add, built from this project's services
+        const main = svcs.find((x) => x.domains.length) || svcs[0] || { name: "web" };
+        const others = svcs.filter((x) => x !== main).map((x) => x.name);
+        return put(list, h("div", { class: "empty" },
+          h("strong", {}, "No service can get a preview"),
+          h("div", { class: "small" }, "Previews are opt-in per service. Add ", mono("x-vops.preview"), " to the service a preview is for: ", mono("with"), " runs other services next to it (empty), ", mono("copy"), " also copies their data from production. Services in no declaration never run in a preview."),
+          h("pre", { class: "cmd" }, `services:\n  ${main.name}:\n    x-vops:\n      preview:\n        with: [${others.join(", ")}]\n        copy: []   # e.g. your database${others.length ? "" : "\n# or just: preview: {}"}`),
+          h("div", { class: "small" }, "Then push its image with a ", mono("preview-*"), " tag, or use New preview above.")));
+      }
+      const own = declared.find((x) => x.image.startsWith(reg + "/"));
+      const repo = own ? own.image.slice(reg.length + 1).replace(/[:@].*$/, "") : path + "/" + declared[0].name;
+      const dom = ((own && own.domains.length ? own : declared.find((x) => x.domains.length)) || { domains: [] }).domains[0];
       return put(list, h("div", { class: "empty" },
         h("strong", {}, "No previews"),
-        h("div", { class: "small" }, "Push an image with a ", mono("preview-*"), " tag: vops creates preview ", mono("pr-42"), " with it (pushing the project's other images with the same tag lands in the same preview). Production is never redeployed by these tags."),
+        h("div", { class: "small" }, "Push the image of a service with ", mono("x-vops.preview"), " (", declared.map((x) => x.name).join(", "), ") with a ", mono("preview-*"), " tag: vops creates preview ", mono("pr-42"), " with it and what its declaration runs (pushing another declared image with the same tag lands in the same preview). Production is never redeployed by these tags."),
         h("pre", { class: "cmd" }, `podman push ${reg}/${repo}:preview-pr-42`),
         dom ? h("div", { class: "small" }, "→ ", mono(domainURL(st, dom.replace(/^([^.]+)\./, "$1.pr-42.")))) : null,
         h("div", { class: "small" }, "Or: New preview above, Preview from here on the Timeline, or ", mono(`vops preview up ${path} --name pr-42`), ".")));

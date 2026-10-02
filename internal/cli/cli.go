@@ -44,7 +44,7 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
                                      --preview: the secrets of the project's previews, which never get its env;
                                      ls also shows each service's variables and where they come from)
   preview up <project> --name n [--image svc=ref]... [--ref r] [--from snapshot-id]
-  preview ls [project] | rm <project> <name>   previews: <service>.<name>.<project>.<domain>, a copy of the data
+  preview ls [project] | rm <project> <name>   previews of services with x-vops.preview: <service>.<name>.<project>.<domain>
   user ls | rm <name>                users: admins (dashboard + every repo) and deployers (registry only)
   user add <name> --admin            an admin (prompts its password; dashboard and podman login)
   user add <name> --global | --repo r...   a deployer: every repo, or these (prints its token once;

@@ -33,7 +33,7 @@ Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback` (images by pinning
 ### Previews, next
 
 - Reset a preview's data without `rm`: `preview up --from <id>` (or `--from live`) on an existing preview (today it errors and asks for `rm` first); stop it, restore like rollback, start.
-- Delete the registry tags pushed for a preview when it's removed (today they stay until `vops registry rm`): only tags matching the project's `x-vops.previews` pattern.
+- Delete the registry tags pushed for a preview when it's removed (today they stay until `vops registry rm`): only `preview-*` tags of the repos the preview ran.
 - Remove a preview when its branch is deleted or its PR merged: a `vops preview rm` from CI is enough today; maybe a push of an empty/special tag.
 - Per-preview ttl (`--ttl 12h`) and a "keep" flag for long-lived staging-like previews.
 - Previews of projects with fixed-subnet networks: rewrite or drop `ipam` in previews.

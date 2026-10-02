@@ -317,7 +317,7 @@ func (q *Queries) GetMeta(ctx context.Context, key string) (string, error) {
 }
 
 const getPreview = `-- name: GetPreview :one
-SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at, deploy_id FROM previews WHERE project = ? AND name = ?
+SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at, deploy_id, services FROM previews WHERE project = ? AND name = ?
 `
 
 type GetPreviewParams struct {
@@ -339,6 +339,7 @@ func (q *Queries) GetPreview(ctx context.Context, arg GetPreviewParams) (Preview
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.DeployID,
+		&i.Services,
 	)
 	return i, err
 }
@@ -704,7 +705,7 @@ func (q *Queries) ListPins(ctx context.Context, project interface{}) ([]Pin, err
 }
 
 const listPreviews = `-- name: ListPreviews :many
-SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at, deploy_id FROM previews
+SELECT project, name, ref, commit_sha, images, snapshot_id, data, created_at, updated_at, deploy_id, services FROM previews
 WHERE ?1 = '' OR project = ?1
 ORDER BY project, name
 `
@@ -729,6 +730,7 @@ func (q *Queries) ListPreviews(ctx context.Context, project interface{}) ([]Prev
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.DeployID,
+			&i.Services,
 		); err != nil {
 			return nil, err
 		}
@@ -994,8 +996,8 @@ func (q *Queries) PutPin(ctx context.Context, arg PutPinParams) error {
 }
 
 const putPreview = `-- name: PutPreview :exec
-INSERT INTO previews (project, name, ref, commit_sha, images, snapshot_id, deploy_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, updated_at = excluded.updated_at
+INSERT INTO previews (project, name, ref, commit_sha, images, services, snapshot_id, deploy_id, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT (project, name) DO UPDATE SET ref = excluded.ref, commit_sha = excluded.commit_sha, images = excluded.images, services = excluded.services, updated_at = excluded.updated_at
 `
 
 type PutPreviewParams struct {
@@ -1004,6 +1006,7 @@ type PutPreviewParams struct {
 	Ref        string `json:"ref"`
 	CommitSha  string `json:"commit_sha"`
 	Images     string `json:"images"`
+	Services   string `json:"services"`
 	SnapshotID int64  `json:"snapshot_id"`
 	DeployID   int64  `json:"deploy_id"`
 	Data       string `json:"data"`
@@ -1019,6 +1022,7 @@ func (q *Queries) PutPreview(ctx context.Context, arg PutPreviewParams) error {
 		arg.Ref,
 		arg.CommitSha,
 		arg.Images,
+		arg.Services,
 		arg.SnapshotID,
 		arg.DeployID,
 		arg.Data,

@@ -88,11 +88,10 @@ type ProjectPlan struct {
 
 	limits string // desired limits (json proxy.Limits, '' = none)
 
-	specs    map[string]*desired
-	actual   map[string][]podman.Container
-	nets     []compose.NetworkDef
-	previews string // x-vops.previews
-	project  *compose.Project
+	specs   map[string]*desired
+	actual  map[string][]podman.Container
+	nets    []compose.NetworkDef
+	project *compose.Project
 }
 
 // PinState is a pin as the plan sees it: in effect, or stale (the next apply drops it and runs what compose says).
@@ -342,11 +341,12 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 
 // source is where a project's definition comes from: the repo, or a preview's worktree with its own env and images.
 type source struct {
-	root   string               // the git working tree (e.Repo or a preview worktree)
-	files  []string             // compose files in the project dir
-	env    map[string]string    // interpolation and pass-through variables
-	images map[string]string    // preview image overrides: service -> image
-	pins   map[string]store.Pin // image rollback: service -> pinned image (projects only, previews ignore pins)
+	root     string               // the git working tree (e.Repo or a preview worktree)
+	files    []string             // compose files in the project dir
+	env      map[string]string    // interpolation and pass-through variables
+	images   map[string]string    // preview image overrides: service -> image
+	services []string             // what a preview is for (empty = every service with x-vops.preview)
+	pins     map[string]store.Pin // image rollback: service -> pinned image (projects only, previews ignore pins)
 }
 
 func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, domain string, warns *[]string) error {
@@ -361,18 +361,24 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 	if err != nil {
 		return err
 	}
+	if compose.IsPreview(pp.Path) {
+		var roots []string // left out by COMPOSE_PROFILES = nothing to run
+		for _, svc := range src.services {
+			if !slices.Contains(proj.Inactive, svc) {
+				roots = append(roots, svc)
+			}
+		}
+		if err := proj.PreviewRun(roots); err != nil {
+			return err
+		}
+	}
 	*warns = append(*warns, proj.Warnings...)
 	for _, svc := range sortedKeys(src.images) {
-		s := proj.Services[svc]
-		if s == nil {
-			if slices.Contains(proj.Inactive, svc) || slices.Contains(proj.Skipped, svc) {
-				continue
-			}
-			return fmt.Errorf("image override for %s: no such service", svc)
+		if s := proj.Services[svc]; s != nil { // else a pin (preview from a timeline node) of what doesn't run
+			s.Image, s.Build = src.images[svc], nil
 		}
-		s.Image, s.Build = src.images[svc], nil
 	}
-	pp.previews, pp.project = proj.Previews, proj
+	pp.project = proj
 	pp.limits = limitsJSON(proj.Limits)
 	specs, err := proj.Specs(domain, env)
 	if err != nil {
@@ -602,14 +608,14 @@ func sortedKeys[V any](m map[string]V) []string {
 }
 
 // Watching lists services that run repo:tag from our registry and want to be redeployed when it is pushed.
-// A tag matching the project's previews pattern is for previews only (PreviewTargets), never production.
+// A preview tag (preview-*) is for previews only (PreviewTargets), never production.
 func (p *Plan) Watching(repo, tag string) []proxy.Key {
 	var out []proxy.Key
+	if _, preview := compose.PreviewName(tag); preview {
+		return nil
+	}
 	for _, pp := range p.Projects {
 		if pp.Disabled || pp.Gone || pp.Error != "" {
-			continue
-		}
-		if _, preview := compose.PreviewName(pp.previews, tag); preview {
 			continue
 		}
 		for name, d := range pp.specs {
@@ -632,7 +638,8 @@ type ServiceState struct {
 	Port       int                `json:"port,omitempty"`
 	Pending    string             `json:"pending,omitempty"` // create | update | start | remove
 	Reason     string             `json:"reason,omitempty"`
-	Pin        *store.Pin         `json:"pin,omitempty"` // runs a past image (image rollback), not what compose says
+	Pin        *store.Pin         `json:"pin,omitempty"`     // runs a past image (image rollback), not what compose says
+	Preview    bool               `json:"preview,omitempty"` // has x-vops.preview: it can get a preview
 	Containers []podman.Container `json:"containers"`
 }
 
@@ -659,6 +666,9 @@ func (pp *ProjectPlan) Services() []ServiceState {
 				st.Domains = []string{}
 			}
 			st.Pin = d.pin
+			if pp.project != nil && pp.project.Services[n] != nil {
+				st.Preview = pp.project.Services[n].Vops.Preview != nil
+			}
 		} else if len(st.Containers) > 0 {
 			st.Image = st.Containers[0].Image
 		}

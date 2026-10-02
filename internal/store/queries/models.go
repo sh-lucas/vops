@@ -72,6 +72,7 @@ type Preview struct {
 	CreatedAt  int64  `json:"created_at"`
 	UpdatedAt  int64  `json:"updated_at"`
 	DeployID   int64  `json:"deploy_id"`
+	Services   string `json:"services"`
 }
 
 type Project struct {

@@ -16,8 +16,9 @@ import (
 
 // A preview of a project with a real postgres: its data is a copy of production's, a destructive migration
 // in it leaves production untouched, its env comes only from preview.env and the preview secrets, it is
-// served on its own domain, off the shared network, without skipped services; preview_max holds; rm and
-// the ttl leave nothing behind; --from starts a preview from a snapshot.
+// served on its own domain, off the shared network, with only what web declares (x-vops.preview): db's data
+// is copied, web's own volume starts empty, the undeclared worker doesn't run; preview_max holds; rm and the
+// ttl leave nothing behind; --from starts a preview from a snapshot.
 func TestPreviewWithPostgres(t *testing.T) {
 	v := newEnv(t)
 	if !snapshot.Supported(v.e.SnapshotDir) {
@@ -53,13 +54,16 @@ func TestPreviewWithPostgres(t *testing.T) {
     image: APP
     environment: [MSG, SECRET, SMTP_HOST]
     depends_on: {migrate: {condition: service_completed_successfully}}
-    x-vops: {port: 8080}
+    volumes: ["files:/files"]
+    x-vops: {port: 8080, preview: {copy: [db], with: [migrate]}}
   worker:
     image: APP
     environment: {PORT: "9000"}
-    x-vops: {preview: {skip: true}}
+    volumes: ["jobs:/jobs"]
 volumes:
   pg:
+  files:
+  jobs:
 `,
 		p + "/preview.env": "MSG=from-file\nSMTP_HOST=mailpit\nMIGRATION=DELETE FROM users WHERE name = 'bob'\n",
 	})
@@ -91,6 +95,17 @@ volumes:
 		return out
 	}
 	prodIDs := ids(p)
+	inWeb := func(project string, args ...string) (string, error) {
+		t.Helper()
+		cs, _ := podman.PS(ctx, LProject+"="+project, LService+"=web")
+		if len(cs) == 0 {
+			t.Fatalf("no web in %s", project)
+		}
+		return podman.Run(ctx, append([]string{"exec", cs[0].ID, "/app"}, args...)...)
+	}
+	if _, err := inWeb(p, "write", "/files/f", "prod-file"); err != nil {
+		t.Fatal(err)
+	}
 
 	// up: data copied, destructive migration runs in the preview only
 	volumesBefore, _ := podman.Run(ctx, "volume", "ls", "-q")
@@ -130,7 +145,14 @@ volumes:
 	}
 	slices.Sort(services)
 	if strings.Join(services, ",") != "db,migrate,web" {
-		t.Fatalf("preview services (worker is skipped): %v", services)
+		t.Fatalf("preview services (worker declares nothing): %v", services)
+	}
+	// only db (copy) has production's data: web's volume starts empty, the worker's isn't created
+	if out, err := inWeb(path, "read", "/files/f"); err == nil {
+		t.Fatalf("web's volume was copied: %q", out)
+	}
+	if vols, _ := podman.Run(ctx, "volume", "ls", "-q", "--filter", "label="+LProject+"="+path); strings.Contains(vols, "-jobs") || !strings.Contains(vols, "-pg") {
+		t.Fatalf("preview volumes: %s", vols)
 	}
 	envs, _ := podman.Run(ctx, "inspect", "--format", "{{range .Config.Env}}{{println .}}{{end}}", web[0])
 	if !strings.Contains(envs, "MSG=preview-secret\n") || !strings.Contains(envs, "SMTP_HOST=mailpit\n") || strings.Contains(envs, "SECRET=") {

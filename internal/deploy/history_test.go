@@ -47,7 +47,7 @@ func TestHistoryRollbackAndBranch(t *testing.T) {
     volumes: ["data:/data:U"]
   web:
     image: ` + web + `
-    x-vops: {port: 8080}
+    x-vops: {port: 8080, preview: {copy: [db]}}
 volumes:
   data:
 `}

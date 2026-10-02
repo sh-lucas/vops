@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/proxy"
@@ -256,7 +257,14 @@ func (d *Daemon) onPush(repo, tag, digest string) {
 	}
 	w := &logWriter{prefix: "push " + repo + ":" + tag + ": "}
 	// a preview tag creates or updates a preview; Watching never returns it, so production is not touched
-	for _, t := range plan.PreviewTargets(repo, tag) {
+	targets, skipped := plan.PreviewTargets(repo, tag)
+	for _, k := range skipped {
+		d.DB.Event(k.Project, "preview", "%s:%s pushed: no preview for %s, it has no x-vops.preview", repo, tag, k.Service)
+	}
+	if _, preview := compose.PreviewName(tag); preview && len(targets) == 0 && len(skipped) == 0 {
+		log.Printf("push %s:%s: no preview: no service runs %s", repo, tag, repo)
+	}
+	for _, t := range targets {
 		if err := d.Engine.PreviewUp(ctx, w, deploy.PreviewOpts{Project: t.Project, Name: t.Name, Images: t.Images}); err != nil {
 			log.Printf("push trigger %s:%s: preview %s of %s: %v", repo, tag, t.Name, t.Project, err)
 			d.DB.Event(t.Project, "error", "preview %s from %s:%s: %v", t.Name, repo, tag, err)

@@ -17,8 +17,9 @@ import (
 )
 
 // Previews from registry tags, through the real binary and daemon: pushing shop/web:preview-pr-7 creates
-// preview pr-7 of shop with that image, pushing shop/api:preview-pr-7 lands in the same preview, pushing web
-// again updates it, and production is never redeployed. Plus env --preview, preview up/ls/rm and the api.
+// preview pr-7 of shop with that image (web declares x-vops.preview with api), pushing shop/api:preview-pr-7
+// lands in the same preview, pushing web again updates it, pushing the undeclared worker does nothing, and
+// production is never redeployed. Plus env --preview, preview up/ls/rm and the api.
 func TestPreviewsFromRegistry(t *testing.T) {
 	w := setup(t)
 	dev := filepath.Join(t.TempDir(), "infra")
@@ -48,6 +49,7 @@ func TestPreviewsFromRegistry(t *testing.T) {
 	body := func(host string) string { _, b := w.get(host); return b }
 	push("shop/web", "v1", "web-prod")
 	push("shop/api", "v1", "api-prod")
+	push("shop/worker", "v1", "worker-prod")
 	w.vops(dev, "env", "set", "shop", "SECRET=prod-secret")
 	w.vops(dev, "env", "set", "shop", "--preview", "PREVIEW_ONLY=yes")
 	if keys := w.vops(dev, "env", "ls", "shop", "--preview"); !strings.Contains(keys, "PREVIEW_ONLY\t(set") || strings.Contains(keys, "SECRET\t(set") {
@@ -57,10 +59,12 @@ func TestPreviewsFromRegistry(t *testing.T) {
   web:
     image: UI/shop/web:v1
     environment: [SECRET, PREVIEW_ONLY]
-    x-vops: {port: 8080}
+    x-vops: {port: 8080, preview: {with: [api]}}
   api:
     image: UI/shop/api:v1
-    x-vops: {port: 8080}
+    x-vops: {port: 8080, preview: {}}
+  worker:
+    image: UI/shop/worker:v1
 `
 	w.write(dev, map[string]string{"shop/compose.yml": compose})
 	w.vops(dev, "sync", "--yes")
@@ -97,6 +101,20 @@ func TestPreviewsFromRegistry(t *testing.T) {
 	w.eventually("preview updated by a second push", func() bool { return body("web.pr-7.shop.vops.test") == "web-pr7-b" })
 	if prodIDs() != prod || body("web.shop.vops.test") != "web-prod" || body("api.shop.vops.test") != "api-prod" {
 		t.Fatal("a preview tag touched production")
+	}
+	if cs, _ := podman.PS(ctx, "vops.project=shop@pr-7", "vops.service=worker"); len(cs) != 0 {
+		t.Fatal("the undeclared worker runs in the preview")
+	}
+	// a service without x-vops.preview gets none
+	push("shop/worker", "preview-pr-9", "worker-pr9")
+	w.eventually("the skipped push recorded", func() bool {
+		return strings.Contains(w.vops(dev, "events", "shop"), "no preview for worker, it has no x-vops.preview")
+	})
+	if ls := w.vops(dev, "preview", "ls", "shop"); strings.Contains(ls, "pr-9") {
+		t.Fatalf("worker push made a preview:\n%s", ls)
+	}
+	if out, err := w.try(dev, "", "preview", "up", "shop", "--name", "pr-9", "--image", "worker="+w.uiAddr+"/shop/worker:preview-pr-9"); err == nil || !strings.Contains(out, "worker has no x-vops.preview") {
+		t.Fatalf("--image of an undeclared service: %v\n%s", err, out)
 	}
 	// env: the preview secrets, never production's
 	var cs []podman.Container

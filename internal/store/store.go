@@ -532,6 +532,7 @@ type Preview struct {
 	Ref        string            `json:"ref"`
 	Commit     string            `json:"commit"`
 	Images     map[string]string `json:"images"`      // service -> image overrides
+	Services   []string          `json:"services"`    // what the preview is for (pushes, --image); empty = every service with x-vops.preview
 	SnapshotID int64             `json:"snapshot_id"` // data copied from this snapshot; 0 = live data
 	DeployID   int64             `json:"deploy_id"`   // the timeline node it branched from; 0 = none
 	Data       string            `json:"data"`
@@ -540,8 +541,9 @@ type Preview struct {
 }
 
 func previewFrom(r queries.Preview) Preview {
-	p := Preview{Project: r.Project, Name: r.Name, Ref: r.Ref, Commit: r.CommitSha, Images: map[string]string{}, SnapshotID: r.SnapshotID, DeployID: r.DeployID, Data: r.Data, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
+	p := Preview{Project: r.Project, Name: r.Name, Ref: r.Ref, Commit: r.CommitSha, Images: map[string]string{}, Services: []string{}, SnapshotID: r.SnapshotID, DeployID: r.DeployID, Data: r.Data, CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt}
 	json.Unmarshal([]byte(r.Images), &p.Images)
+	json.Unmarshal([]byte(r.Services), &p.Services)
 	return p
 }
 
@@ -550,9 +552,13 @@ func (d *DB) PutPreview(p Preview) error {
 	if p.Images == nil {
 		p.Images = map[string]string{}
 	}
+	if p.Services == nil {
+		p.Services = []string{}
+	}
 	images, _ := json.Marshal(p.Images, json.Deterministic(true))
+	services, _ := json.Marshal(p.Services)
 	t := now()
-	return d.q.PutPreview(ctx, queries.PutPreviewParams{Project: p.Project, Name: p.Name, Ref: p.Ref, CommitSha: p.Commit, Images: string(images),
+	return d.q.PutPreview(ctx, queries.PutPreviewParams{Project: p.Project, Name: p.Name, Ref: p.Ref, CommitSha: p.Commit, Images: string(images), Services: string(services),
 		SnapshotID: p.SnapshotID, DeployID: p.DeployID, Data: p.Data, CreatedAt: t, UpdatedAt: t})
 }
 

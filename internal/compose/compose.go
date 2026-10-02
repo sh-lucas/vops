@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -27,8 +28,7 @@ type Project struct {
 	Volumes  map[string]*Volume
 	Networks map[string]*Network
 	Inactive []string // services left out by COMPOSE_PROFILES
-	Skipped  []string // services left out of a preview (x-vops.preview.skip)
-	Previews string   // top-level x-vops.previews: registry tags that create previews ("preview-*" when empty, "off")
+	Copied   []string // previews: services whose data is copied from production (PreviewRun)
 	Limits   Limits   // top-level x-vops rate, burst, max_body: the proxy applies them to every routed service
 	Warnings []string
 	Refs     map[string]bool                // every ${VAR} the files use
@@ -84,16 +84,20 @@ type Service struct {
 
 // Vops is the `x-vops` block of a service.
 type Vops struct {
-	Port     int      `yaml:"port"`     // http port inside the container; enables routing
-	Domains  []string `yaml:"domains"`  // extra domains
-	Health   string   `yaml:"health"`   // http readiness path
-	Replicas int      `yaml:"replicas"` // routed services only
-	Strategy string   `yaml:"strategy"` // rolling | recreate
-	Watch    *bool    `yaml:"watch"`    // redeploy when the tag is pushed to the vops registry (default true)
-	Timeout  Duration `yaml:"timeout"`  // readiness timeout (default 60s)
-	Preview  struct {
-		Skip bool `yaml:"skip"` // not run in previews (workers, crons)
-	} `yaml:"preview"`
+	Port     int          `yaml:"port"`     // http port inside the container; enables routing
+	Domains  []string     `yaml:"domains"`  // extra domains
+	Health   string       `yaml:"health"`   // http readiness path
+	Replicas int          `yaml:"replicas"` // routed services only
+	Strategy string       `yaml:"strategy"` // rolling | recreate
+	Watch    *bool        `yaml:"watch"`    // redeploy when the tag is pushed to the vops registry (default true)
+	Timeout  Duration     `yaml:"timeout"`  // readiness timeout (default 60s)
+	Preview  *PreviewDecl `yaml:"preview"`  // this service can get a preview (nil = it never runs in one)
+}
+
+// PreviewDecl is a service's `x-vops.preview`: what runs with it in a preview, and whose data is copied.
+type PreviewDecl struct {
+	With []string `yaml:"with"` // services that run with it
+	Copy []string `yaml:"copy"` // services whose data is copied from production (they run with it too)
 }
 
 type Build struct {
@@ -504,21 +508,18 @@ var PreviewNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$`)
 // IsPreview reports whether a project path is a preview ("shop@pr-42").
 func IsPreview(path string) bool { return strings.Contains(path, "@") }
 
-// DefaultPreviews is the tag pattern that creates previews when x-vops.previews is not set.
-const DefaultPreviews = "preview-*"
+// PreviewTagPrefix: a registry tag "preview-<name>" creates or updates preview <name>, never production.
+const PreviewTagPrefix = "preview-"
 
-// PreviewName reports whether a registry tag matches a previews pattern, and the preview it names (the
-// part matched by *). "_" and "." become "-" and letters are lowercased: "preview-PR_42" is preview "pr-42".
+// PreviewName reports whether a registry tag is a preview tag, and the preview it names (the part after
+// "preview-"). "_" and "." become "-" and letters are lowercased: "preview-PR_42" is preview "pr-42".
 // The name may still be invalid (check it with PreviewNameRe); a matching tag is a preview tag either way.
-func PreviewName(pattern, tag string) (string, bool) {
-	if pattern == "" {
-		pattern = DefaultPreviews
-	}
-	prefix, suffix, ok := strings.Cut(pattern, "*")
-	if !ok || len(tag) <= len(prefix)+len(suffix) || !strings.HasPrefix(tag, prefix) || !strings.HasSuffix(tag, suffix) {
+func PreviewName(tag string) (string, bool) {
+	name, ok := strings.CutPrefix(tag, PreviewTagPrefix)
+	if !ok || name == "" {
 		return "", false
 	}
-	return strings.ToLower(strings.NewReplacer("_", "-", ".", "-").Replace(tag[len(prefix) : len(tag)-len(suffix)])), true
+	return strings.ToLower(strings.NewReplacer("_", "-", ".", "-").Replace(name)), true
 }
 
 // ReadEnvFile reads KEY=VALUE lines (env_file, preview.env).
@@ -593,11 +594,6 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 	if err := p.applyProfiles(env["COMPOSE_PROFILES"]); err != nil {
 		return nil, err
 	}
-	if IsPreview(path) {
-		if err := p.previewGuardrails(); err != nil {
-			return nil, err
-		}
-	}
 	if err := p.checkNetworks(); err != nil {
 		return nil, err
 	}
@@ -612,6 +608,9 @@ func Load(dir, path string, files []string, env map[string]string) (*Project, er
 		if err := p.check(s, env); err != nil {
 			return nil, fmt.Errorf("%s: service %s: %w", path, s.Name, err)
 		}
+	}
+	if err := p.checkPreviews(); err != nil {
+		return nil, err
 	}
 	if IsPreview(path) {
 		// previews never join the shared network: a service that asked for it gets the preview's default network
@@ -697,14 +696,13 @@ func (p *Project) topVops(root *yaml.Node) error {
 			continue
 		}
 		v := root.Content[i+1]
-		if err := strictKeys(v, "previews", "rate", "burst", "max_body"); err != nil {
+		if err := strictKeys(v, "rate", "burst", "max_body"); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
 		}
 		var top struct {
-			Previews string `yaml:"previews"`
-			Rate     string `yaml:"rate"`
-			Burst    *int   `yaml:"burst"`
-			MaxBody  string `yaml:"max_body"`
+			Rate    string `yaml:"rate"`
+			Burst   *int   `yaml:"burst"`
+			MaxBody string `yaml:"max_body"`
 		}
 		if err := v.Decode(&top); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
@@ -712,16 +710,6 @@ func (p *Project) topVops(root *yaml.Node) error {
 		if err := p.limits(top.Rate, top.Burst, top.MaxBody); err != nil {
 			return fmt.Errorf("x-vops.%w", err)
 		}
-		if top.Previews == "" {
-			continue
-		}
-		if top.Previews != "off" && strings.Count(top.Previews, "*") != 1 {
-			return fmt.Errorf("x-vops.previews must be a tag pattern with one * (the preview name), or off; got %q", top.Previews)
-		}
-		if p.Previews != "" && p.Previews != top.Previews {
-			return fmt.Errorf("x-vops.previews is set twice (%q and %q)", p.Previews, top.Previews)
-		}
-		p.Previews = top.Previews
 	}
 	return nil
 }
@@ -798,32 +786,132 @@ func ParseSize(s string) (int64, error) {
 	return v * mult, nil
 }
 
-// previewGuardrails keeps a preview away from production: x-vops.preview.skip services don't run,
-// no published host ports, no extra domains, no external volumes.
-func (p *Project) previewGuardrails() error {
+// Previewable lists the services that can get a preview (x-vops.preview), sorted.
+func (p *Project) Previewable() []string {
+	var out []string
 	for name, s := range p.Services {
-		if s.Vops.Preview.Skip {
-			delete(p.Services, name)
-			p.Skipped = append(p.Skipped, name)
+		if s.Vops.Preview != nil {
+			out = append(out, name)
 		}
 	}
-	slices.Sort(p.Skipped)
-	for _, s := range p.Services {
-		s.DependsOn = slices.DeleteFunc(s.DependsOn, func(d Dep) bool { return slices.Contains(p.Skipped, d.Name) })
+	slices.Sort(out)
+	return out
+}
+
+// previewSet is what runs in a preview of roots: the roots, what they run with and whose data they copy.
+// Services left out by COMPOSE_PROFILES are not in it.
+func (p *Project) previewSet(roots []string) (run, copied map[string]bool) {
+	run, copied = map[string]bool{}, map[string]bool{}
+	for _, r := range roots {
+		run[r] = true
+		d := p.Services[r].Vops.Preview
+		for _, n := range d.With {
+			run[n] = p.Services[n] != nil
+		}
+		for _, n := range d.Copy {
+			run[n], copied[n] = p.Services[n] != nil, p.Services[n] != nil
+		}
+	}
+	maps.DeleteFunc(run, func(_ string, ok bool) bool { return !ok })
+	maps.DeleteFunc(copied, func(_ string, ok bool) bool { return !ok })
+	return run, copied
+}
+
+// checkPreviews validates x-vops.preview declarations: names are services, and every service a preview
+// runs has its dependencies in the preview too (a required one outside it is an error, not silently dropped).
+func (p *Project) checkPreviews() error {
+	for _, root := range p.Previewable() {
+		d := p.Services[root].Vops.Preview
+		for _, n := range slices.Concat(d.With, d.Copy) {
+			if p.Services[n] == nil && !slices.Contains(p.Inactive, n) {
+				return fmt.Errorf("%s: service %s: x-vops.preview: no service %q", p.Path, root, n)
+			}
+		}
+		run, _ := p.previewSet([]string{root})
+		for _, name := range sortedSet(run) {
+			for _, dep := range p.Services[name].DependsOn {
+				if !run[dep.Name] && dep.Required && p.Services[dep.Name] != nil {
+					return fmt.Errorf("%s: preview of %s: %s depends on %s, which doesn't run in it: add %s to x-vops.preview.with of %s", p.Path, root, name, dep.Name, dep.Name, root)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// within reports whether path is inside dir.
+func within(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != "." && !strings.HasPrefix(rel, "..")
+}
+
+func sortedSet(m map[string]bool) []string {
+	out := slices.Collect(maps.Keys(m))
+	slices.Sort(out)
+	return out
+}
+
+// PreviewRun reduces a preview's project to what the preview runs. The preview is for the services among
+// overrides (those with image overrides) that declare x-vops.preview, or for every declared service when none
+// does; it runs them with their x-vops.preview.with and copy. An override of an undeclared service only pins
+// the image of a service that runs anyway. PreviewRun sets Copied, drops volumes nothing running mounts, and
+// keeps the preview away from production: no published host ports, no extra domains, no external volumes.
+func (p *Project) PreviewRun(overrides []string) error {
+	var roots []string
+	for _, o := range overrides {
+		if p.Services[o] == nil {
+			return fmt.Errorf("image override for %s: no such service", o)
+		}
+		if p.Services[o].Vops.Preview != nil {
+			roots = append(roots, o)
+		}
+	}
+	if len(roots) == 0 {
+		if roots = p.Previewable(); len(roots) == 0 {
+			return fmt.Errorf("%s: no service can get a preview: add `x-vops: {preview: {}}` to the service a preview is for (with: and copy: name what runs with it)", p.Path)
+		}
+	}
+	run, copied := p.previewSet(roots)
+	for _, o := range overrides {
+		if !run[o] {
+			return fmt.Errorf("%s: service %s has no x-vops.preview, so it can't get a preview: add `x-vops: {preview: {}}` to it", p.Path, o)
+		}
+	}
+	for name := range p.Services {
+		if !run[name] {
+			delete(p.Services, name)
+		}
+	}
+	p.Copied = sortedSet(copied)
+	mounted := map[string][]string{} // volume key or bind source -> services mounting it
+	for _, name := range sortedSet(run) {
+		s := p.Services[name]
+		s.DependsOn = slices.DeleteFunc(s.DependsOn, func(d Dep) bool { return !run[d.Name] }) // optional ones
 		if len(s.Ports) > 0 {
 			p.Warnings = append(p.Warnings, fmt.Sprintf("%s: service %s: published ports are left out of previews", p.Path, s.Name))
 			s.Ports = nil
 		}
 		s.Vops.Domains = nil
 		for _, m := range s.Volumes {
-			if m.Type == "bind" && filepath.IsAbs(m.Source) {
+			if m.Type == "bind" && filepath.IsAbs(m.Source) && !within(m.Source, p.Dir) {
 				p.Warnings = append(p.Warnings, fmt.Sprintf("%s: service %s: %s is an absolute path, shared with production", p.Path, s.Name, m.Source))
+			}
+			if m.Source != "" && (m.Type == "volume" || m.Type == "bind") && !slices.Contains(mounted[m.Source], name) {
+				mounted[m.Source] = append(mounted[m.Source], name)
 			}
 		}
 	}
 	for key, v := range p.Volumes {
-		if v.External {
+		if len(mounted[key]) == 0 {
+			delete(p.Volumes, key)
+		} else if v.External {
 			return fmt.Errorf("%s: volume %s is external: a preview would write to it, so this project can't have previews", p.Path, key)
+		}
+	}
+	for _, src := range sortedKeys(mounted) {
+		users := mounted[src]
+		if slices.ContainsFunc(users, func(n string) bool { return copied[n] }) && slices.ContainsFunc(users, func(n string) bool { return !copied[n] }) {
+			p.Warnings = append(p.Warnings, fmt.Sprintf("%s: %s is copied from production and also mounted by %s (it runs on that copy)", p.Path, src, strings.Join(slices.DeleteFunc(slices.Clone(users), func(n string) bool { return copied[n] }), ", ")))
 		}
 	}
 	return nil

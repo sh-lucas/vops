@@ -369,27 +369,34 @@ services:
 	}
 }
 
-// The same compose as a preview: own names and domain, no shared network, no skipped services,
-// no host ports, no extra domains, and the top-level x-vops.previews pattern.
+// The same compose as a preview: own names and domain, no shared network, only the declared services,
+// no host ports, no extra domains.
 func TestPreviewGuardrails(t *testing.T) {
 	yml := `
-x-vops: {previews: "pr-*"}
 services:
   web:
     image: x
     ports: ["8080:80"]
     networks: [default, vops]
-    depends_on: [worker]
-    volumes: ["data:/data"]
-    x-vops: {port: 80, domains: [shop.com], strategy: recreate}
+    depends_on: [db]
+    volumes: ["data:/data", "./uploads:/uploads"]
+    x-vops: {port: 80, domains: [shop.com], strategy: recreate, preview: {copy: [db], with: [cache]}}
   db:
     image: x
-    networks: [backend]
+    networks: [default, backend]
+    volumes: ["pg:/var/lib/postgresql/data", "data:/shared"]
+  cache:
+    image: x
+    volumes: ["tmp:/tmp"]
   worker:
     image: x
-    x-vops: {preview: {skip: true}}
+    depends_on: [db]
+    volumes: ["jobs:/jobs"]
 volumes:
   data: {name: shop-data}
+  pg:
+  tmp:
+  jobs: {external: true}
 networks:
   backend: {name: shop-backend, internal: true}
 `
@@ -397,15 +404,26 @@ networks:
 	if err != nil {
 		t.Fatal(err)
 	}
-	if prod.Previews != "pr-*" || prod.VolumeName("data") != "shop-data" || prod.netName("backend") != "shop-backend" {
-		t.Fatalf("prod: %q %s %s", prod.Previews, prod.VolumeName("data"), prod.netName("backend"))
+	if prod.VolumeName("data") != "shop-data" || prod.netName("backend") != "shop-backend" || !slices.Equal(prod.Previewable(), []string{"web"}) {
+		t.Fatalf("prod: %s %s %v", prod.VolumeName("data"), prod.netName("backend"), prod.Previewable())
 	}
 	p, err := load(t, "shop@pr-1", yml, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := p.Services["worker"]; ok || !slices.Equal(p.Skipped, []string{"worker"}) {
-		t.Fatalf("worker should be skipped: %v", p.Skipped)
+	if err := p.PreviewRun(nil); err != nil { // no overrides: every declared service (web)
+		t.Fatal(err)
+	}
+	if got := sortedKeys(p.Services); !slices.Equal(got, []string{"cache", "db", "web"}) || !slices.Equal(p.Copied, []string{"db"}) {
+		t.Fatalf("run %v copied %v", got, p.Copied)
+	}
+	if got := sortedKeys(p.Volumes); !slices.Equal(got, []string{"data", "pg", "tmp"}) { // jobs: only the worker mounts it (and it's external)
+		t.Fatalf("volumes %v", got)
+	}
+	if !slices.ContainsFunc(p.Warnings, func(w string) bool {
+		return strings.Contains(w, "data is copied from production and also mounted by web")
+	}) {
+		t.Fatalf("shared volume warning missing: %v", p.Warnings)
 	}
 	specs, err := p.Specs("example.com", nil)
 	if err != nil {
@@ -418,13 +436,14 @@ networks:
 		nets = append(nets, n.Name)
 	}
 	if strings.Contains(args, "-p ") || !slices.Equal(web.Domains, []string{"pr-1.shop.example.com", "web.pr-1.shop.example.com"}) ||
-		!slices.Equal(nets, []string{"vops-shop--pr-1"}) || len(web.DependsOn) != 0 || !strings.Contains(args, "-v vops-shop--pr-1-data:/data") {
+		!slices.Equal(nets, []string{"vops-shop--pr-1"}) || !slices.Equal(web.DependsOn, []string{"db"}) || !strings.Contains(args, "-v vops-shop--pr-1-data:/data") {
 		t.Fatalf("preview web: domains %v networks %v deps %v args %s", web.Domains, nets, web.DependsOn, args)
 	}
 	if p.netName("backend") != "vops-shop--pr-1-backend" {
 		t.Fatalf("preview network: %s", p.netName("backend"))
 	}
-	if _, err := load(t, "shop@pr-1", "services:\n  a:\n    image: x\n    volumes: [\"d:/d\"]\nvolumes:\n  d: {external: true}\n", nil); err == nil || !strings.Contains(err.Error(), "external") {
+	ext := "services:\n  a:\n    image: x\n    volumes: [\"d:/d\"]\n    x-vops: {preview: {}}\nvolumes:\n  d: {external: true}\n"
+	if p, err := load(t, "shop@pr-1", ext, nil); err != nil || p.PreviewRun(nil) == nil || !strings.Contains(p.PreviewRun(nil).Error(), "external") {
 		t.Fatalf("external volume in a preview: %v", err)
 	}
 	for _, bad := range []string{"shop@PR", "shop@-x", "shop@a.b", "shop@"} {
@@ -433,18 +452,72 @@ networks:
 		}
 	}
 	for tag, want := range map[string]string{"preview-pr-42": "pr-42", "preview-PR_42": "pr-42", "preview-": "", "v1": "", "xpreview-1": ""} {
-		if got, ok := PreviewName("", tag); got != want || ok != (want != "") {
+		if got, ok := PreviewName(tag); got != want || ok != (want != "") {
 			t.Errorf("%s: got %q %v, want %q", tag, got, ok, want)
 		}
 	}
-	if _, ok := PreviewName("off", "preview-1"); ok {
-		t.Error("previews: off still matches")
+	for name, c := range map[string]struct{ yml, want string }{
+		"top-level previews": {"x-vops: {previews: off}\nservices:\n  a:\n    image: x\n", "previews"},
+		"skip":               {"services:\n  a:\n    image: x\n    x-vops: {preview: {skip: true}}\n", "skip"},
+		"unknown with":       {"services:\n  a:\n    image: x\n    x-vops: {preview: {with: [nope]}}\n", `no service "nope"`},
+		"unknown copy":       {"services:\n  a:\n    image: x\n    x-vops: {preview: {copy: [nope]}}\n", `no service "nope"`},
+		"dep outside":        {"services:\n  a:\n    image: x\n    depends_on: [b]\n    x-vops: {preview: {}}\n  b:\n    image: x\n", "add b to x-vops.preview.with of a"},
+		"dep of with":        {"services:\n  a:\n    image: x\n    x-vops: {preview: {with: [b]}}\n  b:\n    image: x\n    depends_on: [c]\n  c:\n    image: x\n", "b depends on c"},
+	} {
+		if _, err := load(t, "p", c.yml, nil); err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", name, err, c.want)
+		}
 	}
-	if got, ok := PreviewName("pr-*-web", "pr-7-web"); !ok || got != "7" {
-		t.Errorf("suffix pattern: %q %v", got, ok)
+}
+
+// What a preview runs: the overridden services' declarations; undeclared services can't be overridden.
+func TestPreviewRun(t *testing.T) {
+	yml := `
+services:
+  web:
+    image: x
+    x-vops: {preview: {with: [cache]}}
+  api:
+    image: x
+    depends_on: {db: {condition: service_started}, cache: {condition: service_started, required: false}}
+    x-vops: {preview: {copy: [db]}}
+  db: {image: x}
+  cache: {image: x}
+  worker: {image: x}
+`
+	for _, c := range []struct {
+		roots       []string
+		run, copied []string
+		err         string
+	}{
+		{nil, []string{"api", "cache", "db", "web"}, []string{"db"}, ""},
+		{[]string{"web"}, []string{"cache", "web"}, nil, ""},
+		{[]string{"api"}, []string{"api", "db"}, []string{"db"}, ""},
+		{[]string{"api", "web"}, []string{"api", "cache", "db", "web"}, []string{"db"}, ""},
+		{[]string{"db", "web"}, []string{"cache", "web"}, nil, "db has no x-vops.preview"},
+		{[]string{"cache", "web"}, []string{"cache", "web"}, nil, ""},               // pins cache's image
+		{[]string{"db"}, []string{"api", "cache", "db", "web"}, []string{"db"}, ""}, // no declared override: every declaration
+		{[]string{"worker"}, nil, nil, "worker has no x-vops.preview"},
+		{[]string{"nope"}, nil, nil, "no such service"},
+	} {
+		p, err := load(t, "shop@x", yml, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		err = p.PreviewRun(c.roots)
+		if c.err != "" {
+			if err == nil || !strings.Contains(err.Error(), c.err) {
+				t.Errorf("%v: got %v, want %q", c.roots, err, c.err)
+			}
+			continue
+		}
+		if err != nil || !slices.Equal(sortedKeys(p.Services), c.run) || !slices.Equal(p.Copied, c.copied) {
+			t.Errorf("%v: run %v copied %v err %v", c.roots, sortedKeys(p.Services), p.Copied, err)
+		}
 	}
-	if _, err := load(t, "p", "x-vops: {previews: nope}\nservices:\n  a:\n    image: x\n", nil); err == nil {
-		t.Error("pattern without * accepted")
+	p, _ := load(t, "shop@x", "services:\n  a:\n    image: x\n", nil)
+	if err := p.PreviewRun(nil); err == nil || !strings.Contains(err.Error(), "x-vops: {preview: {}}") {
+		t.Errorf("no declaration: %v", err)
 	}
 }
 
@@ -460,7 +533,7 @@ func TestLimits(t *testing.T) {
 		{"x-vops: {rate: 30/m}\n", Limits{Rate: 0.5, Burst: 1}},
 		{"x-vops: {rate: 5000/h}\n", Limits{Rate: 5000.0 / 3600, Burst: 2}},
 		{"x-vops: {max_body: 10MB}\n", Limits{MaxBody: 10 << 20}},
-		{"x-vops: {max_body: 512KB, previews: off}\n", Limits{MaxBody: 512 << 10}},
+		{"x-vops: {max_body: 512KB}\n", Limits{MaxBody: 512 << 10}},
 		{"x-vops: {max_body: 1GB}\n", Limits{MaxBody: 1 << 30}},
 		{"x-vops: {max_body: 4096}\n", Limits{MaxBody: 4096}},
 	} {
