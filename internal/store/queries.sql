@@ -85,8 +85,9 @@ DELETE FROM sessions WHERE id_hash = ?;
 INSERT INTO events (at, project, kind, message) VALUES (?, ?, ?, ?);
 
 -- name: ListEvents :many
+-- newest first; before > 0 pages back (ids below it)
 SELECT * FROM events
-WHERE sqlc.arg(project) = '' OR project = sqlc.arg(project)
+WHERE (sqlc.arg(project) = '' OR project = sqlc.arg(project)) AND (sqlc.arg(before) = 0 OR id < sqlc.arg(before))
 ORDER BY id DESC LIMIT sqlc.arg(lim);
 
 -- name: CreateSnapshot :one

@@ -22,6 +22,7 @@ import (
 	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/store"
+	"github.com/sh-lucas/vops/internal/sysmon"
 )
 
 // parseLogTime accepts 2006-01-02, "2006-01-02 15:04", RFC3339, or a duration like "2h" (meaning now minus it).
@@ -221,7 +222,7 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	case "events":
 		project, _ := arg(0, "")
 		var evs []store.Event
-		if err := getJSON(c, "/api/events?project="+url.QueryEscape(project), &evs); err != nil {
+		if err := getJSON(c, "/api/events?n=100&project="+url.QueryEscape(project), &evs); err != nil {
 			return err
 		}
 		for i := len(evs) - 1; i >= 0; i-- {
@@ -854,6 +855,17 @@ func printStatus(c *client, out io.Writer) error {
 		proxyNote += ")"
 	}
 	fmt.Fprintf(out, "commit %.12s  domain %s  proxy %s\n", st.Commit, orDash(st.Domain), proxyNote)
+	var sys sysmon.Stats
+	if getJSON(c, "/api/system", &sys) == nil && sys.MemTotal > 0 {
+		line := fmt.Sprintf("host: cpu %.0f%%  mem %.0f%% of %s", sys.CPU, float64(sys.MemUsed)/float64(sys.MemTotal)*100, humanSize(int64(sys.MemTotal)))
+		for _, f := range sys.Filesystems {
+			if f.Total > 0 {
+				line += fmt.Sprintf("  disk %.0f%% (%s free)", float64(f.Used)/float64(f.Total)*100, humanSize(int64(f.Avail)))
+				break
+			}
+		}
+		fmt.Fprintf(out, "%s  up %s\n", line, (time.Duration(sys.Uptime) * time.Second).Truncate(time.Minute))
+	}
 	for _, w := range st.Warnings {
 		fmt.Fprintf(out, "! %s\n", w)
 	}

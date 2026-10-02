@@ -126,7 +126,7 @@ git add -A && git commit -m site && vops sync
 
 ### Dashboard
 - `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>`, so it is a web login (an admin's user and password, session cookie), not ssh; deployers can't log in. Anything you do from it (apply, rollback, env, users) is available to every admin. The top bar shows who is logged in.
-- Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart, unpin), timeline (deploys, rollbacks, snapshots; roll back images and/or data, preview from a point), previews, logs (live, search, date range, download), env vars (production or previews), events. Also registry images and users, git-tracked files (text only), events and audit log. Works on a phone.
+- Sidebar with every project and its health, overview with stats and warnings, pending changes + apply from any page. Per project: services (restart, unpin), timeline (deploys, rollbacks, snapshots; roll back images and/or data, preview from a point), previews, logs (live, search, date range, download), env vars (production or previews), events. Also registry images and users, git-tracked files (text only), events (50 per page, load more) and audit log, and a System page with the host's cpu, memory, disk io and space, network, pressure (PSI), kernel and uptime, live every 3s (`vops status` prints a one-line summary). Works on a phone.
 
 ### Logs
 - Containers log to journald; `vops logs <project> [service] -f --grep x` or the dashboard. History survives rollouts; search covers all of it, and the dashboard loads older lines as you scroll up.

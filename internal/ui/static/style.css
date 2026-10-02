@@ -179,6 +179,10 @@ td.wrap { overflow-wrap: anywhere; min-width: 16ch; }
 .stat .foot { font-size: 12px; color: var(--muted); min-height: 18px; }
 .stat.warn .value { color: var(--warn); }
 .stat.bad .foot { color: var(--bad); }
+.meter { height: 6px; border-radius: 3px; background: var(--hover); overflow: hidden; margin: 4px 0 2px; }
+.meter span { display: block; height: 100%; background: var(--accent); transition: width .4s; }
+.meter.warn span { background: var(--warn); }
+.meter.bad span { background: var(--bad); }
 
 /* ---- project list (overview) */
 .plist > div { padding: 9px 16px 9px calc(16px + var(--d, 0) * 22px); border-bottom: 1px solid var(--line); }

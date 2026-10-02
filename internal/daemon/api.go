@@ -246,7 +246,13 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	})
 
 	h("GET /api/events", func(w http.ResponseWriter, r *http.Request) error {
-		evs, err := d.DB.Events(r.URL.Query().Get("project"), 100)
+		q := r.URL.Query()
+		n, _ := strconv.Atoi(q.Get("n"))
+		if n <= 0 || n > 500 {
+			n = 50
+		}
+		before, _ := strconv.ParseInt(q.Get("before"), 10, 64)
+		evs, err := d.DB.EventsBefore(q.Get("project"), before, n)
 		if err != nil {
 			return err
 		}
@@ -666,6 +672,14 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return err
 		}
 		writeJSON(w, logs)
+		return nil
+	})
+
+	h("GET /api/system", func(w http.ResponseWriter, r *http.Request) error {
+		if d.sys == nil {
+			return errors.New("no system monitor")
+		}
+		writeJSON(w, d.sys.Read())
 		return nil
 	})
 

@@ -417,7 +417,12 @@ func (d *DB) Event(project, kind, format string, args ...any) {
 }
 
 func (d *DB) Events(project string, limit int) ([]Event, error) {
-	return d.q.ListEvents(ctx, queries.ListEventsParams{Project: project, Lim: int64(limit)})
+	return d.EventsBefore(project, 0, limit)
+}
+
+// EventsBefore pages events back: the newest limit with id < before (0 = from the newest).
+func (d *DB) EventsBefore(project string, before int64, limit int) ([]Event, error) {
+	return d.q.ListEvents(ctx, queries.ListEventsParams{Project: project, Before: before, Lim: int64(limit)})
 }
 
 // ---- audit log (written by triggers only)

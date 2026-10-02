@@ -25,6 +25,7 @@ import (
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/sdnotify"
 	"github.com/sh-lucas/vops/internal/store"
+	"github.com/sh-lucas/vops/internal/sysmon"
 )
 
 type Daemon struct {
@@ -45,6 +46,7 @@ type Daemon struct {
 	pushMu     sync.Mutex
 	proxyDirty atomic.Bool // the last push failed: retried every second
 	webRoutes  []string    // patterns of the web api, as API(false) registered them (tests walk them)
+	sys        *sysmon.Sampler
 }
 
 type cachedAuth struct {
@@ -91,7 +93,7 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1), proxy: proxy.NewClient(vopsHome)}
+	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1), proxy: proxy.NewClient(vopsHome), sys: sysmon.New(vopsHome, repo)}
 	d.cfg.Store(&host)
 	d.Routes.OnChange = d.pushRoutes
 	reg.Auth = d.registryAuth

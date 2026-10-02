@@ -629,17 +629,19 @@ func (q *Queries) ListEnvKeys(ctx context.Context, project string) ([]ListEnvKey
 
 const listEvents = `-- name: ListEvents :many
 SELECT id, at, project, kind, message FROM events
-WHERE ?1 = '' OR project = ?1
-ORDER BY id DESC LIMIT ?2
+WHERE (?1 = '' OR project = ?1) AND (?2 = 0 OR id < ?2)
+ORDER BY id DESC LIMIT ?3
 `
 
 type ListEventsParams struct {
 	Project interface{} `json:"project"`
+	Before  interface{} `json:"before"`
 	Lim     int64       `json:"lim"`
 }
 
+// newest first; before > 0 pages back (ids below it)
 func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event, error) {
-	rows, err := q.db.QueryContext(ctx, listEvents, arg.Project, arg.Lim)
+	rows, err := q.db.QueryContext(ctx, listEvents, arg.Project, arg.Before, arg.Lim)
 	if err != nil {
 		return nil, err
 	}

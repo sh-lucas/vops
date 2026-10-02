@@ -39,6 +39,7 @@ const ICONS = {
   camera: "M4 8h3l2-3h6l2 3h3v11H4zM12 16.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z",
   undo: "M9 14L4 9l5-5M4 9h10a6 6 0 0 1 0 12h-3",
   external: "M14 4h6v6M20 4l-9 9M18 14v5a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h5",
+  cpu: "M7 7h10v10H7zM9 3v4M15 3v4M9 17v4M15 17v4M3 9h4M3 15h4M17 9h4M17 15h4",
 };
 
 function icon(name) {
@@ -333,7 +334,7 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden && !$
 
 // ---- chrome: sidebar, top bar
 
-const NAV = [["#/", "Overview", "grid"], ["#/files", "Files", "file"], ["#/registry", "Registry", "box"], ["#/users", "Users", "user"], ["#/events", "Events", "activity"]];
+const NAV = [["#/", "Overview", "grid"], ["#/files", "Files", "file"], ["#/registry", "Registry", "box"], ["#/users", "Users", "user"], ["#/events", "Events", "activity"], ["#/system", "System", "cpu"]];
 $nav.append(...NAV.map(([href, label, ic]) => h("a", { href }, icon(ic), label)));
 $("logout").append(icon("logout"), "Log out");
 $("logout").onclick = async () => {
@@ -1010,7 +1011,8 @@ function previewsTab(ctx, box) {
 
 async function eventsTab(ctx, box) {
   box.replaceChildren(loading());
-  try { box.replaceChildren(eventList(await api("GET", "/events?project=" + enc(ctx.path)), false)); } catch (e) { box.replaceChildren(errorBox(e)); }
+  const q = "&project=" + enc(ctx.path);
+  try { box.replaceChildren(pagedEvents(await api("GET", "/events?n=" + EVENTS_PAGE + q), q, false)); } catch (e) { box.replaceChildren(errorBox(e)); }
 }
 
 // ---- logs
@@ -1378,11 +1380,28 @@ function eventList(evs, withProject = true) {
     h("td", { class: "wrapany" }, e.message)))));
 }
 
+const EVENTS_PAGE = 50;
+// pagedEvents: the newest EVENTS_PAGE events, "Load more" appends the next page (by id, so new events don't shift it)
+function pagedEvents(evs, query, withProject = true) {
+  const box = h("div", {});
+  let all = evs;
+  const render = (more) => {
+    const btn = more ? h("button", { class: "btn sm", onclick: () => busy(btn, async () => {
+      const next = await api("GET", `/events?n=${EVENTS_PAGE}&before=${all[all.length - 1].id}${query}`);
+      all = all.concat(next);
+      render(next.length === EVENTS_PAGE);
+    }) }, "Load more") : null;
+    put(box, eventList(all, withProject), btn ? h("div", { class: "row", style: "margin-top:8px" }, btn) : null);
+  };
+  render(evs.length === EVENTS_PAGE);
+  return box;
+}
+
 async function eventsPage(alive) {
   let evs, audit;
-  try { [evs, audit] = await Promise.all([api("GET", "/events"), api("GET", "/audit?n=200")]); } catch (e) { return failed(e, alive); }
+  try { [evs, audit] = await Promise.all([api("GET", "/events?n=" + EVENTS_PAGE), api("GET", "/audit?n=200")]); } catch (e) { return failed(e, alive); }
   if (!alive()) return;
-  page(head({ title: "Events", sub: "Deploys, config changes, pushes and logins." }), eventList(evs),
+  page(head({ title: "Events", sub: "Deploys, config changes, pushes and logins." }), pagedEvents(evs, ""),
     h("div", { class: "section" },
       h("div", { class: "section-head" }, h("h2", {}, "Audit log"), h("span", { class: "hint" }, "Every write to the host's database, recorded by sqlite triggers. Secrets are never recorded.")),
       audit.length ? panel(table(["When", "Table", "Op", "Key", "Detail"], audit.map((a) => h("tr", {},
@@ -1392,6 +1411,59 @@ async function eventsPage(alive) {
         h("td", { class: "mono small wrapany" }, a.key),
         h("td", { class: "small wrapany" }, a.detail)))))
         : panel(empty("Empty", null))));
+}
+
+// ---- system: the host's load, polled every 3s while the page is open (rates are since the previous poll)
+
+const pct = (x) => (x < 10 ? x.toFixed(1) : Math.round(x)) + "%";
+const rate = (bps) => size(Math.round(bps)) + "/s";
+const meter = (x) => h("div", { class: "meter" + (x >= 90 ? " bad" : x >= 70 ? " warn" : "") }, h("span", { style: `width:${Math.min(100, Math.max(0, x)).toFixed(1)}%` }));
+const duration = (s) => { const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60); return d ? `${d}d ${hh}h` : hh ? `${hh}h ${m}m` : `${m}m`; };
+
+async function systemPage(alive) {
+  let timer = null;
+  onLeave(() => clearTimeout(timer));
+  const tick = async () => {
+    let sys;
+    try { sys = await api("GET", "/system"); } catch (e) { return failed(e, alive); }
+    if (!alive()) return;
+    renderSystem(sys);
+    timer = setTimeout(tick, document.hidden ? 15000 : 3000);
+  };
+  await tick();
+}
+
+function renderSystem(sys) {
+  const card = (label, value, foot, x) => h("div", { class: "panel stat" }, h("div", { class: "label" }, label), h("div", { class: "value" }, value), x === undefined ? null : meter(x), h("div", { class: "foot" }, foot));
+  const mem = sys.mem_total ? (sys.mem_used / sys.mem_total) * 100 : 0;
+  const busiest = sys.disks.reduce((a, d) => (!a || d.busy > a.busy ? d : a), null);
+  const rx = sys.net.reduce((n, x) => n + x.rx_bps, 0), tx = sys.net.reduce((n, x) => n + x.tx_bps, 0);
+  const psi = Object.entries(sys.pressure || {});
+  page(head({ title: "System", sub: [mono(sys.hostname || "host"), sep(), "Linux ", mono(sys.kernel || "?"), sep(), "updates every 3s"] }),
+    h("div", { class: "stats" },
+      card("CPU", pct(sys.cpu), `${sys.cpus} cpu${sys.cpus === 1 ? "" : "s"} · load ${sys.load.map((x) => x.toFixed(2)).join(" ")}`, sys.cpu),
+      card("Memory", pct(mem), `${size(sys.mem_used)} of ${size(sys.mem_total)}` + (sys.swap_total ? ` · swap ${size(sys.swap_used)} of ${size(sys.swap_total)}` : ""), mem),
+      busiest ? card("Disk IO", pct(busiest.busy), `${busiest.name} busy · read ${rate(busiest.read_bps)} · write ${rate(busiest.write_bps)}`, busiest.busy) : null,
+      card("Network", ["↓ ", rate(rx)], ["↑ ", rate(tx)]),
+      card("Uptime", duration(sys.uptime), "vops daemon up " + duration(sys.daemon_uptime))),
+    h("div", { class: "section" }, h("div", { class: "section-head" }, h("h2", {}, "Disk space"), h("span", { class: "hint" }, "the filesystems holding ~/.vops and the repo")),
+      panel(table(["Paths", "Used", "", "Available", "Size"], sys.filesystems.map((f) => {
+        const used = f.total ? (f.used / f.total) * 100 : 0;
+        return h("tr", {}, h("td", { class: "mono small wrapany" }, f.paths.join(", ")), h("td", { class: "nowrap" }, pct(used)), h("td", { style: "width:30%" }, meter(used)), h("td", { class: "nowrap" }, size(f.avail)), h("td", { class: "nowrap muted" }, size(f.total)));
+      })))),
+    sys.disks.length > 1 ? h("div", { class: "section" }, h("div", { class: "section-head" }, h("h2", {}, "Disks")),
+      panel(table(["Device", "Busy", "", "Read", "Write"], sys.disks.map((d) => h("tr", {}, h("td", { class: "mono" }, d.name), h("td", { class: "nowrap" }, pct(d.busy)), h("td", { style: "width:30%" }, meter(d.busy)), h("td", { class: "nowrap" }, rate(d.read_bps)), h("td", { class: "nowrap" }, rate(d.write_bps))))))) : null,
+    sys.net.length ? h("div", { class: "section" }, h("div", { class: "section-head" }, h("h2", {}, "Network")),
+      panel(table(["Interface", "Receive", "Send", "Link"], sys.net.map((n) => {
+        const cap = n.speed ? (n.speed * 1e6) / 8 : 0; // Mbit/s -> bytes/s
+        return h("tr", {}, h("td", { class: "mono" }, n.name), h("td", { class: "nowrap" }, rate(n.rx_bps), cap ? h("span", { class: "muted" }, " · " + pct((n.rx_bps / cap) * 100)) : null),
+          h("td", { class: "nowrap" }, rate(n.tx_bps), cap ? h("span", { class: "muted" }, " · " + pct((n.tx_bps / cap) * 100)) : null), h("td", { class: "muted nowrap" }, n.speed ? (n.speed >= 1000 ? n.speed / 1000 + " Gbit/s" : n.speed + " Mbit/s") : "unknown"));
+      })))) : null,
+    psi.length ? h("div", { class: "section" }, h("div", { class: "section-head" }, h("h2", {}, "Pressure"), h("span", { class: "hint" }, "share of time tasks waited on the resource (PSI): some = at least one, full = all; averages over 10s, 60s, 300s")),
+      panel(table(["Resource", "Some", "Full"], ["cpu", "memory", "io"].filter((r) => sys.pressure[r]).map((r) => {
+        const p = sys.pressure[r], fmt = (v) => v.map((x) => x.toFixed(2) + "%").join(" · ");
+        return h("tr", {}, h("td", {}, r), h("td", { class: "mono small" + (p.some[0] >= 10 ? " warn-text" : "") }, fmt(p.some)), h("td", { class: "mono small" }, p.full ? fmt(p.full) : "—"));
+      })))) : null);
 }
 
 // ---- router. Old links keep working: #/p/<path> is the services tab, #/logs/<path>?service=x the full-page logs.
@@ -1428,6 +1500,7 @@ function route() {
   if (path === "/registry") return registryPage(alive);
   if (path === "/users") return usersPage(alive);
   if (path === "/events") return eventsPage(alive);
+  if (path === "/system") return systemPage(alive);
   return overview(alive);
 }
 
