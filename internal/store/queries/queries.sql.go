@@ -395,6 +395,31 @@ func (q *Queries) GetUser(ctx context.Context, name string) (User, error) {
 	return i, err
 }
 
+const insertEnvIfMissing = `-- name: InsertEnvIfMissing :execrows
+INSERT INTO env (project, key, value, updated_at) VALUES (?, ?, ?, ?)
+ON CONFLICT (project, key) DO NOTHING
+`
+
+type InsertEnvIfMissingParams struct {
+	Project   string `json:"project"`
+	Key       string `json:"key"`
+	Value     []byte `json:"value"`
+	UpdatedAt int64  `json:"updated_at"`
+}
+
+func (q *Queries) InsertEnvIfMissing(ctx context.Context, arg InsertEnvIfMissingParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, insertEnvIfMissing,
+		arg.Project,
+		arg.Key,
+		arg.Value,
+		arg.UpdatedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const latestDeploys = `-- name: LatestDeploys :many
 SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at, before_id, parts FROM deploys WHERE id IN (SELECT max(id) FROM deploys GROUP BY project)
 `
@@ -426,6 +451,39 @@ func (q *Queries) LatestDeploys(ctx context.Context) ([]Deploy, error) {
 			&i.BeforeID,
 			&i.Parts,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listAllEnv = `-- name: ListAllEnv :many
+SELECT project, key, value FROM env ORDER BY project, key
+`
+
+type ListAllEnvRow struct {
+	Project string `json:"project"`
+	Key     string `json:"key"`
+	Value   []byte `json:"value"`
+}
+
+func (q *Queries) ListAllEnv(ctx context.Context) ([]ListAllEnvRow, error) {
+	rows, err := q.db.QueryContext(ctx, listAllEnv)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAllEnvRow{}
+	for rows.Next() {
+		var i ListAllEnvRow
+		if err := rows.Scan(&i.Project, &i.Key, &i.Value); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

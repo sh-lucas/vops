@@ -18,9 +18,11 @@ import (
 	"time"
 
 	"github.com/sh-lucas/vops/internal/compose"
+	"github.com/sh-lucas/vops/internal/daemon"
 	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
+	"github.com/sh-lucas/vops/internal/secrets"
 	"github.com/sh-lucas/vops/internal/store"
 	"github.com/sh-lucas/vops/internal/sysmon"
 )
@@ -117,6 +119,7 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 	fs.Var(&services, "service", "")
 	snapshotID := fs.Int64("snapshot", 0, "")
 	planOnly := fs.Bool("plan", false, "")
+	have := fs.String("have", "", "")
 	pos, err := parseFlags(fs, args)
 	if err != nil {
 		return err
@@ -232,9 +235,64 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		return nil
 
 	case "env":
-		sub, err := arg(0, "ls|set|rm")
+		sub, err := arg(0, "ls|set|rm|restore|recipients")
 		if err != nil {
 			return err
+		}
+		switch sub {
+		case "backup": // the laptop's side of sync: the blob and what it holds (names only)
+			resp, err := c.do("GET", "/api/secrets?blob=1&have="+url.QueryEscape(*have), nil)
+			if err != nil {
+				return err
+			}
+			defer resp.Body.Close()
+			_, err = io.Copy(out, resp.Body)
+			return err
+		case "recipients":
+			var info daemon.BackupInfo
+			if err := getJSON(c, "/api/secrets", &info); err != nil {
+				return err
+			}
+			if *asJSON {
+				return json.MarshalWrite(out, info)
+			}
+			printRecipients(out, info)
+			return nil
+		case "restore":
+			if !*fromStdin {
+				return errors.New("env restore on the host reads the decrypted backup with --stdin")
+			}
+			b, err := io.ReadAll(stdin)
+			if err != nil {
+				return err
+			}
+			entries, err := secrets.Unmarshal(b)
+			if err != nil {
+				return err
+			}
+			var res struct {
+				Restored, Kept []string
+				Error          string
+			}
+			if err := post(c, "POST", "/api/secrets/restore", map[string]any{"entries": entries}, &res); err != nil {
+				return err
+			}
+			if len(res.Restored) > 0 {
+				fmt.Fprintf(out, "restored %d secret(s): %s\n", len(res.Restored), strings.Join(res.Restored, ", "))
+			}
+			if len(res.Kept) > 0 {
+				fmt.Fprintf(out, "already set on the host, kept as is: %s\n", strings.Join(res.Kept, ", "))
+			}
+			if len(res.Restored) == 0 && len(res.Kept) == 0 {
+				fmt.Fprintln(out, "the backup holds no secrets")
+			}
+			if res.Error != "" {
+				return errors.New(res.Error)
+			}
+			if len(res.Restored) > 0 {
+				fmt.Fprintln(out, "run `vops apply` to deploy them")
+			}
+			return nil
 		}
 		project, err := arg(1, "project")
 		if err != nil {
@@ -269,7 +327,17 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			if len(u.Unused) > 0 {
 				fmt.Fprintf(tw, "\nunused (set, but no service uses them): %s\t\t\n", strings.Join(u.Unused, ", "))
 			}
-			return tw.Flush()
+			if err := tw.Flush(); err != nil {
+				return err
+			}
+			var info daemon.BackupInfo
+			if getJSON(c, "/api/secrets", &info) == nil && (info.Secrets > 0 || info.SHA != "") {
+				fmt.Fprintf(out, "\nbackup: %s, %d secret(s), opens with %d key(s) (vops env recipients)\n", info.File, info.Secrets, len(info.Recipients))
+				if info.Warning != "" {
+					fmt.Fprintf(out, "! %s\n", info.Warning)
+				}
+			}
+			return nil
 		case "set":
 			if !*fromStdin {
 				return errors.New("env set on the host reads KEY=VALUE lines with --stdin")
@@ -742,6 +810,31 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		return nil
 	}
 	return fmt.Errorf("unknown command %q", cmd)
+}
+
+// printRecipients: who can open the backup, which keys were left out, and the state of the copy in git.
+func printRecipients(out io.Writer, info daemon.BackupInfo) {
+	fmt.Fprintf(out, "%s: %d secret(s), opens with any of these keys:\n", info.File, info.Secrets)
+	tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+	for _, r := range info.Recipients {
+		fmt.Fprintf(tw, "  %s\t%s\t%s\n", r.Name(), r.Type, r.Source)
+	}
+	if len(info.Recipients) == 0 {
+		fmt.Fprintln(tw, "  (none)")
+	}
+	tw.Flush()
+	for _, r := range info.Skipped {
+		fmt.Fprintf(out, "! skipped %s %s (%s): %s\n", r.Type, r.Name(), r.Source, r.Reason)
+	}
+	if info.Warning != "" {
+		fmt.Fprintf(out, "! %s\n", info.Warning)
+	}
+	switch info.Repo {
+	case "behind":
+		fmt.Fprintf(out, "the copy in git is behind: run `vops sync` to save it\n")
+	case "foreign":
+		fmt.Fprintf(out, "the copy in git isn't one this host wrote: `vops sync` offers to restore it\n")
+	}
 }
 
 // envHint is the short advice next to a variable in `env ls`.

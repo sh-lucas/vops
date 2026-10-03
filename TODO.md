@@ -48,6 +48,8 @@ Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback` (images by pinning
 
 ## Other
 
+- Secrets backup: cover it in `just vps-test` (real sshd, root's keys copied with passwordless sudo, a restore onto the fresh container host).
+
 - Proxy: a listener change (http/https/tls) re-execs it, so sites blink for a moment; hand the listening sockets to the new process (or bind the new ones before closing the old) to make it seamless. Same for a `proxy.Version` bump on upgrade.
 - Watchdog in `just vps-test`: SIGSTOP the proxy and the daemon and check systemd restarts them (takes WatchdogSec, 30-60s, so it isn't there yet).
 - conmon (podman's per-container monitor) runs inside `vops.service`'s cgroup: harmless with `KillMode=process`, but systemd attributes image-pull page cache to the service. Run podman through `systemd-run --user --scope` (or set conmon's cgroup) so each container is fully outside the daemon.

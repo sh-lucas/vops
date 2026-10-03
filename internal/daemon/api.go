@@ -19,6 +19,7 @@ import (
 	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
+	"github.com/sh-lucas/vops/internal/secrets"
 	"github.com/sh-lucas/vops/internal/store"
 )
 
@@ -106,7 +107,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Previews []preview  `json:"previews"`
 			Proxy    ProxyState `json:"proxy"`
 			User     string     `json:"user"` // who is logged in ("cli" on the socket)
-		}{plan.Domain, plan.Commit, plan.Changes(), append(pwarns, plan.Warnings...), []project{}, []preview{}, px, actor(r)}
+		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r)}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
 			var ld *store.Deploy
@@ -307,6 +308,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return err
 		}
 		d.DB.Event(in.Project, "config", "%s %s set", envLabel(in.Preview), in.Key)
+		d.backupNow()
 		writeJSON(w, map[string]bool{"ok": true})
 		return nil
 	})
@@ -320,7 +322,20 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			return err
 		}
 		d.DB.Event(q.Get("project"), "config", "%s %s removed", envLabel(q.Get("preview") == "1"), q.Get("key"))
+		d.backupNow()
 		writeJSON(w, map[string]bool{"ok": true})
+		return nil
+	})
+
+	// the encrypted secrets backup: who can open it, whether git has it. blob=1 adds the armored file
+	// (it is encrypted: it goes to git anyway); have=<sha> asks whether a copy is one this host wrote.
+	h("GET /api/secrets", func(w http.ResponseWriter, r *http.Request) error {
+		q := r.URL.Query()
+		info, err := d.backupInfo(q.Get("have"), q.Get("blob") == "1")
+		if err != nil && info.File == "" {
+			return err
+		}
+		writeJSON(w, info)
 		return nil
 	})
 
@@ -689,6 +704,30 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	})
 
 	if trusted {
+		// `vops env restore`: values decrypted on the laptop, sent over ssh; only missing keys are set
+		h("POST /api/secrets/restore", func(w http.ResponseWriter, r *http.Request) error {
+			var in struct{ Entries []secrets.Entry }
+			if err := readJSON(r, &in); err != nil {
+				return err
+			}
+			restored, kept, err := d.restoreEnv(in.Entries)
+			if restored == nil {
+				restored = []string{}
+			}
+			if kept == nil {
+				kept = []string{}
+			}
+			if err != nil && len(restored) == 0 {
+				return err
+			}
+			out := map[string]any{"restored": restored, "kept": kept}
+			if err != nil {
+				out["error"] = err.Error()
+			}
+			writeJSON(w, out)
+			return nil
+		})
+
 		// `vops setup` after starting the proxy: rebuild the table from podman and send it now
 		h("POST /api/proxy/sync", func(w http.ResponseWriter, r *http.Request) error {
 			var err error

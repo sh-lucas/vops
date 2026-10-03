@@ -143,7 +143,29 @@ func cmdSetup(args []string) error {
 		say("VOPS_NO_SYSTEMD set: not installing the service")
 		return nil
 	}
+	if os.Getuid() != 0 {
+		snapshotRootKeys(vh, say)
+	}
 	return installUnit(vh, say, warn)
+}
+
+// snapshotRootKeys copies root's authorized_keys (hosting panels put their key there) so those keys can
+// open .secrets.age too: the rootless daemon can't read /root. Only read, only with passwordless sudo
+// (-n: never a prompt); without it the previous snapshot stays.
+func snapshotRootKeys(vh string, say func(string, ...any)) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "sudo", "-n", "cat", "/root/.ssh/authorized_keys").Output()
+	path := daemon.RootKeysPath(vh)
+	if err != nil {
+		if _, serr := os.Stat(path); serr == nil {
+			say("root's ssh keys: no passwordless sudo now, keeping the copy from the last install")
+		}
+		return
+	}
+	if err := os.WriteFile(path+".tmp", out, 0o600); err == nil && os.Rename(path+".tmp", path) == nil {
+		say("root's ssh keys can open .secrets.age too (copied with sudo)")
+	}
 }
 
 func installUnit(vh string, say, warn func(string, ...any)) error {

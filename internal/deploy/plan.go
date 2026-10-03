@@ -239,7 +239,7 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 		case err != nil:
 			plan.Warnings = append(plan.Warnings, fmt.Sprintf("%v: keeping the config in effect", err))
 			cfg = current
-		case cfg != current:
+		case !cfg.Equal(current):
 			plan.Config = &ConfigChange{Changes: current.Diff(cfg), Restart: current.UIListener(cfg), ProxyRestart: current.ProxyListeners(cfg), To: cfg}
 		}
 	} else if err != nil {

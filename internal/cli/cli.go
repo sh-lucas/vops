@@ -43,6 +43,8 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   env ls|set|rm <project> [--preview] [KEY=VALUE... | KEY...]   (set reads KEY=VALUE lines from stdin if none given;
                                      --preview: the secrets of the project's previews, which never get its env;
                                      ls also shows each service's variables and where they come from)
+  env recipients                     who can open .secrets.age, the encrypted backup of every env secret in git
+  env restore [file]                 decrypt .secrets.age with your ssh key and set the secrets the host lacks
   preview up <project> --name n [--image svc=ref]... [--ref r] [--from snapshot-id]
   preview ls [project] | rm <project> <name>   previews of services with x-vops.preview: <service>.<name>.<project>.<domain>
   user ls | rm <name>                users: admins (dashboard + every repo) and deployers (registry only)

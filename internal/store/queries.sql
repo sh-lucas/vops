@@ -36,6 +36,13 @@ SELECT key, updated_at FROM env WHERE project = ? ORDER BY key;
 -- name: ListEnv :many
 SELECT key, value FROM env WHERE project = ?;
 
+-- name: ListAllEnv :many
+SELECT project, key, value FROM env ORDER BY project, key;
+
+-- name: InsertEnvIfMissing :execrows
+INSERT INTO env (project, key, value, updated_at) VALUES (?, ?, ?, ?)
+ON CONFLICT (project, key) DO NOTHING;
+
 -- name: CreateUser :exec
 INSERT INTO users (name, role, global, secret, created_at) VALUES (?, ?, ?, ?, ?);
 

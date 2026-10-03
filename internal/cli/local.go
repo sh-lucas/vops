@@ -23,6 +23,7 @@ import (
 	"github.com/sh-lucas/vops/internal/daemon"
 	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/proxy"
+	"github.com/sh-lucas/vops/internal/secrets"
 )
 
 func run(dir string, env []string, name string, args ...string) error {
@@ -226,6 +227,9 @@ func cmdInstall(g globals, args []string) error {
 			return err
 		}
 		fmt.Printf("\nlinked %s to %s (vops-lock.yml, git remote \"vops\"); next: vops sync\n", root, r.Host)
+		if _, err := os.Stat(filepath.Join(root, secrets.File)); err == nil {
+			fmt.Printf("%s is here: if this host lacks its secrets, vops sync offers to restore them\n", secrets.File)
+		}
 	}
 	return nil
 }
@@ -301,10 +305,13 @@ func cmdSync(g globals, args []string) error {
 	}
 	if _, err := output(root, "git", "rev-parse", "--verify", "-q", "refs/remotes/vops/main"); err == nil {
 		if _, err := output(root, "git", "merge-base", "--is-ancestor", "vops/main", "HEAD"); err != nil {
-			if err := run(root, env, "git", "merge", "--no-edit", "vops/main"); err != nil {
+			if err := run(root, env, "git", "merge", "--no-edit", "vops/main"); err != nil && !resolveBackupConflict(root) {
 				return fmt.Errorf("could not merge the host's changes: resolve the conflict, commit, and sync again (%w)", err)
 			}
 		}
+	}
+	if err := syncSecrets(g, r, root, secretsOpts{sync: true, yes: *yes}); err != nil {
+		warnf("secrets backup: %v", err)
 	}
 	fmt.Fprintln(os.Stderr, "pushing")
 	if err := run(root, env, "git", "push", "-q", "vops", "HEAD:main"); err != nil {
@@ -312,6 +319,18 @@ func cmdSync(g globals, args []string) error {
 	}
 	head, _ := output(root, "git", "rev-parse", "HEAD")
 	return applyFlow(g, *yes, head, nil, "sync")
+}
+
+// resolveBackupConflict finishes a merge whose only conflict is .secrets.age (two laptops committed
+// different backups): any side will do, sync writes the host's latest right after.
+func resolveBackupConflict(root string) bool {
+	conflicts, _ := output(root, "git", "diff", "--name-only", "--diff-filter=U")
+	if conflicts != secrets.File {
+		return false
+	}
+	return run(root, nil, "git", "checkout", "--theirs", "--", secrets.File) == nil &&
+		run(root, nil, "git", "add", "-f", "--", secrets.File) == nil &&
+		run(root, nil, "git", "commit", "-q", "--no-edit") == nil
 }
 
 // ---- apply
@@ -369,7 +388,41 @@ func applyFlow(g globals, yes bool, commit string, projects []string, trigger st
 // ---- env and admin read secrets here and send them over stdin, never on a command line
 
 func cmdEnv(g globals, args []string) error {
-	if len(args) < 2 || args[0] != "set" || slices.Contains(args, "--stdin") {
+	if slices.Contains(args, "--stdin") {
+		return forward(g, "env", args, os.Stdin, os.Stdout)
+	}
+	if len(args) > 0 && args[0] == "restore" {
+		return cmdEnvRestore(g, args[1:])
+	}
+	if err := envWrite(g, args); err != nil {
+		return err
+	}
+	if len(args) > 0 && args[0] == "recipients" {
+		if r, _ := g.remote(); r != nil {
+			if info, err := backupInfo(g, ""); err == nil && len(info.Recipients) > 0 {
+				if k := myKey(info, r.Key); k != "" {
+					fmt.Printf("you can open it with %s\n", k)
+				} else {
+					checkMine(info, r.Key)
+				}
+			}
+		}
+	}
+	// a change on the host: bring its new backup into git (committed here, pushed by the next sync)
+	if len(args) > 1 && (args[0] == "set" || args[0] == "rm") {
+		if r, _ := g.remote(); r != nil {
+			if root := repoRoot(); root != "" {
+				if err := syncSecrets(g, r, root, secretsOpts{}); err != nil {
+					warnf("secrets backup: %v", err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func envWrite(g globals, args []string) error {
+	if len(args) < 2 || args[0] != "set" {
 		return forward(g, "env", args, os.Stdin, os.Stdout)
 	}
 	project, pairs := args[1], args[2:]

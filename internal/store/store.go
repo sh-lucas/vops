@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/hmac"
 	"crypto/pbkdf2"
 	"crypto/rand"
 	"crypto/sha256"
@@ -28,9 +29,10 @@ import (
 )
 
 type DB struct {
-	sql *sql.DB
-	q   *queries.Queries
-	gcm cipher.AEAD
+	sql    *sql.DB
+	q      *queries.Queries
+	gcm    cipher.AEAD
+	macKey []byte // derived from secret.key: fingerprints of secrets (never a plain hash of them)
 }
 
 // ctx: the store is fast and local; callers don't need to thread contexts through it.
@@ -63,7 +65,7 @@ func Open(path, keyPath string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DB{sql: db, q: queries.New(db), gcm: gcm}, nil
+	return &DB{sql: db, q: queries.New(db), gcm: gcm, macKey: mac(key, []byte("vops fingerprint"))}, nil
 }
 
 func (d *DB) Close() error { return d.sql.Close() }
@@ -85,6 +87,16 @@ func loadKey(path string) ([]byte, error) {
 }
 
 func now() int64 { return time.Now().Unix() }
+
+func mac(key, data []byte) []byte {
+	m := hmac.New(sha256.New, key)
+	m.Write(data)
+	return m.Sum(nil)
+}
+
+// Fingerprint is a keyed hash (HMAC with a key derived from secret.key): it says whether secrets changed
+// without being a hash anyone could brute-force from the secrets.
+func (d *DB) Fingerprint(data []byte) string { return hex.EncodeToString(mac(d.macKey, data)) }
 
 // Hash is the sha256 hex used for tokens and session ids.
 func Hash(s string) string {
@@ -158,10 +170,31 @@ func (d *DB) DeleteProject(path string) error { return d.q.DeleteProject(ctx, pa
 // ---- env (values are encrypted and never leave the daemon except into containers)
 
 func (d *DB) SetEnv(project, key, value string) error {
+	return d.q.SetEnv(ctx, queries.SetEnvParams{Project: project, Key: key, Value: d.seal(project, key, value), UpdatedAt: now()})
+}
+
+func (d *DB) seal(project, key, value string) []byte {
 	nonce := make([]byte, d.gcm.NonceSize())
 	rand.Read(nonce)
-	sealed := d.gcm.Seal(nonce, nonce, []byte(value), []byte(project+"\x00"+key))
-	return d.q.SetEnv(ctx, queries.SetEnvParams{Project: project, Key: key, Value: sealed, UpdatedAt: now()})
+	return d.gcm.Seal(nonce, nonce, []byte(value), []byte(project+"\x00"+key))
+}
+
+func (d *DB) open(project, key string, sealed []byte) (string, error) {
+	n := d.gcm.NonceSize()
+	if len(sealed) < n {
+		return "", fmt.Errorf("env %s/%s: corrupt", project, key)
+	}
+	plain, err := d.gcm.Open(nil, sealed[:n], sealed[n:], []byte(project+"\x00"+key))
+	if err != nil {
+		return "", fmt.Errorf("env %s/%s: %w", project, key, err)
+	}
+	return string(plain), nil
+}
+
+// SetEnvIfMissing sets a value only when the key isn't set yet (restoring a backup never overwrites).
+func (d *DB) SetEnvIfMissing(project, key, value string) (bool, error) {
+	n, err := d.q.InsertEnvIfMissing(ctx, queries.InsertEnvIfMissingParams{Project: project, Key: key, Value: d.seal(project, key, value), UpdatedAt: now()})
+	return n > 0, err
 }
 
 func (d *DB) UnsetEnv(project, key string) error {
@@ -190,16 +223,32 @@ func (d *DB) Env(project string) (map[string]string, error) {
 		return nil, err
 	}
 	out := map[string]string{}
-	n := d.gcm.NonceSize()
 	for _, r := range rows {
-		if len(r.Value) < n {
-			return nil, fmt.Errorf("env %s/%s: corrupt", project, r.Key)
-		}
-		plain, err := d.gcm.Open(nil, r.Value[:n], r.Value[n:], []byte(project+"\x00"+r.Key))
+		v, err := d.open(project, r.Key, r.Value)
 		if err != nil {
-			return nil, fmt.Errorf("env %s/%s: %w", project, r.Key, err)
+			return nil, err
 		}
-		out[r.Key] = string(plain)
+		out[r.Key] = v
+	}
+	return out, nil
+}
+
+// EnvValue is one decrypted env var of any scope (a project, or "<project>@*" for its previews).
+type EnvValue struct{ Scope, Key, Value string }
+
+// AllEnv returns every env var of every scope, decrypted, sorted; only the secrets backup should call it.
+func (d *DB) AllEnv() ([]EnvValue, error) {
+	rows, err := d.q.ListAllEnv(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := []EnvValue{}
+	for _, r := range rows {
+		v, err := d.open(r.Project, r.Key, r.Value)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, EnvValue{r.Project, r.Key, v})
 	}
 	return out, nil
 }

@@ -601,7 +601,26 @@ function envTab(ctx, box) {
   };
   const list = h("div", {}, loading("Loading…", "pad"));
   const services = h("div", {});
+  const backup = h("div", {});
+  const loadBackup = async () => {
+    let b;
+    try { b = await api("GET", "/secrets"); } catch (e) { return put(backup, errorBox(e)); }
+    const state = {
+      current: "saved in git, up to date",
+      behind: ["the copy in git is behind: run ", mono("vops sync"), " to save it"],
+      foreign: ["the copy in git isn't one this host wrote: ", mono("vops sync"), " offers to restore its secrets"],
+      none: b.sha ? ["not in git yet: run ", mono("vops sync")] : "nothing to back up yet",
+    }[b.repo];
+    put(backup, panel(panelHead(h("h2", {}, "Backup in git"), h("span", { class: "muted small" }, mono(b.file), " · encrypted to the ssh keys below")),
+      h("div", { class: "panel-note small" + (b.repo === "behind" || b.repo === "foreign" ? " warn-text" : " muted") }, b.secrets + " secret(s) of every project and previews · ", state),
+      b.warning ? alertBox("bad", "Nobody can decrypt a new backup", h("span", { class: "small" }, b.warning)) : null,
+      b.recipients.length ? table(["Can decrypt", "Type", "From"], b.recipients.map((r) => h("tr", {},
+        h("td", { class: "wrapany", title: r.fingerprint || null }, r.comment || mono(r.fingerprint || r.key)), h("td", { class: "mono small" }, r.type), h("td", { class: "small" }, r.source)))) : null,
+      b.skipped.map((r) => h("div", { class: "panel-note small warn-text" }, "Skipped ", mono(r.type), " ", r.comment || r.fingerprint || r.key, " (", r.source, "): ", r.reason)),
+      h("div", { class: "panel-note small muted" }, "Restore on a new host: ", mono("vops sync"), " or ", mono("vops env restore"), " decrypts it with your ssh key. More people: ", mono("secrets.recipients"), " in vops.yml.")));
+  };
   const load = async () => {
+    loadBackup();
     let envs, usage = null, uerr = null;
     try {
       [envs, usage] = await Promise.all([api("GET", "/env?project=" + enc(path) + scope), api("GET", "/env/usage?project=" + enc(path) + scope).catch((e) => { uerr = e; return null; })]);
@@ -652,7 +671,7 @@ function envTab(ctx, box) {
     h("div", { class: "panel-note small muted" }, preview
       ? ["Previews don't inherit production's env: they read ", mono("preview.env"), " from ", mono(path + "/"), " in the repo, then these secrets on top."]
       : ["Used as ", mono("${KEY}"), " in compose.yml or with ", mono("environment: [KEY]"), ". Changes deploy on the next apply."]),
-    list, h("div", { class: "panel-foot" }, form)), services));
+    list, h("div", { class: "panel-foot" }, form)), services, backup));
   load();
 }
 

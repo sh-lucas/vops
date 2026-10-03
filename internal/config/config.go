@@ -28,17 +28,23 @@ type Config struct {
 	Domain string `yaml:"domain"` // projects live under <project>.<domain>, the ui under vops.<domain>
 	Email  string `yaml:"email"`  // for Let's Encrypt
 
-	HTTP         string `yaml:"http"`          // default ":80"
-	HTTPS        string `yaml:"https"`         // default ":443"; "off" disables it
-	UI           string `yaml:"ui"`            // default "127.0.0.1:9984"; "off" disables it
-	TLS          string `yaml:"tls"`           // auto (default) | off
-	Snapshots    string `yaml:"snapshots"`     // on (default) | off
-	SnapshotKeep int    `yaml:"snapshot_keep"` // automatic snapshots kept per project, default 5
-	ImageKeep    int    `yaml:"image_keep"`    // registry gc keeps the images of the newest N deploys per project, default 10
-	PreviewMax   int    `yaml:"preview_max"`   // previews on this host at once, default 5 (each one is another database)
-	PreviewTTL   string `yaml:"preview_ttl"`   // previews not updated for this long are removed, default 3d
+	HTTP         string  `yaml:"http"`              // default ":80"
+	HTTPS        string  `yaml:"https"`             // default ":443"; "off" disables it
+	UI           string  `yaml:"ui"`                // default "127.0.0.1:9984"; "off" disables it
+	TLS          string  `yaml:"tls"`               // auto (default) | off
+	Snapshots    string  `yaml:"snapshots"`         // on (default) | off
+	SnapshotKeep int     `yaml:"snapshot_keep"`     // automatic snapshots kept per project, default 5
+	ImageKeep    int     `yaml:"image_keep"`        // registry gc keeps the images of the newest N deploys per project, default 10
+	PreviewMax   int     `yaml:"preview_max"`       // previews on this host at once, default 5 (each one is another database)
+	PreviewTTL   string  `yaml:"preview_ttl"`       // previews not updated for this long are removed, default 3d
+	Secrets      Secrets `yaml:"secrets,omitempty"` // the encrypted backup of env secrets (.secrets.age)
 	// ACMEDirectory overrides the Let's Encrypt directory (staging, pebble in tests).
 	ACMEDirectory string `yaml:"acme_directory,omitempty"`
+}
+
+// Secrets: who else can decrypt .secrets.age, besides the ssh keys that reach the host.
+type Secrets struct {
+	Recipients []string `yaml:"recipients,omitempty"` // ssh public keys ("ssh-ed25519 AAAA… name") or age1… keys
 }
 
 type Lock struct {
@@ -113,6 +119,11 @@ func (c Config) Validate() error {
 	if _, err := ParseTTL(c.PreviewTTL); err != nil {
 		return fmt.Errorf("preview_ttl: %w", err)
 	}
+	for _, r := range c.Secrets.Recipients {
+		if r = strings.TrimSpace(r); !strings.HasPrefix(r, "ssh-") && !strings.HasPrefix(r, "age1") {
+			return fmt.Errorf("secrets.recipients: %q is not an ssh public key (ssh-ed25519 AAAA… name) or an age1… key", r)
+		}
+	}
 	return nil
 }
 
@@ -169,8 +180,30 @@ func (c Config) Diff(o Config) []string {
 	add("image_keep", c.ImageKeep, o.ImageKeep)
 	add("preview_max", c.PreviewMax, o.PreviewMax)
 	add("preview_ttl", c.PreviewTTL, o.PreviewTTL)
+	add("secrets.recipients", recipientNames(c.Secrets.Recipients), recipientNames(o.Secrets.Recipients))
 	add("acme_directory", c.ACMEDirectory, o.ACMEDirectory)
 	return out
+}
+
+// Equal: no field differs (Config holds a slice, so == doesn't work).
+func (c Config) Equal(o Config) bool { return len(c.Diff(o)) == 0 }
+
+// recipientNames shows keys by comment (or their tail) in the plan.
+func recipientNames(rs []string) string {
+	if len(rs) == 0 {
+		return "none"
+	}
+	var out []string
+	for _, r := range rs {
+		f := strings.Fields(r)
+		switch {
+		case len(f) > 2:
+			out = append(out, strings.Join(f[2:], " "))
+		case len(f) > 0 && len(f[len(f)-1]) > 8:
+			out = append(out, "…"+f[len(f)-1][len(f[len(f)-1])-8:])
+		}
+	}
+	return "[" + strings.Join(out, ", ") + "]"
 }
 
 func orNone(v any) any {
@@ -242,6 +275,8 @@ snapshot_keep: 5         # automatic snapshots kept per project
 image_keep: 10           # registry gc keeps the images of the last N deploys per project (rollback, previews)
 preview_max: 5           # previews on this host at once (each one runs its own copy of the databases)
 preview_ttl: 3d          # previews not updated for this long are removed
+# secrets:                 # .secrets.age (env secrets backup) opens with the host's ssh keys; add more people:
+#   recipients: ["ssh-ed25519 AAAA... teammate", "age1..."]
 `, domain, email)
 }
 

@@ -47,6 +47,7 @@ type Daemon struct {
 	proxyDirty atomic.Bool // the last push failed: retried every second
 	webRoutes  []string    // patterns of the web api, as API(false) registered them (tests walk them)
 	sys        *sysmon.Sampler
+	backup     backup // the encrypted secrets backup (secrets.go)
 }
 
 type cachedAuth struct {
@@ -122,6 +123,9 @@ func (d *Daemon) applyConfig(c config.Config, w io.Writer) error {
 	d.Engine.SnapshotKeep, d.Engine.SnapshotsOff = c.SnapshotKeep, c.Snapshots == "off"
 	d.Engine.PreviewMax, d.Engine.PreviewTTL = c.Previews()
 	d.DB.Event("", "config", "vops.yml applied: %s", strings.Join(old.Diff(c), ", "))
+	if err := d.refreshBackup(); err != nil {
+		fmt.Fprintf(w, "secrets backup: ! %v\n", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if restart, err := d.proxy.Reload(ctx); err != nil {
@@ -397,6 +401,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	sdnotify.Notify("READY=1")
 	go sdnotify.Watchdog(ctx, d.ping)
+	d.backupNow()
 
 	// after a reboot: start what should run; this also sends the routes to the proxy
 	d.Engine.StartStopped(ctx, &logWriter{prefix: "boot: "})
@@ -466,6 +471,7 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		d.Engine.Lock(func() { d.Engine.RefreshRoutes(ctx) })
 		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
 		d.DB.PurgeSessions()
+		d.backupNow() // authorized_keys may have changed
 		if n%(24*60) == 0 {
 			if res, err := d.gc(); err == nil && res.Blobs > 0 {
 				d.DB.Event("", "gc", "registry gc: %d manifests, %d blobs, %d bytes freed", res.Manifests, res.Blobs, res.Freed)

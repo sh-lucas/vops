@@ -53,6 +53,7 @@ The thoughts above are the original brief. How it ended up (details and reasons 
 | `internal/daemon` | unix sockets (cli, `web.sock` for the proxy) and the ui listener, json api, login and sessions, registry auth, logs, git-tracked file tree, pushing the routing table to the proxy |
 | `internal/deploy` | plan (git vs podman), apply, rolling/recreate, readiness, routes from labels, pre-deploy snapshots (`snapshots.go`), rollback of images (pins) and data (`rollback.go`), previews: worktree, data copy, env layers, push targets, ttl (`preview.go`), deploy history and timeline (`history.go`), backups: snapshots as .tar.gz, export and checked import (`backup.go`), proxy limits from compose into the table (`plan.go`, `apply.go`) |
 | `internal/compose` | compose subset parser, interpolation, service → podman args |
+| `internal/secrets` | the `.secrets.age` backup: recipients from authorized_keys and `vops.yml`, the plaintext format, age encrypt/decrypt, private keys in `~/.ssh`. The host side is `daemon/secrets.go`, the laptop side `cli/secrets.go` |
 | `internal/registry` | OCI registry on the filesystem, GC (with a keep set of digests from the daemon) |
 | `internal/proxy` | routing table + reverse proxy, per-project limits (`limit.go`: token bucket per client ip, body size); the `vops proxy` process (`server.go`: :80/:443, autocert, control socket, table on disk, forwarding to the daemon) and its client (`client.go`) |
 | `internal/sdnotify` | systemd READY=1 and watchdog pings (stdlib) |
