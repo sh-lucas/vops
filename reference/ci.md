@@ -16,10 +16,10 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with: {fetch-depth: 0}      # sync merges the host's history
-      - uses: actions/setup-go@v5
-        with: {go-version: "1.27"}
+      - uses: actions/setup-go@v6
+        with: {go-version: "1.27", cache: false}
       - run: go install github.com/sh-lucas/vops/cmd/vops@latest
       - run: |
           install -m 600 /dev/null key && printf '%s\n' "$KEY" > key
