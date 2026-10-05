@@ -2,60 +2,48 @@
 
 Ideas with a design sketch. Done things move to README/reference; decisions to reference/decisions.md.
 
-## Security and abuse (next)
+## Proxy hardening (next)
 
-Facts today: sqlite is in WAL with foreign keys on (`store.go`); all SQL is sqlc (parameterized); users are admins/deployers with the rules in db checks and triggers; sessions are HttpOnly/SameSite=Strict + `X-Vops` header, tied to a user, purged by housekeeping; json bodies are capped at 1MB; env is write-only; the proxy rate-limits per project and tcp peer (`x-vops.rate`).
+Today: `ReadHeaderTimeout` 10s, `IdleTimeout` 2m, upstream dial 5s with a keep-alive pool, per-project rate/burst/max_body per client ip. It never decompresses bodies, so zip bombs only concern the app; what's missing is limits on connections and time. All of these bump `proxy.Version`.
 
-- Login throttle is still a global mutex + 1s sleep: an attacker's failed attempts queue in front of the real admins (lockout by spam) and nothing is per IP. Replace with per-IP backoff (token bucket, in memory, like the proxy's limiter) and keep the failed-login event. Same for registry basic auth failures.
-- Audit `X-Forwarded-*` handling before adding anything per-IP in the daemon (only trust it when the proxy sits behind a known CDN): the daemon trusts the proxy's `X-Forwarded-For`, and the proxy appends to whatever the client sent.
-- Optional: dashboard roles below admin (viewer, per-project scopes) and pull-only deployers, if someone needs them.
-- Fuzz more: the registry manifest parser, the log query parser.
+- Body read timeout: a slow upload holds its connection forever. Reset a read deadline on every body read (e.g. no byte for 30s = drop), not a total `ReadTimeout` that would kill big legit uploads.
+- Upstream response header timeout: `ResponseHeaderTimeout` is 0, so a hung container holds the connection until the client gives up. Default 60s, `x-vops.timeout`-style override per project for long polling/SSE.
+- Max concurrent connections per ip and in total (`ConnState` counting, refuse past the cap), with a default that no real client reaches.
+- `MaxHeaderBytes` down from Go's 1MB to 64KB.
+- IP allow/deny list per project in compose's `x-vops`, plus basic-auth in front of a route (staging/previews).
+- `x-vops.redirect` www→apex.
 
-## Proxy toggles
+## Security
 
-Done: per-project `rate`/`burst`/`max_body` in compose's top-level `x-vops`, carried by the routing table (see decisions.md).
-
-- A dashboard "override" table for emergencies (block an IP, lower a limit) with an expiry, sent in the routing table and shown in the plan like pins.
-- Per-service limits (today they are per project) if a project needs an upload service next to a strict api.
-- Other toggles worth having: request/response header timeouts per route, max concurrent connections per IP, IP allow/deny list, basic-auth in front of a route (staging/previews), `x-vops.redirect` www→apex, security headers (HSTS is on).
+- Login throttle is a global mutex + 1s sleep: an attacker's failed attempts queue in front of the real admins and nothing is per ip. Per-ip backoff (token bucket in memory, like the proxy's limiter), keeping the failed-login event. Same for registry basic auth failures.
+- Audit `X-Forwarded-*` before adding anything per-ip in the daemon: the daemon trusts the proxy's `X-Forwarded-For`, and the proxy appends to whatever the client sent.
+- Dashboard roles below admin (viewer, per-project scopes) if someone needs them; notifications already filter through `notify.CanSee`.
+- Fuzz the registry manifest parser and the log query parser.
 
 ## Releases
 
-- Manual approval per project: `x-vops.approve: true` (or a repo pattern). A push that would redeploy records a pending release (repo, tag, digest, who pushed) instead of deploying; the dashboard shows Approve/Reject (reject = untag/ignore); approve runs the same apply as `onPush` does today. Needs a `pending_releases` table + a badge like "pending changes".
-- Notifications, next: Web Push and alerts are done (see decisions.md "Notifications"). Outbound webhooks (generic JSON, plus ntfy/Discord/Slack formats) as one more kind of "device": a row in the db with its URL (a secret: sealed like env), the same kinds, toggles and access rule, a "Send test", added from the Notifications page. Also: a `push` and `approval` kind once manual approval exists, per-project mutes, and quiet hours per user.
-- Tag semantics to document (they already work this way): a service on `myapp:v2.1.8` only redeploys when `v2.1.8` itself is pushed again (mutable tag = new digest = redeploy); pushing `latest` does nothing to it. Consider `x-vops.watch: digest-only`/`false` for "never redeploy from a push", and a warning when a push overwrites an existing non-`latest` tag.
-- Rollback to test on a real host (no btrfs and with btrfs): images-only rollback needs no btrfs; check the dashboard flow on a real deploy and write the result in README.
+- Manual approval per project: `x-vops.approve: true`. A push that would redeploy records a pending release (repo, tag, digest, who pushed) instead of deploying; the dashboard shows Approve/Reject; approve runs the same apply as `onPush`. Needs a `pending_releases` table, a badge like "pending changes" and an `approval` notification kind.
+- Tag semantics to document (they already work this way): a service on `myapp:v2.1.8` only redeploys when `v2.1.8` itself is pushed again; pushing `latest` does nothing to it. Warn when a push overwrites an existing non-`latest` tag.
+- Prebuilt release binaries (amd64/arm64) so install and CI don't need go.
+
+## Notifications
+
+- Outbound webhooks (generic JSON, ntfy, Discord, Slack) as one more kind of device: a row with its URL (a secret, sealed like env), the same kinds, toggles and access rule, "Send test", added from the Notifications page.
+- Per-project mutes.
+- Opt-in early kill: `x-vops.oom: kill-first` on a service lets vops restart it when memory PSI stays high, before the kernel or systemd-oomd picks a victim (maybe the proxy). Never a default: it could pick a database. `mem_limit` is the first answer.
 
 ## Data
 
-Done: btrfs subvolumes, pre-deploy snapshots, `vops rollback` (images by pinning, and data), previews (`vops preview`, previews from registry tags, `--from` snapshot), deploy history with the dashboard timeline and previews tab.
-
-### Previews, next
-
-- Reset a preview's data without `rm`: `preview up --from <id>` (or `--from live`) on an existing preview (today it errors and asks for `rm` first); stop it, restore like rollback, start.
-- Delete the registry tags pushed for a preview when it's removed (today they stay until `vops registry rm`): only `preview-*` tags of the repos the preview ran.
-- Remove a preview when its branch is deleted or its PR merged: a `vops preview rm` from CI is enough today; maybe a push of an empty/special tag.
-- Per-preview ttl (`--ttl 12h`) and a "keep" flag for long-lived staging-like previews.
-- Previews of projects with fixed-subnet networks: rewrite or drop `ipam` in previews.
-
-### Smaller data items
-
-- Opt-out per project for pre-deploy snapshots (top-level `x-vops: {snapshots: false}` in compose; today it's host-wide in `vops.yml`).
-- `vops snapshot diff <id>`: `btrfs subvolume find-new` / sizes, to see how much a snapshot holds exclusively.
-- Show snapshot disk usage (needs quotas or `btrfs filesystem du`, which is slow; maybe only on demand).
-- Off-host backups exist (`vops snapshot export|import`, a .tar.gz). Next: scheduled export to a target (ssh, S3-compatible), and incremental `btrfs send` for big data.
-- Tag built images per commit (`localhost/vops/<project>-<service>:<commit>`, keep the last N) so built services can roll back too (today image rollback skips them: "can't roll back without the code").
+- Per-preview ttl (`--ttl 12h`, `0` = keep) for long-lived staging-like previews.
+- Delete a preview's `preview-*` registry tags when it's removed (today they stay until `vops registry rm`).
+- Opt-out per project for pre-deploy snapshots (`x-vops: {snapshots: false}`; today it's host-wide in `vops.yml`).
+- Scheduled off-host export of snapshots (ssh, S3-compatible); `vops snapshot export|import` exists.
+- Tag built images per commit (keep the last N) so built services can roll back too (today image rollback skips them).
 
 ## Other
 
-- Secrets backup: cover it in `just vps-test` (real sshd, root's keys copied with passwordless sudo, a restore onto the fresh container host).
-
-- Proxy: a listener change (http/https/tls) re-execs it, so sites blink for a moment; hand the listening sockets to the new process (or bind the new ones before closing the old) to make it seamless. Same for a `proxy.Version` bump on upgrade.
-- Watchdog in `just vps-test`: SIGSTOP the proxy and the daemon and check systemd restarts them (takes WatchdogSec, 30-60s, so it isn't there yet).
-- conmon (podman's per-container monitor) runs inside `vops.service`'s cgroup: harmless with `KillMode=process`, but systemd attributes image-pull page cache to the service. Run podman through `systemd-run --user --scope` (or set conmon's cgroup) so each container is fully outside the daemon.
-- migration helper: `vops migrate-db` for the dump/restore/verify dance in reference/migrating.md (postgres, mysql).
-- re-pull third-party tags (`postgres:16`) on demand from the dashboard ("update images").
-- prebuilt release binaries (amd64/arm64) so install and CI don't need go.
-- per-container metrics (podman stats) in the dashboard.
-- compose `secrets` as podman secrets from the project env (also hides values from `podman inspect`).
-- log aggregation in duckdb/parquet if months-long search is ever needed (journald does it today).
+- Proxy: a listener change or a `proxy.Version` bump re-execs it, so sites blink; hand the listening sockets to the new process to make it seamless.
+- Re-pull third-party tags (`postgres:16`) on demand from the dashboard ("update images").
+- Per-container cpu/memory in the dashboard: the notifications monitor already reads them from cgroups.
+- Compose `secrets` as podman secrets from the project env (also hides values from `podman inspect`).
+- `vops migrate-db` for the dump/restore/verify dance in reference/migrating.md (postgres, mysql).
