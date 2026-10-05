@@ -380,8 +380,8 @@ func (e *Engine) fetch(ctx context.Context, img store.DeployImage) error {
 // the project, snapshots the current data (pre-rollback, the undo point), restores, then starts it with the
 // pinned images. One history row, trigger rollback.
 func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	w = &syncWriter{w: w}
 	rp, pp, err := e.rollbackPlan(ctx, o)
 	if err != nil {
@@ -390,6 +390,11 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err
 	if len(rp.Parts) == 0 {
 		return fmt.Errorf("nothing to roll back: %s", rp.Why())
 	}
+	defer func() {
+		if err != nil {
+			e.deployed(o.Project, fmt.Errorf("rollback: %w", err))
+		}
+	}()
 	images, data := slices.Contains(rp.Parts, "images"), slices.Contains(rp.Parts, "data")
 	var steps []ImageStep
 	for _, st := range rp.Images {
@@ -502,6 +507,7 @@ func (e *Engine) stopProject(ctx context.Context, w io.Writer, project string) (
 		}
 	}
 	fmt.Fprintf(w, "%s: stopping %d container(s)\n", project, len(running))
+	e.expectAll(running)
 	for i, c := range running {
 		if _, err := podman.Run(ctx, "stop", "-t", cmpOr(c.Labels["vops.stopwait"], "10"), c.ID); err != nil {
 			return running[:i+1], err

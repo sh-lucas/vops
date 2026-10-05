@@ -32,6 +32,7 @@ type Stats struct {
 	Net          []Net          `json:"net"`
 	Pressure     map[string]PSI `json:"pressure,omitempty"` // cpu, memory, io; absent without PSI
 	Interval     float64        `json:"interval"`           // seconds between the two samples
+	OOMKills     uint64         `json:"oom_kills"`          // processes killed by the kernel OOM killer since boot (/proc/vmstat)
 }
 
 type Disk struct {
@@ -143,6 +144,7 @@ func (s *Sampler) Read() Stats {
 		}
 	}
 	st.Filesystems = s.filesystems()
+	st.OOMKills = parseVmstat(s.read("proc/vmstat"))["oom_kill"]
 	s.last = st
 	return st
 }
@@ -271,6 +273,16 @@ func parseLoadavg(text string) [3]float64 {
 		l[i], _ = strconv.ParseFloat(f[i], 64)
 	}
 	return l
+}
+
+func parseVmstat(text string) map[string]uint64 {
+	out := map[string]uint64{}
+	for line := range strings.SplitSeq(text, "\n") {
+		if k, v, ok := strings.Cut(line, " "); ok {
+			out[k], _ = strconv.ParseUint(strings.TrimSpace(v), 10, 64)
+		}
+	}
+	return out
 }
 
 type diskCounters struct{ sectorsRead, sectorsWritten, ioTicks uint64 }

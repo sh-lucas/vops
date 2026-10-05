@@ -92,8 +92,8 @@ func (e *Engine) previewRoot(path string) string {
 
 // PreviewUp creates a preview or updates it (new ref, new images, or just redeploy and keep it alive).
 func (e *Engine) PreviewUp(ctx context.Context, w io.Writer, o PreviewOpts) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	w = &syncWriter{w: w}
 	path := PreviewPath(o.Project, o.Name)
 	if err := compose.ValidProjectPath(path); err != nil {
@@ -192,6 +192,7 @@ func (e *Engine) PreviewUp(ctx context.Context, w io.Writer, o PreviewOpts) erro
 		if !found { // nothing half-made stays behind
 			e.removePreview(ctx, io.Discard, pv)
 		}
+		e.deployed(path, err)
 		return err
 	}
 	var warns []string
@@ -425,8 +426,8 @@ func pause(ctx context.Context, ids []string) func() {
 
 // PreviewRm removes a preview and everything it made.
 func (e *Engine) PreviewRm(ctx context.Context, w io.Writer, project, name string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	path := PreviewPath(project, name)
 	if err := compose.ValidProjectPath(path); err != nil {
 		return err

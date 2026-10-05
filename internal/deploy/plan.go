@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sh-lucas/vops/internal/compose"
@@ -57,7 +58,13 @@ type Engine struct {
 	Config      func() config.Config
 	ApplyConfig func(config.Config, io.Writer) error // podman authfile (0600) with credentials for PullAddr; not --creds, which shows in ps
 
-	mu sync.Mutex // one apply at a time
+	// OnDeploy hears every deploy that changed something (err nil = ok) and every failed rollback or preview (notifications)
+	OnDeploy func(project string, err error)
+
+	mu       sync.Mutex    // one apply at a time
+	busy     atomic.Bool   // an apply, rollback, restart, preview or snapshot holds mu
+	gen      atomic.Uint64 // bumped when such an operation starts and ends
+	expected sync.Map      // container id or name -> time.Time: the engine stops it, so its death is no alert
 }
 
 type Plan struct {

@@ -57,6 +57,55 @@ func (q *Queries) CountAdmins(ctx context.Context) (int64, error) {
 	return count, err
 }
 
+const createAlert = `-- name: CreateAlert :one
+INSERT INTO alerts (kind, key, project, service, title, body, url, first_at, last_at, sent_at, sends, occurrences, state, ended_at, closed_at, closed_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id
+`
+
+type CreateAlertParams struct {
+	Kind        string `json:"kind"`
+	Key         string `json:"key"`
+	Project     string `json:"project"`
+	Service     string `json:"service"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	Url         string `json:"url"`
+	FirstAt     int64  `json:"first_at"`
+	LastAt      int64  `json:"last_at"`
+	SentAt      int64  `json:"sent_at"`
+	Sends       int64  `json:"sends"`
+	Occurrences int64  `json:"occurrences"`
+	State       string `json:"state"`
+	EndedAt     int64  `json:"ended_at"`
+	ClosedAt    int64  `json:"closed_at"`
+	ClosedBy    string `json:"closed_by"`
+}
+
+func (q *Queries) CreateAlert(ctx context.Context, arg CreateAlertParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, createAlert,
+		arg.Kind,
+		arg.Key,
+		arg.Project,
+		arg.Service,
+		arg.Title,
+		arg.Body,
+		arg.Url,
+		arg.FirstAt,
+		arg.LastAt,
+		arg.SentAt,
+		arg.Sends,
+		arg.Occurrences,
+		arg.State,
+		arg.EndedAt,
+		arg.ClosedAt,
+		arg.ClosedBy,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createDeploy = `-- name: CreateDeploy :one
 INSERT INTO deploys (project, commit_sha, trigger, images, snapshot_id, restored_id, undoes, before_id, parts, result, error, summary, started_at, finished_at)
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -199,6 +248,15 @@ func (q *Queries) DeleteExpiredSessions(ctx context.Context, expires int64) (int
 	return result.RowsAffected()
 }
 
+const deleteNotifySetting = `-- name: DeleteNotifySetting :exec
+DELETE FROM notify_settings WHERE key = ?
+`
+
+func (q *Queries) DeleteNotifySetting(ctx context.Context, key string) error {
+	_, err := q.db.ExecContext(ctx, deleteNotifySetting, key)
+	return err
+}
+
 const deletePin = `-- name: DeletePin :execrows
 DELETE FROM pins WHERE project = ? AND service = ?
 `
@@ -257,6 +315,30 @@ func (q *Queries) DeleteSnapshot(ctx context.Context, id int64) error {
 	return err
 }
 
+const deleteSubscription = `-- name: DeleteSubscription :execrows
+DELETE FROM push_subscriptions WHERE id = ?
+`
+
+func (q *Queries) DeleteSubscription(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteSubscription, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+const deleteSubscriptionByEndpoint = `-- name: DeleteSubscriptionByEndpoint :execrows
+DELETE FROM push_subscriptions WHERE endpoint = ?
+`
+
+func (q *Queries) DeleteSubscriptionByEndpoint(ctx context.Context, endpoint string) (int64, error) {
+	result, err := q.db.ExecContext(ctx, deleteSubscriptionByEndpoint, endpoint)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
 const deleteUser = `-- name: DeleteUser :execrows
 DELETE FROM users WHERE name = ?
 `
@@ -276,6 +358,35 @@ DELETE FROM user_repos WHERE user = ?
 func (q *Queries) DeleteUserRepos(ctx context.Context, user string) error {
 	_, err := q.db.ExecContext(ctx, deleteUserRepos, user)
 	return err
+}
+
+const getAlert = `-- name: GetAlert :one
+SELECT id, kind, "key", project, service, title, body, url, first_at, last_at, sent_at, sends, occurrences, state, ended_at, closed_at, closed_by FROM alerts WHERE id = ?
+`
+
+func (q *Queries) GetAlert(ctx context.Context, id int64) (Alert, error) {
+	row := q.db.QueryRowContext(ctx, getAlert, id)
+	var i Alert
+	err := row.Scan(
+		&i.ID,
+		&i.Kind,
+		&i.Key,
+		&i.Project,
+		&i.Service,
+		&i.Title,
+		&i.Body,
+		&i.Url,
+		&i.FirstAt,
+		&i.LastAt,
+		&i.SentAt,
+		&i.Sends,
+		&i.Occurrences,
+		&i.State,
+		&i.EndedAt,
+		&i.ClosedAt,
+		&i.ClosedBy,
+	)
+	return i, err
 }
 
 const getDeploy = `-- name: GetDeploy :one
@@ -727,6 +838,33 @@ func (q *Queries) ListEvents(ctx context.Context, arg ListEventsParams) ([]Event
 	return items, nil
 }
 
+const listNotifySettings = `-- name: ListNotifySettings :many
+SELECT "key", value FROM notify_settings
+`
+
+func (q *Queries) ListNotifySettings(ctx context.Context) ([]NotifySetting, error) {
+	rows, err := q.db.QueryContext(ctx, listNotifySettings)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []NotifySetting{}
+	for rows.Next() {
+		var i NotifySetting
+		if err := rows.Scan(&i.Key, &i.Value); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listPins = `-- name: ListPins :many
 SELECT project, service, image, digest, compose_image, deploy_id, created_at FROM pins
 WHERE ?1 = '' OR project = ?1
@@ -751,6 +889,33 @@ func (q *Queries) ListPins(ctx context.Context, project interface{}) ([]Pin, err
 			&i.DeployID,
 			&i.CreatedAt,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listPrefs = `-- name: ListPrefs :many
+SELECT user, kind, enabled FROM notify_prefs
+`
+
+func (q *Queries) ListPrefs(ctx context.Context) ([]NotifyPref, error) {
+	rows, err := q.db.QueryContext(ctx, listPrefs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []NotifyPref{}
+	for rows.Next() {
+		var i NotifyPref
+		if err := rows.Scan(&i.User, &i.Kind, &i.Enabled); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -934,6 +1099,43 @@ func (q *Queries) ListSnapshots(ctx context.Context, project interface{}) ([]Sna
 	return items, nil
 }
 
+const listSubscriptions = `-- name: ListSubscriptions :many
+SELECT id, user, endpoint, p256dh, auth, label, created_at, last_ok_at, last_error FROM push_subscriptions ORDER BY user, id
+`
+
+func (q *Queries) ListSubscriptions(ctx context.Context) ([]PushSubscription, error) {
+	rows, err := q.db.QueryContext(ctx, listSubscriptions)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PushSubscription{}
+	for rows.Next() {
+		var i PushSubscription
+		if err := rows.Scan(
+			&i.ID,
+			&i.User,
+			&i.Endpoint,
+			&i.P256dh,
+			&i.Auth,
+			&i.Label,
+			&i.CreatedAt,
+			&i.LastOkAt,
+			&i.LastError,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listUserRepos = `-- name: ListUserRepos :many
 SELECT user, repo FROM user_repos ORDER BY user, repo
 `
@@ -980,6 +1182,52 @@ func (q *Queries) ListUsers(ctx context.Context) ([]User, error) {
 			&i.Global,
 			&i.Secret,
 			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const liveAlerts = `-- name: LiveAlerts :many
+SELECT id, kind, "key", project, service, title, body, url, first_at, last_at, sent_at, sends, occurrences, state, ended_at, closed_at, closed_by FROM alerts WHERE ended_at = 0 ORDER BY id
+`
+
+// alerts whose condition still holds (open, silenced or expired)
+func (q *Queries) LiveAlerts(ctx context.Context) ([]Alert, error) {
+	rows, err := q.db.QueryContext(ctx, liveAlerts)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Alert{}
+	for rows.Next() {
+		var i Alert
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Key,
+			&i.Project,
+			&i.Service,
+			&i.Title,
+			&i.Body,
+			&i.Url,
+			&i.FirstAt,
+			&i.LastAt,
+			&i.SentAt,
+			&i.Sends,
+			&i.Occurrences,
+			&i.State,
+			&i.EndedAt,
+			&i.ClosedAt,
+			&i.ClosedBy,
 		); err != nil {
 			return nil, err
 		}
@@ -1092,6 +1340,78 @@ func (q *Queries) PutPreview(ctx context.Context, arg PutPreviewParams) error {
 	return err
 }
 
+const putSubscription = `-- name: PutSubscription :exec
+INSERT INTO push_subscriptions (user, endpoint, p256dh, auth, label, created_at) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT (endpoint) DO UPDATE SET user = excluded.user, p256dh = excluded.p256dh, auth = excluded.auth, label = excluded.label, last_error = ''
+`
+
+type PutSubscriptionParams struct {
+	User      string `json:"user"`
+	Endpoint  string `json:"endpoint"`
+	P256dh    string `json:"p256dh"`
+	Auth      string `json:"auth"`
+	Label     string `json:"label"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+// a browser resubscribing (same endpoint) moves to whoever is logged in now
+func (q *Queries) PutSubscription(ctx context.Context, arg PutSubscriptionParams) error {
+	_, err := q.db.ExecContext(ctx, putSubscription,
+		arg.User,
+		arg.Endpoint,
+		arg.P256dh,
+		arg.Auth,
+		arg.Label,
+		arg.CreatedAt,
+	)
+	return err
+}
+
+const recentAlerts = `-- name: RecentAlerts :many
+SELECT id, kind, "key", project, service, title, body, url, first_at, last_at, sent_at, sends, occurrences, state, ended_at, closed_at, closed_by FROM alerts ORDER BY id DESC LIMIT ?
+`
+
+func (q *Queries) RecentAlerts(ctx context.Context, limit int64) ([]Alert, error) {
+	rows, err := q.db.QueryContext(ctx, recentAlerts, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Alert{}
+	for rows.Next() {
+		var i Alert
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Key,
+			&i.Project,
+			&i.Service,
+			&i.Title,
+			&i.Body,
+			&i.Url,
+			&i.FirstAt,
+			&i.LastAt,
+			&i.SentAt,
+			&i.Sends,
+			&i.Occurrences,
+			&i.State,
+			&i.EndedAt,
+			&i.ClosedAt,
+			&i.ClosedBy,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const recentDeployImages = `-- name: RecentDeployImages :many
 SELECT images FROM deploys d
 WHERE (SELECT count(*) FROM deploys x WHERE x.project = d.project AND x.id > d.id) < CAST(?1 AS INTEGER)
@@ -1158,6 +1478,37 @@ func (q *Queries) SetMeta(ctx context.Context, arg SetMetaParams) error {
 	return err
 }
 
+const setNotifySetting = `-- name: SetNotifySetting :exec
+INSERT INTO notify_settings (key, value) VALUES (?, ?)
+ON CONFLICT (key) DO UPDATE SET value = excluded.value
+`
+
+type SetNotifySettingParams struct {
+	Key   string `json:"key"`
+	Value int64  `json:"value"`
+}
+
+func (q *Queries) SetNotifySetting(ctx context.Context, arg SetNotifySettingParams) error {
+	_, err := q.db.ExecContext(ctx, setNotifySetting, arg.Key, arg.Value)
+	return err
+}
+
+const setPref = `-- name: SetPref :exec
+INSERT INTO notify_prefs (user, kind, enabled) VALUES (?, ?, ?)
+ON CONFLICT (user, kind) DO UPDATE SET enabled = excluded.enabled
+`
+
+type SetPrefParams struct {
+	User    string `json:"user"`
+	Kind    string `json:"kind"`
+	Enabled bool   `json:"enabled"`
+}
+
+func (q *Queries) SetPref(ctx context.Context, arg SetPrefParams) error {
+	_, err := q.db.ExecContext(ctx, setPref, arg.User, arg.Kind, arg.Enabled)
+	return err
+}
+
 const setProjectApplied = `-- name: SetProjectApplied :exec
 INSERT INTO projects (path, commit_sha, applied_at) VALUES (?, ?, ?)
 ON CONFLICT (path) DO UPDATE SET commit_sha = excluded.commit_sha, applied_at = excluded.applied_at
@@ -1204,6 +1555,34 @@ func (q *Queries) SetProjectLimits(ctx context.Context, arg SetProjectLimitsPara
 	return err
 }
 
+const subscriptionFailed = `-- name: SubscriptionFailed :exec
+UPDATE push_subscriptions SET last_error = ? WHERE id = ?
+`
+
+type SubscriptionFailedParams struct {
+	LastError string `json:"last_error"`
+	ID        int64  `json:"id"`
+}
+
+func (q *Queries) SubscriptionFailed(ctx context.Context, arg SubscriptionFailedParams) error {
+	_, err := q.db.ExecContext(ctx, subscriptionFailed, arg.LastError, arg.ID)
+	return err
+}
+
+const subscriptionOK = `-- name: SubscriptionOK :exec
+UPDATE push_subscriptions SET last_ok_at = ?, last_error = '' WHERE id = ?
+`
+
+type SubscriptionOKParams struct {
+	LastOkAt int64 `json:"last_ok_at"`
+	ID       int64 `json:"id"`
+}
+
+func (q *Queries) SubscriptionOK(ctx context.Context, arg SubscriptionOKParams) error {
+	_, err := q.db.ExecContext(ctx, subscriptionOK, arg.LastOkAt, arg.ID)
+	return err
+}
+
 const unsetEnv = `-- name: UnsetEnv :exec
 DELETE FROM env WHERE project = ? AND key = ?
 `
@@ -1215,6 +1594,44 @@ type UnsetEnvParams struct {
 
 func (q *Queries) UnsetEnv(ctx context.Context, arg UnsetEnvParams) error {
 	_, err := q.db.ExecContext(ctx, unsetEnv, arg.Project, arg.Key)
+	return err
+}
+
+const updateAlert = `-- name: UpdateAlert :exec
+UPDATE alerts SET title = ?, body = ?, url = ?, last_at = ?, sent_at = ?, sends = ?, occurrences = ?, state = ?, ended_at = ?, closed_at = ?, closed_by = ?
+WHERE id = ?
+`
+
+type UpdateAlertParams struct {
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	Url         string `json:"url"`
+	LastAt      int64  `json:"last_at"`
+	SentAt      int64  `json:"sent_at"`
+	Sends       int64  `json:"sends"`
+	Occurrences int64  `json:"occurrences"`
+	State       string `json:"state"`
+	EndedAt     int64  `json:"ended_at"`
+	ClosedAt    int64  `json:"closed_at"`
+	ClosedBy    string `json:"closed_by"`
+	ID          int64  `json:"id"`
+}
+
+func (q *Queries) UpdateAlert(ctx context.Context, arg UpdateAlertParams) error {
+	_, err := q.db.ExecContext(ctx, updateAlert,
+		arg.Title,
+		arg.Body,
+		arg.Url,
+		arg.LastAt,
+		arg.SentAt,
+		arg.Sends,
+		arg.Occurrences,
+		arg.State,
+		arg.EndedAt,
+		arg.ClosedAt,
+		arg.ClosedBy,
+		arg.ID,
+	)
 	return err
 }
 

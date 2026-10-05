@@ -57,8 +57,8 @@ func (o ApplyOpts) wants(project, service string) bool {
 
 // Apply makes podman match git. Progress goes to w. Projects fail independently.
 func (e *Engine) Apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	w = &syncWriter{w: w}
 	if opts.Unpin != "" {
 		for _, k := range opts.Services {
@@ -109,7 +109,11 @@ func (e *Engine) applyProject(ctx context.Context, w io.Writer, plan *Plan, pp *
 		}
 	}
 	err := e.deployProject(ctx, w, plan, pp, opts, &rec)
-	if compose.IsPreview(pp.Path) || pp.Error == "" && !slices.ContainsFunc(pp.Actions, func(a Action) bool { return a.Kind != "none" && opts.wants(pp.Path, a.Service) }) {
+	changed := pp.Error != "" || slices.ContainsFunc(pp.Actions, func(a Action) bool { return a.Kind != "none" && opts.wants(pp.Path, a.Service) })
+	if changed || err != nil {
+		e.deployed(pp.Path, err)
+	}
+	if compose.IsPreview(pp.Path) || !changed {
 		return err
 	}
 	e.record(ctx, rec, pp.specs, err)
@@ -248,6 +252,7 @@ func (e *Engine) ensureNetworks(ctx context.Context, w io.Writer, pp *ProjectPla
 			fmt.Fprintf(w, "%s: network %s changed, recreating it\n", pp.Path, n.Name)
 			out, _ := podman.Run(ctx, "ps", "-aq", "--filter", "network="+n.Name, "--filter", "label="+LProject+"="+pp.Path)
 			for _, id := range strings.Fields(out) {
+				e.expect(id)
 				podman.Run(ctx, "rm", "-f", "-t", "10", id)
 			}
 			if _, err := podman.Run(ctx, "network", "rm", n.Name); err != nil {
@@ -263,6 +268,7 @@ func (e *Engine) ensureNetworks(ctx context.Context, w io.Writer, pp *ProjectPla
 }
 
 func (e *Engine) remove(ctx context.Context, cs []podman.Container) error {
+	e.expectAll(cs)
 	var errs []error
 	for _, c := range cs {
 		wait := "10"
@@ -354,6 +360,7 @@ func (e *Engine) deploy(ctx context.Context, log func(string, ...any), d *desire
 				log("last logs of %s:\n%s", r.name, indent(tail))
 			}
 			if rolling {
+				e.expect(r.id, r.name)
 				podman.Run(ctx, "rm", "-f", "-t", "0", r.id)
 			}
 		}
@@ -489,6 +496,7 @@ func (e *Engine) start(ctx context.Context, d *desired) (replica, error) {
 	id, err := podman.Run(ctx, args...)
 	if err != nil {
 		// podman may have created the container before failing to start it
+		e.expect(r.name)
 		podman.Run(ctx, "rm", "-f", "-t", "0", r.name)
 		return replica{}, err
 	}
@@ -595,8 +603,8 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 
 // StartStopped starts vops containers of enabled projects that are not running (after a reboot).
 func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	cs, err := podman.PS(ctx, LProject)
 	if err != nil {
 		fmt.Fprintln(w, err)
@@ -617,8 +625,8 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 
 // Restart restarts the containers of a project (or one service of it).
 func (e *Engine) Restart(ctx context.Context, project, service string) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	filters := []string{LProject + "=" + project}
 	if service != "" {
 		filters = append(filters, LService+"="+service)
@@ -630,6 +638,7 @@ func (e *Engine) Restart(ctx context.Context, project, service string) error {
 	if len(cs) == 0 {
 		return fmt.Errorf("no containers for %s %s", project, service)
 	}
+	e.expectAll(cs)
 	for _, c := range cs {
 		if _, err := podman.Run(ctx, "restart", c.ID); err != nil {
 			return err

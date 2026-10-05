@@ -234,6 +234,25 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 		}
 		return nil
 
+	case "notifications":
+		var n struct {
+			Alerts []store.Alert `json:"alerts"`
+		}
+		if err := getJSON(c, "/api/notify", &n); err != nil {
+			return err
+		}
+		open := 0
+		for _, a := range n.Alerts {
+			if a.State == "open" {
+				open++
+				fmt.Fprintf(out, "%s  %-13s %s (sent %d×)\n    %s\n", time.Unix(a.FirstAt, 0).Format("2006-01-02 15:04"), a.Kind, a.Title, a.Sends, a.Body)
+			}
+		}
+		if open == 0 {
+			fmt.Fprintln(out, "no open alerts")
+		}
+		return nil
+
 	case "env":
 		sub, err := arg(0, "ls|set|rm|restore|recipients")
 		if err != nil {

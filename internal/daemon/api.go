@@ -106,8 +106,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Projects []project  `json:"projects"`
 			Previews []preview  `json:"previews"`
 			Proxy    ProxyState `json:"proxy"`
-			User     string     `json:"user"` // who is logged in ("cli" on the socket)
-		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r)}
+			User     string     `json:"user"`   // who is logged in ("cli" on the socket)
+			Alerts   int        `json:"alerts"` // open alerts the user can see (the sidebar badge)
+		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r), d.openAlerts(r)}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
 			var ld *store.Deploy
@@ -697,6 +698,8 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		writeJSON(w, d.sys.Read())
 		return nil
 	})
+
+	d.notifyRoutes(h)
 
 	h("GET /api/routes", func(w http.ResponseWriter, r *http.Request) error {
 		writeJSON(w, d.Routes.Routes())

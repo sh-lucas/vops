@@ -62,6 +62,7 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
   history <project> [-n N]           deploys, rollbacks and snapshots, newest first
   admin password                     same as user password admin
   events [project]                   what happened (deploys, pushes, config)
+  notifications                      open alerts (being pushed to the dashboard's devices)
   audit [-n N]                       every write to the host's state
   version
 
@@ -145,7 +146,7 @@ func dispatch(g globals, cmd string, rest []string) (err error) {
 		err = cmdRollback(g, rest)
 	case "preview":
 		err = cmdPreview(g, rest)
-	case "status", "plan", "logs", "restart", "enable", "disable", "registry", "events", "audit", "history", "unpin":
+	case "status", "plan", "logs", "restart", "enable", "disable", "registry", "events", "notifications", "audit", "history", "unpin":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)

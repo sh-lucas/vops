@@ -266,8 +266,8 @@ func short(s string) string {
 
 // Snapshot takes a manual snapshot of a project's data.
 func (e *Engine) Snapshot(ctx context.Context, w io.Writer, project, note string) (store.Snapshot, error) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	if !e.snapshotsOn() {
 		return store.Snapshot{}, errors.New("snapshots are off (snapshots: off in vops.yml)")
 	}
@@ -288,8 +288,8 @@ func (e *Engine) Snapshot(ctx context.Context, w io.Writer, project, note string
 
 // DeleteSnapshot deletes a snapshot and its data.
 func (e *Engine) DeleteSnapshot(ctx context.Context, id int64) error {
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.lock()
+	defer e.unlock()
 	s, err := e.DB.Snapshot(id)
 	if err != nil {
 		return err

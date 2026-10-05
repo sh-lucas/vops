@@ -4,6 +4,26 @@
 
 package queries
 
+type Alert struct {
+	ID          int64  `json:"id"`
+	Kind        string `json:"kind"`
+	Key         string `json:"key"`
+	Project     string `json:"project"`
+	Service     string `json:"service"`
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	Url         string `json:"url"`
+	FirstAt     int64  `json:"first_at"`
+	LastAt      int64  `json:"last_at"`
+	SentAt      int64  `json:"sent_at"`
+	Sends       int64  `json:"sends"`
+	Occurrences int64  `json:"occurrences"`
+	State       string `json:"state"`
+	EndedAt     int64  `json:"ended_at"`
+	ClosedAt    int64  `json:"closed_at"`
+	ClosedBy    string `json:"closed_by"`
+}
+
 type AuditLog struct {
 	ID     int64  `json:"id"`
 	At     int64  `json:"at"`
@@ -51,6 +71,17 @@ type Meta struct {
 	Value string `json:"value"`
 }
 
+type NotifyPref struct {
+	User    string `json:"user"`
+	Kind    string `json:"kind"`
+	Enabled bool   `json:"enabled"`
+}
+
+type NotifySetting struct {
+	Key   string `json:"key"`
+	Value int64  `json:"value"`
+}
+
 type Pin struct {
 	Project      string `json:"project"`
 	Service      string `json:"service"`
@@ -81,6 +112,18 @@ type Project struct {
 	CommitSha string `json:"commit_sha"`
 	AppliedAt int64  `json:"applied_at"`
 	Limits    string `json:"limits"`
+}
+
+type PushSubscription struct {
+	ID        int64  `json:"id"`
+	User      string `json:"user"`
+	Endpoint  string `json:"endpoint"`
+	P256dh    string `json:"p256dh"`
+	Auth      string `json:"auth"`
+	Label     string `json:"label"`
+	CreatedAt int64  `json:"created_at"`
+	LastOkAt  int64  `json:"last_ok_at"`
+	LastError string `json:"last_error"`
 }
 
 type Session struct {

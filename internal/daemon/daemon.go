@@ -21,6 +21,7 @@ import (
 	"github.com/sh-lucas/vops/internal/compose"
 	"github.com/sh-lucas/vops/internal/config"
 	"github.com/sh-lucas/vops/internal/deploy"
+	"github.com/sh-lucas/vops/internal/notify"
 	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/sdnotify"
@@ -48,6 +49,8 @@ type Daemon struct {
 	webRoutes  []string    // patterns of the web api, as API(false) registered them (tests walk them)
 	sys        *sysmon.Sampler
 	backup     backup // the encrypted secrets backup (secrets.go)
+	notify     *notify.Notifier
+	monitor    *notify.Monitor
 }
 
 type cachedAuth struct {
@@ -108,6 +111,10 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	if err := os.WriteFile(d.Engine.PullAuthFile, []byte(auth), 0o600); err != nil {
 		return nil, err
 	}
+	if err := d.notifier(); err != nil {
+		return nil, err
+	}
+	d.monitor = &notify.Monitor{N: d.notify, Engine: d.Engine, Sys: d.sys}
 	return d, nil
 }
 
@@ -407,6 +414,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.Engine.StartStopped(ctx, &logWriter{prefix: "boot: "})
 	go d.retryProxy(ctx)
 	go d.housekeeping(ctx)
+	d.monitor.Run(ctx)
 	select {
 	case <-ctx.Done():
 	case err = <-errc:
@@ -418,6 +426,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for _, s := range servers {
 		s.Shutdown(shutdown)
 	}
+	d.notify.Wait()
 	d.DB.Close()
 	return err
 }
@@ -472,6 +481,7 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
 		d.DB.PurgeSessions()
 		d.backupNow() // authorized_keys may have changed
+		d.monitor.Reconcile(ctx)
 		if n%(24*60) == 0 {
 			if res, err := d.gc(); err == nil && res.Blobs > 0 {
 				d.DB.Event("", "gc", "registry gc: %d manifests, %d blobs, %d bytes freed", res.Manifests, res.Blobs, res.Freed)

@@ -72,7 +72,7 @@ func TestRead(t *testing.T) {
 		"proc/stat":                "cpu  100 0 0 900 0 0 0 0 0 0\ncpu0 100 0 0 900 0 0 0 0 0 0\n",
 		"proc/diskstats":           "8 0 sda 0 0 0 0 0 0 0 0 0 0 0\n8 1 sda1 0 0 0 0 0 0 0 0 0 0 0\n",
 		"proc/net/dev":             "h\nh\n  eth0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n   br0: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
-		"sys/class/net/eth0/speed": "1000\n",
+		"sys/class/net/eth0/speed": "1000\n", "proc/vmstat": "pgfault 10\noom_kill 3\n",
 	})
 	s := &Sampler{Root: root, Paths: []string{root}, started: time.Now()}
 	s.Read()
@@ -86,8 +86,8 @@ func TestRead(t *testing.T) {
 	if st.Kernel != "6.8.0-test" || st.Hostname != "box" || st.Uptime != 3600 || st.CPUs != 1 || st.MemTotal != 1000*1024 || st.MemUsed != 750*1024 {
 		t.Fatalf("stats: %+v", st)
 	}
-	if st.CPU != 50 {
-		t.Fatalf("cpu: %v", st.CPU)
+	if st.CPU != 50 || st.OOMKills != 3 {
+		t.Fatalf("cpu: %v oom kills %d", st.CPU, st.OOMKills)
 	}
 	if len(st.Disks) != 1 || st.Disks[0].Name != "sda" || st.Disks[0].Busy < 24 || st.Disks[0].Busy > 26 || st.Disks[0].ReadBps < 25000 || st.Disks[0].ReadBps > 26000 {
 		t.Fatalf("disks: %+v", st.Disks)

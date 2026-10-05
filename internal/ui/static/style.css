@@ -360,3 +360,14 @@ dialog.modal form, dialog.modal .inner { display: flex; flex-direction: column; 
   .tl-foot form input { flex: 1; width: auto; }
 }
 .login .error:empty { display: none; }
+
+/* notifications */
+.nav-badge { margin-left: auto; min-width: 18px; padding: 0 6px; border-radius: 99px; background: var(--bad); color: #fff; font-size: 11px; line-height: 18px; text-align: center; }
+.nav-badge[hidden] { display: none; }
+.stack-tight { display: grid; gap: 12px; }
+label.pref { display: flex; gap: 10px; align-items: flex-start; cursor: pointer; }
+label.pref input { margin-top: 3px; }
+label.pref .tag { margin-left: 6px; }
+form.settings label.field { flex: 1 1 220px; }
+details.section > summary { cursor: pointer; margin-bottom: 10px; }
+.inline-h { display: inline; }

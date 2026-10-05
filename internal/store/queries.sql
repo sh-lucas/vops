@@ -178,3 +178,59 @@ ORDER BY project, service;
 
 -- name: DeletePin :execrows
 DELETE FROM pins WHERE project = ? AND service = ?;
+
+-- name: PutSubscription :exec
+-- a browser resubscribing (same endpoint) moves to whoever is logged in now
+INSERT INTO push_subscriptions (user, endpoint, p256dh, auth, label, created_at) VALUES (?, ?, ?, ?, ?, ?)
+ON CONFLICT (endpoint) DO UPDATE SET user = excluded.user, p256dh = excluded.p256dh, auth = excluded.auth, label = excluded.label, last_error = '';
+
+-- name: ListSubscriptions :many
+SELECT * FROM push_subscriptions ORDER BY user, id;
+
+-- name: DeleteSubscription :execrows
+DELETE FROM push_subscriptions WHERE id = ?;
+
+-- name: DeleteSubscriptionByEndpoint :execrows
+DELETE FROM push_subscriptions WHERE endpoint = ?;
+
+-- name: SubscriptionOK :exec
+UPDATE push_subscriptions SET last_ok_at = ?, last_error = '' WHERE id = ?;
+
+-- name: SubscriptionFailed :exec
+UPDATE push_subscriptions SET last_error = ? WHERE id = ?;
+
+-- name: CreateAlert :one
+INSERT INTO alerts (kind, key, project, service, title, body, url, first_at, last_at, sent_at, sends, occurrences, state, ended_at, closed_at, closed_by)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id;
+
+-- name: UpdateAlert :exec
+UPDATE alerts SET title = ?, body = ?, url = ?, last_at = ?, sent_at = ?, sends = ?, occurrences = ?, state = ?, ended_at = ?, closed_at = ?, closed_by = ?
+WHERE id = ?;
+
+-- name: GetAlert :one
+SELECT * FROM alerts WHERE id = ?;
+
+-- name: LiveAlerts :many
+-- alerts whose condition still holds (open, silenced or expired)
+SELECT * FROM alerts WHERE ended_at = 0 ORDER BY id;
+
+-- name: RecentAlerts :many
+SELECT * FROM alerts ORDER BY id DESC LIMIT ?;
+
+-- name: ListPrefs :many
+SELECT * FROM notify_prefs;
+
+-- name: SetPref :exec
+INSERT INTO notify_prefs (user, kind, enabled) VALUES (?, ?, ?)
+ON CONFLICT (user, kind) DO UPDATE SET enabled = excluded.enabled;
+
+-- name: ListNotifySettings :many
+SELECT * FROM notify_settings;
+
+-- name: SetNotifySetting :exec
+INSERT INTO notify_settings (key, value) VALUES (?, ?)
+ON CONFLICT (key) DO UPDATE SET value = excluded.value;
+
+-- name: DeleteNotifySetting :exec
+DELETE FROM notify_settings WHERE key = ?;

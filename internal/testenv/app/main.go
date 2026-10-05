@@ -49,12 +49,17 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "exit" {
 		os.Exit(3)
 	}
-	// READY_AFTER delays readiness: /health answers 503 until then.
+	// READY_AFTER delays readiness: /health answers 503 until then. FAIL_AFTER: 500 from then on.
 	start := time.Now()
 	delay, _ := time.ParseDuration(os.Getenv("READY_AFTER"))
+	fail, _ := time.ParseDuration(os.Getenv("FAIL_AFTER"))
 	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if time.Since(start) < delay || os.Getenv("NEVER_READY") != "" {
 			w.WriteHeader(503)
+			return
+		}
+		if fail > 0 && time.Since(start) > fail {
+			w.WriteHeader(500)
 			return
 		}
 		fmt.Fprint(w, "ok")
