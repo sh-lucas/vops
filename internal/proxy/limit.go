@@ -18,9 +18,10 @@ type Limits struct {
 	Rate    float64 `json:"rate,omitempty"`     // requests per second per client ip
 	Burst   int     `json:"burst,omitempty"`    // bucket size
 	MaxBody int64   `json:"max_body,omitempty"` // request body bytes
+	Timeout int64   `json:"timeout,omitempty"`  // seconds to wait for the upstream's response headers (0: DefaultTimeout)
 }
 
-func (l *Limits) set() bool { return l != nil && (l.Rate > 0 || l.MaxBody > 0) }
+func (l *Limits) set() bool { return l != nil && (l.Rate > 0 || l.MaxBody > 0 || l.Timeout > 0) }
 
 // String is the human form the plan shows ("unlimited", "rate 20/s burst 20, max_body 10MB").
 func (l *Limits) String() string {
@@ -36,6 +37,12 @@ func (l *Limits) String() string {
 			s += ", "
 		}
 		s += "max_body " + Bytes(l.MaxBody)
+	}
+	if l.Timeout > 0 {
+		if s != "" {
+			s += ", "
+		}
+		s += "timeout " + (time.Duration(l.Timeout) * time.Second).String()
 	}
 	return s
 }
@@ -136,7 +143,7 @@ func clientIP(r *http.Request) string {
 
 // limit applies a project's limits to a request; false means it already answered (429 or 413).
 func (l *limiter) limit(w http.ResponseWriter, r *http.Request, project string, lim *Limits) bool {
-	if !lim.set() {
+	if lim == nil {
 		return true
 	}
 	if lim.Rate > 0 {

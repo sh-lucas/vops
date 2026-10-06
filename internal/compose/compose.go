@@ -29,7 +29,7 @@ type Project struct {
 	Networks map[string]*Network
 	Inactive []string // services left out by COMPOSE_PROFILES
 	Copied   []string // previews: services whose data is copied from production (PreviewRun)
-	Limits   Limits   // top-level x-vops rate, burst, max_body: the proxy applies them to every routed service
+	Limits   Limits   // top-level x-vops rate, burst, max_body, timeout: the proxy applies them to every routed service
 	Warnings []string
 	Refs     map[string]bool                // every ${VAR} the files use
 	EnvRefs  map[string]map[string][]string // service -> environment key -> the ${VAR}s its value uses
@@ -696,18 +696,19 @@ func (p *Project) topVops(root *yaml.Node) error {
 			continue
 		}
 		v := root.Content[i+1]
-		if err := strictKeys(v, "rate", "burst", "max_body"); err != nil {
+		if err := strictKeys(v, "rate", "burst", "max_body", "timeout"); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
 		}
 		var top struct {
 			Rate    string `yaml:"rate"`
 			Burst   *int   `yaml:"burst"`
 			MaxBody string `yaml:"max_body"`
+			Timeout string `yaml:"timeout"`
 		}
 		if err := v.Decode(&top); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
 		}
-		if err := p.limits(top.Rate, top.Burst, top.MaxBody); err != nil {
+		if err := p.limits(top.Rate, top.Burst, top.MaxBody, top.Timeout); err != nil {
 			return fmt.Errorf("x-vops.%w", err)
 		}
 	}
@@ -719,14 +720,15 @@ type Limits struct {
 	Rate    float64 // requests per second per client ip
 	Burst   int
 	MaxBody int64 // bytes
+	Timeout int64 // seconds to wait for response headers
 }
 
-func (p *Project) limits(rate string, burst *int, maxBody string) error {
-	if rate == "" && burst == nil && maxBody == "" {
+func (p *Project) limits(rate string, burst *int, maxBody, timeout string) error {
+	if rate == "" && burst == nil && maxBody == "" && timeout == "" {
 		return nil
 	}
 	if p.Limits != (Limits{}) {
-		return errors.New("rate, burst and max_body are set in two compose files")
+		return errors.New("rate, burst, max_body and timeout are set in two compose files")
 	}
 	var l Limits
 	if rate != "" {
@@ -751,6 +753,13 @@ func (p *Project) limits(rate string, burst *int, maxBody string) error {
 			return fmt.Errorf("max_body: %w", err)
 		}
 		l.MaxBody = n
+	}
+	if timeout != "" {
+		d, err := time.ParseDuration(timeout)
+		if err != nil || d < time.Second || d%time.Second != 0 {
+			return fmt.Errorf("timeout: want whole seconds (30s, 5m, 1h), got %q", timeout)
+		}
+		l.Timeout = int64(d / time.Second)
 	}
 	p.Limits = l
 	return nil

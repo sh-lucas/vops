@@ -72,10 +72,12 @@ func (d *DB) Close() error { return d.sql.Close() }
 
 func loadKey(path string) ([]byte, error) {
 	key, err := os.ReadFile(path)
-	if err == nil && len(key) == 32 {
+	switch {
+	case err == nil && len(key) == 32:
 		return key, nil
-	}
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
+	case err == nil:
+		return nil, fmt.Errorf("%s: %d bytes, want 32 (a corrupt key would lose every secret; restore it or move it away)", path, len(key))
+	case !errors.Is(err, os.ErrNotExist):
 		return nil, err
 	}
 	key = make([]byte, 32)

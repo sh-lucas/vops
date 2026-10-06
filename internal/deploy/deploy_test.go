@@ -521,7 +521,7 @@ networks:
 	if _, body := v.get(host); body != "web-1" {
 		t.Fatalf("old web should still serve: %q", body)
 	}
-	if plan, _ := v.e.Plan(ctx); !strings.Contains(actions(plan), p+"/migrate:update") {
+	if plan, _ := v.e.Plan(ctx); !strings.Contains(actions(plan), p+"/migrate:create") { // the failed one was removed
 		t.Fatalf("failed job should be retried: %s", actions(plan))
 	}
 

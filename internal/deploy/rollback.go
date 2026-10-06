@@ -446,8 +446,17 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err
 			start(nil)
 			return err
 		}
-		undo, err := e.restore(ctx, w, project, *s, rp.Commit)
+		undo, consistent, err := e.restore(ctx, w, project, *s, rp.Commit)
 		rec.SnapshotID = undo
+		if err != nil && !consistent {
+			fix := fmt.Sprintf("vops rollback %s --snapshot %d", project, s.ID)
+			if undo != 0 {
+				fix = fmt.Sprintf("vops rollback %s --snapshot %d (the data before this rollback) or %s (try again)", project, undo, fix)
+			}
+			err = fmt.Errorf("%w; %s is stopped: its data is partly restored and putting it back failed. recover with: %s, then vops restart %s", err, project, fix, project)
+			e.DB.Event(project, "error", "%v", err)
+			return err
+		}
 		if err != nil {
 			start(nil)
 			return err
@@ -516,9 +525,17 @@ func (e *Engine) stopProject(ctx context.Context, w io.Writer, project string) (
 	return running, nil
 }
 
+// restoreVolume and takeSnapshot are the btrfs operations restore and snap use (tests make them fail).
+var (
+	restoreVolume = snapshot.Restore
+	takeSnapshot  = snapshot.Take
+)
+
 // restore snapshots the current data of the snapshot's volumes (pre-rollback, the undo point) and puts the
 // snapshot back, volume by volume. The project must be stopped. It returns the undo point (0 = none).
-func (e *Engine) restore(ctx context.Context, w io.Writer, project string, s store.Snapshot, commit string) (int64, error) {
+// A failed volume puts the ones already restored back from the undo point; consistent is false when that
+// failed too: the data mixes two instants and the project must stay stopped.
+func (e *Engine) restore(ctx context.Context, w io.Writer, project string, s store.Snapshot, commit string) (undoID int64, consistent bool, err error) {
 	var current []store.SnapshotVolume
 	for _, v := range s.Volumes {
 		src := v.Source
@@ -533,23 +550,49 @@ func (e *Engine) restore(ctx context.Context, w io.Writer, project string, s sto
 	}
 	undo, err := e.snap(ctx, w, store.Snapshot{Project: project, Reason: "pre-rollback", Note: fmt.Sprintf("before rolling back to #%d", s.ID), Commit: commit, Volumes: current}, nil)
 	if err != nil && !errors.Is(err, errNoData) {
-		return 0, fmt.Errorf("could not snapshot the current data, nothing was restored: %w", err)
+		return 0, true, fmt.Errorf("could not snapshot the current data, nothing was restored: %w", err)
 	}
+	var restored [][2]string // name, target
 	for _, v := range s.Volumes {
 		target := v.Source
 		if v.Kind == "volume" {
 			if podman.VolumePath(ctx, v.Name) == "" {
 				if _, err := podman.Run(ctx, "volume", "create", "--label", LProject+"="+project, v.Name); err != nil {
-					return undo.ID, err
+					return undo.ID, e.undoRestore(ctx, w, project, undo, restored), err
 				}
 			}
 			target = podman.VolumePath(ctx, v.Name)
 		}
 		fmt.Fprintf(w, "%s: restoring %s\n", project, v.Name)
-		if err := snapshot.Restore(ctx, v.Path, target); err != nil {
-			return undo.ID, fmt.Errorf("restore %s: %w (undo with: vops rollback %s --snapshot %d)", v.Name, err, project, undo.ID)
+		if err := restoreVolume(ctx, v.Path, target); err != nil {
+			err = fmt.Errorf("restore %s: %w", v.Name, err)
+			if !e.undoRestore(ctx, w, project, undo, restored) {
+				return undo.ID, false, err
+			}
+			return undo.ID, true, fmt.Errorf("%w (the data is as it was before this rollback)", err)
 		}
+		restored = append(restored, [2]string{v.Name, target})
 	}
 	fmt.Fprintf(w, "%s: data restored to #%d (%s, commit %s)\n", project, s.ID, s.Reason, short(s.Commit))
-	return undo.ID, nil
+	return undo.ID, true, nil
+}
+
+// undoRestore puts volumes a failed restore already replaced back from the undo point. False: some couldn't be.
+func (e *Engine) undoRestore(ctx context.Context, w io.Writer, project string, undo store.Snapshot, restored [][2]string) bool {
+	ok := true
+	for _, r := range restored {
+		name, target := r[0], r[1]
+		i := slices.IndexFunc(undo.Volumes, func(v store.SnapshotVolume) bool { return v.Name == name })
+		if undo.ID == 0 || i < 0 {
+			fmt.Fprintf(w, "%s: %s: no copy from before the rollback to put back\n", project, name)
+			ok = false
+			continue
+		}
+		fmt.Fprintf(w, "%s: putting %s back as it was\n", project, name)
+		if err := restoreVolume(ctx, undo.Volumes[i].Path, target); err != nil {
+			fmt.Fprintf(w, "%s: put %s back: %v\n", project, name, err)
+			ok = false
+		}
+	}
+	return ok
 }

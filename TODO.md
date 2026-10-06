@@ -4,19 +4,14 @@ Ideas with a design sketch. Done things move to README/reference; decisions to r
 
 ## Proxy hardening (next)
 
-Today: `ReadHeaderTimeout` 10s, `IdleTimeout` 2m, upstream dial 5s with a keep-alive pool, per-project rate/burst/max_body per client ip. It never decompresses bodies, so zip bombs only concern the app; what's missing is limits on connections and time. All of these bump `proxy.Version`.
+Timeouts, header size and connection caps are done (reference/decisions.md, "The proxy process"). Both of these bump `proxy.Version`:
 
-- Body read timeout: a slow upload holds its connection forever. Reset a read deadline on every body read (e.g. no byte for 30s = drop), not a total `ReadTimeout` that would kill big legit uploads.
-- Upstream response header timeout: `ResponseHeaderTimeout` is 0, so a hung container holds the connection until the client gives up. Default 60s, `x-vops.timeout`-style override per project for long polling/SSE.
-- Max concurrent connections per ip and in total (`ConnState` counting, refuse past the cap), with a default that no real client reaches.
-- `MaxHeaderBytes` down from Go's 1MB to 64KB.
 - IP allow/deny list per project in compose's `x-vops`, plus basic-auth in front of a route (staging/previews).
 - `x-vops.redirect` www→apex.
 
 ## Security
 
 - Login throttle is a global mutex + 1s sleep: an attacker's failed attempts queue in front of the real admins and nothing is per ip. Per-ip backoff (token bucket in memory, like the proxy's limiter), keeping the failed-login event. Same for registry basic auth failures.
-- Audit `X-Forwarded-*` before adding anything per-ip in the daemon: the daemon trusts the proxy's `X-Forwarded-For`, and the proxy appends to whatever the client sent.
 - Dashboard roles below admin (viewer, per-project scopes) if someone needs them; notifications already filter through `notify.CanSee`.
 - Fuzz the registry manifest parser and the log query parser.
 

@@ -536,6 +536,8 @@ func TestLimits(t *testing.T) {
 		{"x-vops: {max_body: 512KB}\n", Limits{MaxBody: 512 << 10}},
 		{"x-vops: {max_body: 1GB}\n", Limits{MaxBody: 1 << 30}},
 		{"x-vops: {max_body: 4096}\n", Limits{MaxBody: 4096}},
+		{"x-vops: {timeout: 5m}\n", Limits{Timeout: 300}},
+		{"x-vops: {timeout: 1h, rate: 1/s}\n", Limits{Rate: 1, Burst: 1, Timeout: 3600}},
 	} {
 		p, err := load(t, "p", c.top+svc, nil)
 		if err != nil || p.Limits != c.want {
@@ -556,6 +558,9 @@ func TestLimits(t *testing.T) {
 		{"x-vops: {max_body: 0}\n", "max_body"},
 		{"x-vops: {max_body: -5KB}\n", "max_body"},
 		{"x-vops: {max_body: 99999999999GB}\n", "max_body"},
+		{"x-vops: {timeout: 500ms}\n", "timeout"},
+		{"x-vops: {timeout: 0s}\n", "timeout"},
+		{"x-vops: {timeout: 30}\n", "timeout"},
 		{"x-vops: {rate_limit: 5/s}\n", "not supported"},
 	} {
 		if _, err := load(t, "p", c.top+svc, nil); err == nil || !strings.Contains(err.Error(), c.want) {

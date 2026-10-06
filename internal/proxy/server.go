@@ -26,7 +26,7 @@ import (
 
 // Version is the proxy's behaviour plus the daemon<->proxy protocol. Bump it when either changes:
 // `vops setup` restarts the running proxy (every site blinks) only when it reports another Version.
-const Version = 2
+const Version = 3
 
 // ControlSocket is where the proxy takes its routing table from the daemon.
 func ControlSocket(vopsHome string) string { return filepath.Join(vopsHome, "proxy.sock") }
@@ -130,9 +130,7 @@ func (s *Server) save() error {
 		return err
 	}
 	defer os.Remove(f.Name())
-	if _, err := f.Write(b); err == nil {
-		err = f.Sync()
-	}
+	err = writeTable(f, b)
 	if cerr := f.Close(); err == nil {
 		err = cerr
 	}
@@ -144,6 +142,14 @@ func (s *Server) save() error {
 	}
 	s.saved = h
 	return nil
+}
+
+// writeTable writes and fsyncs the table file (tests make it fail).
+var writeTable = func(f *os.File, b []byte) error {
+	if _, err := f.Write(b); err != nil {
+		return err
+	}
+	return f.Sync()
 }
 
 // control is the api on proxy.sock (0600, the daemon and `vops setup` use it).
@@ -207,6 +213,11 @@ func webProxy(sock string) http.Handler {
 			DisableCompression:  true,
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if bodyTimedOut(r) {
+				w.Header().Set("Connection", "close")
+				http.Error(w, "vops: request body timed out", http.StatusRequestTimeout)
+				return
+			}
 			if r.Context().Err() == nil {
 				log.Printf("%s: daemon: %v", r.Host, err)
 			}
@@ -217,13 +228,135 @@ func webProxy(sock string) http.Handler {
 
 func (s *Server) handler() http.Handler {
 	routes, web := Handler(s.table), webProxy(WebSocket(s.Home))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return idleBodies(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if s.daemonHost(Host(r.Host)) {
 			web.ServeHTTP(w, r)
 			return
 		}
 		routes.ServeHTTP(w, r)
+	}))
+}
+
+// BodyIdle drops a request whose body sends nothing for this long. Not a total ReadTimeout: big uploads
+// that keep moving are fine, a stalled one doesn't hold its connection forever.
+var BodyIdle = 30 * time.Second
+
+func idleBodies(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Body == nil || r.Body == http.NoBody {
+			h.ServeHTTP(w, r)
+			return
+		}
+		b := &idleBody{rc: r.Body, ctl: http.NewResponseController(w), timedOut: new(atomic.Bool)}
+		r = r.WithContext(context.WithValue(r.Context(), bodyTimeoutKey{}, b.timedOut))
+		r.Body = b
+		defer b.finish()
+		h.ServeHTTP(w, r)
 	})
+}
+
+type bodyTimeoutKey struct{}
+
+// bodyTimedOut: the request failed because its body stalled (the proxy's error is only "context canceled").
+func bodyTimedOut(r *http.Request) bool {
+	t, _ := r.Context().Value(bodyTimeoutKey{}).(*atomic.Bool)
+	return t != nil && t.Load()
+}
+
+// idleBody sets the connection's read deadline before each read of the body and clears it at EOF, so a
+// streamed response (SSE) that outlives the body isn't cut by it.
+type idleBody struct {
+	rc       io.ReadCloser
+	ctl      *http.ResponseController
+	mu       sync.Mutex
+	done     bool // the handler returned: the connection is not ours anymore
+	timedOut *atomic.Bool
+}
+
+func (b *idleBody) deadline(t time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.done {
+		b.ctl.SetReadDeadline(t)
+	}
+}
+
+func (b *idleBody) Read(p []byte) (int, error) {
+	b.deadline(time.Now().Add(BodyIdle))
+	n, err := b.rc.Read(p)
+	switch {
+	case err == io.EOF:
+		b.deadline(time.Time{})
+	case errors.Is(err, os.ErrDeadlineExceeded):
+		b.timedOut.Store(true) // the deadline stays: the server must not wait for the rest of the body either
+	}
+	return n, err
+}
+
+func (b *idleBody) Close() error { return b.rc.Close() }
+
+func (b *idleBody) finish() {
+	b.mu.Lock()
+	b.done = true
+	b.mu.Unlock()
+}
+
+// Connection caps on the public listeners, per client ip and in total; no real client gets near them.
+var (
+	MaxConnsPerIP = 256
+	MaxConns      = 10000
+)
+
+type connLimiter struct {
+	mu    sync.Mutex
+	total int
+	perIP map[string]int
+}
+
+// limitListener closes accepted connections past the caps right away.
+type limitListener struct {
+	net.Listener
+	l *connLimiter
+}
+
+func (ll limitListener) Accept() (net.Conn, error) {
+	for {
+		c, err := ll.Listener.Accept()
+		if err != nil {
+			return nil, err
+		}
+		ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+		ll.l.mu.Lock()
+		ok := ll.l.total < MaxConns && ll.l.perIP[ip] < MaxConnsPerIP
+		if ok {
+			ll.l.total++
+			ll.l.perIP[ip]++
+		}
+		ll.l.mu.Unlock()
+		if ok {
+			return &countedConn{Conn: c, release: sync.OnceFunc(func() { ll.l.release(ip) })}, nil
+		}
+		c.Close()
+	}
+}
+
+func (l *connLimiter) release(ip string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.total--
+	if l.perIP[ip]--; l.perIP[ip] <= 0 {
+		delete(l.perIP, ip)
+	}
+}
+
+type countedConn struct {
+	net.Conn
+	release func()
+}
+
+func (c *countedConn) Close() error {
+	c.release()
+	return c.Conn.Close()
 }
 
 func hsts(h http.Handler) http.Handler {
@@ -240,7 +373,7 @@ func (s *Server) Run(ctx context.Context) error {
 	var servers []*http.Server
 	errc := make(chan error, 4)
 	serve := func(name string, l net.Listener, h http.Handler, tlsCfg *tls.Config) {
-		srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, TLSConfig: tlsCfg}
+		srv := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10, TLSConfig: tlsCfg}
 		servers = append(servers, srv)
 		log.Printf("listening on %s (%s)", l.Addr(), name)
 		go func() {
@@ -276,11 +409,16 @@ func (s *Server) Run(ctx context.Context) error {
 	serve("control", cl, s.control(), nil)
 
 	main := s.handler()
+	conns := &connLimiter{perIP: map[string]int{}} // shared by http and https
 	listen := func(addr string) (net.Listener, error) {
 		if addr == "" || addr == "off" {
 			return nil, nil
 		}
-		return net.Listen("tcp", addr)
+		l, err := net.Listen("tcp", addr)
+		if err != nil {
+			return nil, err
+		}
+		return limitListener{l, conns}, nil
 	}
 	if cfg.TLS != "off" && cfg.HTTPS != "" && cfg.HTTPS != "off" {
 		// always listen: the domain may only arrive with the first sync

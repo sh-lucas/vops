@@ -133,7 +133,8 @@ func encrypt(payload, uaPublic, authSecret []byte, asPriv *ecdh.PrivateKey, salt
 	header = binary.BigEndian.AppendUint32(header, 4096)
 	header = append(header, byte(len(asPublic)))
 	header = append(header, asPublic...)
-	return gcm.Seal(header, nonce, append(payload, 2), nil), nil // 0x02: the last (and only) record
+	plain := append(append(make([]byte, 0, len(payload)+1), payload...), 2) // 0x02: the last (and only) record
+	return gcm.Seal(header, nonce, plain, nil), nil
 }
 
 // Sub is a browser's subscription as PushManager.subscribe() returns it.

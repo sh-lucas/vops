@@ -184,12 +184,16 @@ func (e *Engine) snap(ctx context.Context, w io.Writer, s store.Snapshot, users 
 	if !snapshot.Supported(e.SnapshotDir) {
 		return s, fmt.Errorf("snapshots need btrfs under %s", e.SnapshotDir)
 	}
-	defer pause(ctx, users)()
+	unpause, err := pause(ctx, w, users)
+	if err != nil {
+		return s, err
+	}
+	defer unpause()
 	dir := filepath.Join(e.SnapshotDir, compose.Slug(s.Project), time.Now().UTC().Format("20060102-150405")+"-"+randHex(2))
 	for i := range s.Volumes {
 		v := &s.Volumes[i]
 		v.Path = filepath.Join(dir, strconv.Itoa(i)+"-"+unsafeName.ReplaceAllString(v.Name, "_"))
-		if err := snapshot.Take(ctx, v.Source, v.Path); err != nil {
+		if err := takeSnapshot(ctx, v.Source, v.Path); err != nil {
 			snapshot.Delete(ctx, dir)
 			return s, err
 		}

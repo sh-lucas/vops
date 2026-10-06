@@ -25,6 +25,10 @@ import (
 // Drain is how long old replicas keep serving in-flight requests after traffic moved away.
 var Drain = 2 * time.Second
 
+// ConfirmWait is how long a rolling release waits for the proxy to confirm the new routes before giving up
+// (old routes back, new replicas removed).
+var ConfirmWait = 10 * time.Second
+
 type ApplyOpts struct {
 	Commit   string      // refuse if HEAD is not this commit (what the user confirmed)
 	Projects []string    // only these projects (all if empty)
@@ -133,12 +137,7 @@ func (e *Engine) deployProject(ctx context.Context, w io.Writer, plan *Plan, pp 
 		e.DB.Event(pp.Path, "config", "limits: %s", pp.Limits)
 	}
 	var errs []error
-	if len(pp.specs) > 0 && !pp.Gone && !pp.Disabled {
-		if err := e.ensureNetworks(ctx, w, pp, len(opts.Services) == 0); err != nil {
-			return err
-		}
-	}
-	// previews are disposable copies: no pre-deploy snapshots of them
+	// previews are disposable copies: no pre-deploy snapshots of them. Before the networks: a changed one removes containers
 	if !compose.IsPreview(pp.Path) && !opts.noSnapshot && slices.ContainsFunc(pp.Actions, func(a Action) bool {
 		return (a.Kind == "create" || a.Kind == "update") && opts.wants(pp.Path, a.Service)
 	}) {
@@ -147,6 +146,11 @@ func (e *Engine) deployProject(ctx context.Context, w io.Writer, plan *Plan, pp 
 			return err
 		}
 		rec.SnapshotID = id
+	}
+	if len(pp.specs) > 0 && !pp.Gone && !pp.Disabled {
+		if err := e.ensureNetworks(ctx, w, pp, len(opts.Services) == 0); err != nil {
+			return err
+		}
 	}
 	var done []string // summary for the history: "web updated", "db failed"
 	defer func() { rec.Summary = strings.Join(done, ", ") }()
@@ -253,7 +257,9 @@ func (e *Engine) ensureNetworks(ctx context.Context, w io.Writer, pp *ProjectPla
 			out, _ := podman.Run(ctx, "ps", "-aq", "--filter", "network="+n.Name, "--filter", "label="+LProject+"="+pp.Path)
 			for _, id := range strings.Fields(out) {
 				e.expect(id)
-				podman.Run(ctx, "rm", "-f", "-t", "10", id)
+				if _, err := podman.Run(ctx, "rm", "-f", "-t", "10", id); err != nil {
+					fmt.Fprintf(w, "%s: rm %.12s: %v\n", pp.Path, id, err)
+				}
 			}
 			if _, err := podman.Run(ctx, "network", "rm", n.Name); err != nil {
 				return fmt.Errorf("network %s changed but can't be removed (other containers use it?): %w", n.Name, err)
@@ -354,16 +360,22 @@ func (e *Engine) deploy(ctx context.Context, log func(string, ...any), d *desire
 		}
 	}
 	var news []replica
+	drop := func() {
+		for _, r := range news {
+			e.expect(r.id, r.name)
+			if _, err := podman.Run(ctx, "rm", "-f", "-t", "0", r.id); err != nil {
+				log("rm %s: %v", r.name, err)
+			}
+		}
+	}
+	// failed replicas never stay: a later RefreshRoutes would route a running one
 	fail := func(err error) error {
 		for _, r := range news {
 			if tail, _ := podman.Run(ctx, "logs", "--tail", "15", r.id); tail != "" {
 				log("last logs of %s:\n%s", r.name, indent(tail))
 			}
-			if rolling {
-				e.expect(r.id, r.name)
-				podman.Run(ctx, "rm", "-f", "-t", "0", r.id)
-			}
 		}
+		drop()
 		if rolling {
 			return fmt.Errorf("%w (old replicas kept serving)", err)
 		}
@@ -394,7 +406,18 @@ func (e *Engine) deploy(ctx context.Context, log func(string, ...any), d *desire
 		for _, r := range news {
 			backends = append(backends, "127.0.0.1:"+strconv.Itoa(r.hostPort))
 		}
-		e.Routes.Set(key, sp.Domains, backends)
+		err := e.Routes.Set(key, sp.Domains, backends)
+		// old replicas are drained only once the proxy serves the new ones; elsewhere a proxy that is down retries on its own
+		for deadline := time.Now().Add(ConfirmWait); err != nil && rolling && time.Now().Before(deadline); {
+			time.Sleep(min(time.Second, time.Until(deadline)))
+			err = e.Routes.Set(key, sp.Domains, backends)
+		}
+		if err != nil && rolling {
+			domains, backends := routeOf(old)
+			e.Routes.Set(key, domains, backends)
+			drop()
+			return fmt.Errorf("proxy did not confirm the new routes (%v); old replicas kept serving", err)
+		}
 		log("ready, serving %s", strings.Join(sp.Domains, ", "))
 	} else {
 		log("ready")
@@ -409,6 +432,17 @@ func (e *Engine) deploy(ctx context.Context, log func(string, ...any), d *desire
 		log("removed %d old replica(s)", len(old))
 	}
 	return nil
+}
+
+// routeOf is the route of a service's running containers, from their labels.
+func routeOf(cs []podman.Container) (domains, backends []string) {
+	for _, c := range cs {
+		if c.State == "running" && c.Labels[LHostPort] != "" && c.Labels[LDomains] != "" {
+			domains = strings.Split(c.Labels[LDomains], ",")
+			backends = append(backends, "127.0.0.1:"+c.Labels[LHostPort])
+		}
+	}
+	return domains, backends
 }
 
 func indent(s string) string { return "    " + strings.ReplaceAll(s, "\n", "\n    ") }
@@ -585,19 +619,20 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 			limits[p] = *LimitsOf(f.Limits)
 		}
 	}
-	all := map[proxy.Key][2][]string{}
+	byKey := map[proxy.Key][]podman.Container{}
 	for _, c := range cs {
-		p := c.Labels[LProject]
-		if c.State != "running" || c.Labels[LHostPort] == "" || c.Labels[LDomains] == "" || flags[p].Disabled {
-			continue
+		if p := c.Labels[LProject]; !flags[p].Disabled {
+			k := proxy.Key{Project: p, Service: c.Labels[LService]}
+			byKey[k] = append(byKey[k], c)
 		}
-		k := proxy.Key{Project: p, Service: c.Labels[LService]}
-		v := all[k]
-		v[0] = strings.Split(c.Labels[LDomains], ",")
-		v[1] = append(v[1], "127.0.0.1:"+c.Labels[LHostPort])
-		all[k] = v
 	}
-	e.Routes.Replace(all, limits)
+	all := map[proxy.Key][2][]string{}
+	for k, cs := range byKey {
+		if domains, backends := routeOf(cs); len(backends) > 0 {
+			all[k] = [2][]string{domains, backends}
+		}
+	}
+	e.Routes.Replace(all, limits) // a proxy that doesn't answer gets it from the daemon's retry
 	return nil
 }
 
@@ -612,6 +647,13 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 	}
 	flags, _ := e.DB.Projects()
 	for _, c := range cs {
+		if c.State == "paused" { // the daemon died while a snapshot had them paused
+			fmt.Fprintf(w, "unpausing %s\n", c.Name())
+			if _, err := podman.Run(ctx, "unpause", c.ID); err != nil {
+				fmt.Fprintln(w, err)
+			}
+			continue
+		}
 		if c.State == "running" || flags[c.Labels[LProject]].Disabled || c.Labels[LJob] != "" {
 			continue
 		}

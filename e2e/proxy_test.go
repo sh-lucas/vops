@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	vproxy "github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/snapshot"
 )
 
@@ -33,7 +35,7 @@ func TestProxyOwnProcess(t *testing.T) {
 	if code, body := w.get("shop.vops.test"); code != 200 || body != "v1" {
 		t.Fatalf("site: %d %q", code, body)
 	}
-	if st := w.vops(dev, "status"); !strings.Contains(st, "proxy up (v2, 1 routes)") || strings.Contains(st, "! the proxy") {
+	if st := w.vops(dev, "status"); !strings.Contains(st, fmt.Sprintf("proxy up (v%d, 1 routes)", vproxy.Version)) || strings.Contains(st, "! the proxy") {
 		t.Fatalf("status should show the proxy in sync:\n%s", st)
 	}
 
@@ -89,8 +91,8 @@ func TestProxyOwnProcess(t *testing.T) {
 		t.Fatalf("site after a proxy restart without daemon: %d %q", code, body)
 	}
 
-	// the daemon is back; then the proxy is down during a deploy: the deploy succeeds,
-	// and the proxy gets the new table once it is back (the daemon retries every second)
+	// the daemon is back; then the proxy is down during a rolling release: the switch can't be confirmed, so the
+	// old replicas keep serving and the deploy fails; the proxy comes back with them, the next apply goes through
 	w.startProc("daemon")
 	if code, body := w.get("vops.vops.test"); code != 200 || !strings.Contains(body, "vops") {
 		t.Fatalf("dashboard through the proxy: %d", code)
@@ -101,15 +103,21 @@ func TestProxyOwnProcess(t *testing.T) {
 		t.Fatalf("status should warn that the proxy is down:\n%s", st)
 	}
 	w.vops(dev, "env", "set", "shop", "MSG=v3")
-	if out := w.vops(dev, "apply", "--yes"); !strings.Contains(out, "ready, serving") {
-		t.Fatalf("deploy with the proxy down:\n%s", out)
+	if out, err := w.try(dev, "", "apply", "--yes"); err == nil || !strings.Contains(out, "proxy did not confirm the new routes") {
+		t.Fatalf("rolling release with the proxy down: %v\n%s", err, out)
 	}
 	w.startProc("proxy")
-	w.eventually("the proxy gets the new table", func() bool { _, body := w.get("shop.vops.test"); return body == "v3" })
+	if code, body := w.get("shop.vops.test"); code != 200 || body != "v2" {
+		t.Fatalf("old replicas after the failed release: %d %q", code, body)
+	}
 	w.eventually("status in sync", func() bool {
 		st := w.vops(dev, "status")
-		return strings.Contains(st, "proxy up (v2, 1 routes)") && !strings.Contains(st, "! the proxy")
+		return strings.Contains(st, fmt.Sprintf("proxy up (v%d, 1 routes)", vproxy.Version)) && !strings.Contains(st, "! the proxy")
 	})
+	w.vops(dev, "apply", "--yes")
+	if _, body := w.get("shop.vops.test"); body != "v3" {
+		t.Fatalf("after the proxy is back: %q", body)
+	}
 	if ev := w.vops(dev, "events"); !strings.Contains(ev, "proxy unreachable") || !strings.Contains(ev, "proxy reachable again") {
 		t.Fatalf("events should record the proxy outage:\n%s", ev)
 	}

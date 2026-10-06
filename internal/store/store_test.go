@@ -145,3 +145,25 @@ func TestUpgradeFromPreviousSchema(t *testing.T) {
 		t.Fatalf("audit of a rollback: %+v", logs[0])
 	}
 }
+
+// A key file of the wrong size is an error and stays as it is: replacing it would lose every secret.
+func TestInvalidKeyIsKept(t *testing.T) {
+	dir := t.TempDir()
+	key := filepath.Join(dir, "key")
+	os.WriteFile(key, []byte("short"), 0o600)
+	if _, err := Open(filepath.Join(dir, "vops.db"), key); err == nil || !strings.Contains(err.Error(), "want 32") {
+		t.Fatalf("open with a 5-byte key: %v", err)
+	}
+	if b, _ := os.ReadFile(key); string(b) != "short" {
+		t.Fatalf("the key was rewritten: %q", b)
+	}
+	os.Remove(key)
+	db, err := Open(filepath.Join(dir, "vops.db"), key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if b, _ := os.ReadFile(key); len(b) != 32 {
+		t.Fatalf("a missing key is generated: %d bytes", len(b))
+	}
+}

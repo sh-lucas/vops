@@ -375,7 +375,11 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 			return "", err
 		}
 	}
-	defer pause(ctx, users)()
+	unpause, err := pause(ctx, w, users)
+	if err != nil {
+		return "", err
+	}
+	defer unpause()
 	var copied []string
 	for _, v := range vols {
 		target := ""
@@ -409,19 +413,26 @@ func (e *Engine) previewData(ctx context.Context, w io.Writer, pv store.Preview,
 	return desc, nil
 }
 
-// pause pauses running containers and returns the function that unpauses them.
-func pause(ctx context.Context, ids []string) func() {
+// pause pauses running containers and returns the function that unpauses them. If one can't be paused, the
+// others are unpaused and the error returned: a snapshot of a container still writing isn't one instant.
+func pause(ctx context.Context, w io.Writer, ids []string) (func(), error) {
 	var paused []string
-	for _, id := range ids {
-		if _, err := podman.Run(ctx, "pause", id); err == nil {
-			paused = append(paused, id)
-		}
-	}
-	return func() {
+	unpause := func() {
+		ctx := context.WithoutCancel(ctx) // a cancelled request must not leave containers frozen
 		for _, id := range paused {
-			podman.Run(ctx, "unpause", id)
+			if _, err := podman.Run(ctx, "unpause", id); err != nil {
+				fmt.Fprintf(w, "unpause %.12s: %v (podman unpause it by hand)\n", id, err)
+			}
 		}
 	}
+	for _, id := range ids {
+		if _, err := podman.Run(ctx, "pause", id); err != nil {
+			unpause()
+			return func() {}, fmt.Errorf("pause %.12s: %w", id, err)
+		}
+		paused = append(paused, id)
+	}
+	return unpause, nil
 }
 
 // PreviewRm removes a preview and everything it made.

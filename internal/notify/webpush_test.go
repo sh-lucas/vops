@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -150,4 +151,29 @@ func checkVAPID(h, aud, pub string) error {
 		return fmt.Errorf("bad signature")
 	}
 	return nil
+}
+
+// encrypt never writes into the caller's payload: the notifier shares one payload between devices' goroutines.
+func TestEncryptLeavesPayloadAlone(t *testing.T) {
+	ua, _ := ecdh.P256().GenerateKey(rand.Reader)
+	buf := []byte("hello\xff\xff\xff")
+	payload := buf[:5] // spare capacity, as a shared slice may have
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			as, _ := ecdh.P256().GenerateKey(rand.Reader)
+			body, err := encrypt(payload, ua.PublicKey().Bytes(), []byte("0123456789abcdef"), as, make([]byte, 16))
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			if plain, err := decrypt(body, ua, []byte("0123456789abcdef")); err != nil || string(plain) != "hello" {
+				t.Errorf("decrypt: %q %v", plain, err)
+			}
+		})
+	}
+	wg.Wait()
+	if string(buf) != "hello\xff\xff\xff" {
+		t.Fatalf("payload's backing array changed: %q", buf)
+	}
 }

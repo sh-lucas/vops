@@ -151,9 +151,10 @@ func (d *Daemon) applyConfig(c config.Config, w io.Writer) error {
 }
 
 // pushRoutes sends the whole table to the proxy process and returns once the proxy serves it, so a rolling
-// release drains the old replicas only after traffic moved. A proxy that is down never fails a deploy:
-// it keeps serving its last table, and the push is retried every second until it answers.
-func (d *Daemon) pushRoutes() {
+// release drains the old replicas only after traffic moved. Its error is the table's (Routes.Set): a rolling
+// release that can't get a confirmation puts the old routes back and fails; anything else goes on (the proxy
+// keeps serving its last table) and the push is retried every second until it answers.
+func (d *Daemon) pushRoutes() error {
 	d.pushMu.Lock()
 	defer d.pushMu.Unlock()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -167,6 +168,7 @@ func (d *Daemon) pushRoutes() {
 		log.Print("proxy: reachable again, routes sent")
 		d.DB.Event("", "config", "proxy reachable again, routes sent")
 	}
+	return err
 }
 
 // ProxyState is what /api/status says about the proxy process.
