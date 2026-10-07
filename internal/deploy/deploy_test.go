@@ -753,3 +753,28 @@ volumes:
 		t.Fatalf("a backup of other volumes: %v", err)
 	}
 }
+
+// A bind-mounted file (config, sqlite db) is mounted as it is: never replaced by a dir or a subvolume.
+func TestFileBind(t *testing.T) {
+	v := newEnv(t)
+	p := v.ns + "/conf"
+	v.commit(map[string]string{
+		p + "/conf.txt": "hello",
+		p + "/compose.yml": `services:
+  app:
+    image: APP
+    volumes: ["./conf.txt:/conf.txt:ro"]
+`})
+	v.mustApply()
+	file := filepath.Join(v.repo, p, "conf.txt")
+	if st, err := os.Stat(file); err != nil || st.IsDir() || mustRead(t, file) != "hello" {
+		t.Fatalf("the bind-mounted file was replaced: %v", err)
+	}
+	cs := v.containers(p)
+	if len(cs) != 1 {
+		t.Fatalf("containers: %d", len(cs))
+	}
+	if out, err := podman.Run(context.Background(), "exec", cs[0].ID, "/app", "read", "/conf.txt"); err != nil || out != "hello" {
+		t.Fatalf("read in the container: %q %v", out, err)
+	}
+}

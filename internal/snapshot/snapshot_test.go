@@ -79,6 +79,15 @@ func TestSnapshotRestoreDelete(t *testing.T) {
 	if created, err := EnsureSubvolume(ctx, plain); err != nil || created || IsSubvolume(plain) {
 		t.Fatalf("plain dir converted: %v %v", created, err)
 	}
+	// nor is a bind-mounted file
+	file := filepath.Join(dir, "app.db")
+	os.WriteFile(file, []byte("data"), 0o644)
+	if created, err := EnsureSubvolume(ctx, file); err != nil || created {
+		t.Fatalf("file converted: %v %v", created, err)
+	}
+	if b, _ := os.ReadFile(file); string(b) != "data" {
+		t.Fatalf("file changed: %q", b)
+	}
 	if err := Take(ctx, plain, filepath.Join(dir, "nope")); err == nil {
 		t.Fatal("snapshot of a plain dir should fail")
 	}

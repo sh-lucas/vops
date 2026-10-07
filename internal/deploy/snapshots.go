@@ -54,6 +54,9 @@ func (e *Engine) ensureData(ctx context.Context, log func(string, ...any), sp *c
 		}
 	}
 	for _, b := range sp.Binds {
+		if st, err := os.Stat(b); err == nil && !st.IsDir() {
+			continue // a bind-mounted file (config, socket): nothing to create
+		}
 		if e.snapshotsOn() && within(b, sp.Dir) {
 			if _, err := snapshot.EnsureSubvolume(ctx, b); err != nil {
 				log("%s: can't make it snapshottable: %v", b, err)
