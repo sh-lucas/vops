@@ -44,6 +44,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - A project is any git-tracked directory with `compose.yml`, `compose.yaml`, `*.compose.yml` or `docker-compose.yml`. Several compose files in one dir are merged (duplicate service = error). Nested dirs are separate projects.
 - vops parses compose itself and calls `podman run`. No podman-compose/docker-compose: they can't do rolling releases and are one more dependency. Unsupported keys are an **error**, never silently ignored.
 - Project `a/b` gets domain `b.a.<domain>`. A routed service gets `<service>.b.a.<domain>`, plus `b.a.<domain>` if it is the project's only routed service. Extra domains via `x-vops.domains`. Routing is opt-in per service with `x-vops.port` (the HTTP port inside the container).
+- Podman names are the project's slug plus a key (`vops-shop-api` is project `shop`'s network `api` and `shop-api`'s default network; `Shop` and `shop` share every name). The plan fails the later project (by path) on a generated network or volume name, or a slug, another one has, instead of renaming objects (that would orphan real volumes on upgrade). Explicit `name:` and external objects are shared on purpose and not checked.
 - Default `restart: unless-stopped` (compose's `no` is a bad server default).
 - Interpolation (`${VAR}`, `${VAR:-x}`, `${VAR:?err}`, `$$`) uses the project env vars stored by vops, not the shell. `environment: [KEY]` passes the project var through.
 

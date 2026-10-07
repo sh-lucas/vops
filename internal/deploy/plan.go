@@ -343,7 +343,46 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			}
 		}
 	}
+	claimNames(plan.Projects)
 	return plan, nil
+}
+
+// claimNames fails a project whose podman names another one already has: they are the project's slug plus a
+// key, so "Shop" and "shop", or "shop" with network api and "shop-api", would share networks and volumes.
+// The first project (by path) keeps them; renaming existing objects instead would orphan real volumes.
+func claimNames(projects []*ProjectPlan) {
+	owners := map[string]string{}
+	for _, pp := range projects {
+		if pp.project == nil || pp.Error != "" {
+			continue
+		}
+		names := map[string]string{compose.Slug(pp.Path): "project"} // name -> what it is
+		for _, n := range pp.nets {
+			if def := pp.project.Networks[n.Key]; !n.External && (def == nil || def.Name == "") {
+				names[n.Name] = "network"
+			}
+		}
+		for key, v := range pp.project.Volumes {
+			if v == nil || v.Name == "" && !v.External {
+				names[pp.project.VolumeName(key)] = "volume"
+			}
+		}
+		for _, n := range sortedKeys(names) {
+			if other, taken := owners[n]; taken {
+				pp.Error = fmt.Sprintf("%s name %s is also %s's (podman names are the project dir plus the key): rename the %s or the dir", names[n], n, other, names[n])
+				if names[n] == "project" {
+					pp.Error = fmt.Sprintf("%s and %s differ only in case, so they would share podman names: rename one dir", other, pp.Path)
+				}
+				pp.Actions = []Action{}
+				break
+			}
+		}
+		if pp.Error == "" {
+			for n := range names {
+				owners[n] = pp.Path
+			}
+		}
+	}
 }
 
 // source is where a project's definition comes from: the repo, or a preview's worktree with its own env and images.

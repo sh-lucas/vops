@@ -827,3 +827,50 @@ volumes:
 		t.Fatalf("retention after the rollback: %+v", snaps)
 	}
 }
+
+// Two projects whose podman names collide fail in the plan: the second one never shares the first one's data.
+func TestNameCollisions(t *testing.T) {
+	v := newEnv(t)
+	shop, api, upper, lower := v.ns+"/shop", v.ns+"/shop-api", v.ns+"/Web", v.ns+"/web"
+	plain := `services:
+  app:
+    image: APP
+`
+	v.commit(map[string]string{
+		shop + "/compose.yml": `services:
+  app:
+    image: APP
+    networks: [api]
+    volumes: ["api-data:/data"]
+networks:
+  api:
+volumes:
+  api-data:
+`,
+		api + "/compose.yml": `services:
+  app:
+    image: APP
+    volumes: ["data:/data"]
+volumes:
+  data:
+`,
+		upper + "/compose.yml": plain,
+		lower + "/compose.yml": plain,
+	})
+	plan, out, err := v.apply(ApplyOpts{})
+	if err == nil {
+		t.Fatalf("colliding projects applied\n%s", out)
+	}
+	errs := map[string]string{}
+	for _, pp := range plan.Projects {
+		errs[pp.Path] = pp.Error
+	}
+	if errs[shop] != "" || errs[upper] != "" || !strings.Contains(errs[api], "is also "+shop+"'s") || !strings.Contains(errs[lower], "differ only in case") {
+		t.Fatalf("errors: %q", errs)
+	}
+	for p, n := range map[string]int{shop: 1, upper: 1, api: 0, lower: 0} {
+		if got := len(v.containers(p)); got != n {
+			t.Fatalf("%s: %d containers, want %d", p, got, n)
+		}
+	}
+}
