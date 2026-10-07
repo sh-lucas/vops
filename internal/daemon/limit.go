@@ -36,7 +36,12 @@ func newAuthLimiter() *authLimiter {
 
 // check runs fn (a credential check) for the client of r, unless it is refused: errTooManyFails.
 // blocked is true when this failure is the one that got the client refused (log it once).
+// Loopback clients aren't limited: they are `vops ui` tunnels (ssh already authenticated them, and they all
+// share 127.0.0.1) or the host itself; the proxy forwards everyone else with their real address.
 func (l *authLimiter) check(r *http.Request, fn func() bool) (ok, blocked bool, err error) {
+	if ip, ok := parseAddr(r.RemoteAddr); ok && ip.IsLoopback() {
+		return l.run(fn), false, nil
+	}
 	key := clientKey(r.RemoteAddr)
 	l.mu.Lock()
 	now := l.now()
@@ -63,11 +68,7 @@ func (l *authLimiter) check(r *http.Request, fn func() bool) (ok, blocked bool, 
 	f.until = now.Add(authWindow)
 	l.mu.Unlock()
 
-	l.sem <- struct{}{}
-	ok = fn()
-	<-l.sem
-
-	if ok {
+	if ok = l.run(fn); ok {
 		l.mu.Lock()
 		f.n-- // a success gives its attempt back, but doesn't forgive earlier failures
 		l.mu.Unlock()
@@ -79,21 +80,31 @@ func (l *authLimiter) check(r *http.Request, fn func() bool) (ok, blocked bool, 
 	return false, blocked, nil
 }
 
+func (l *authLimiter) run(fn func() bool) bool {
+	l.sem <- struct{}{}
+	defer func() { <-l.sem }()
+	return fn()
+}
+
 // clientKey is who a request counts against: its ip, or the /64 of an ipv6 address (one host usually has all of it).
 // RemoteAddr is "ip:port", or a bare ip when the proxy forwarded it.
 func clientKey(addr string) string {
-	ip, err := netip.ParseAddr(addr)
-	if err != nil {
-		ap, err := netip.ParseAddrPort(addr)
-		if err != nil {
-			return addr
-		}
-		ip = ap.Addr()
+	ip, ok := parseAddr(addr)
+	if !ok {
+		return addr
 	}
-	ip = ip.Unmap()
 	if ip.Is4() {
 		return ip.String()
 	}
 	p, _ := ip.Prefix(64)
 	return p.String()
+}
+
+// parseAddr reads "ip:port" or a bare ip.
+func parseAddr(addr string) (netip.Addr, bool) {
+	if ip, err := netip.ParseAddr(addr); err == nil {
+		return ip.Unmap(), true
+	}
+	ap, err := netip.ParseAddrPort(addr)
+	return ap.Addr().Unmap(), err == nil
 }

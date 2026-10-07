@@ -356,7 +356,7 @@ func claimNames(projects []*ProjectPlan) {
 		if pp.project == nil || pp.Error != "" {
 			continue
 		}
-		names := map[string]string{compose.Slug(pp.Path): "project"} // name -> what it is
+		names := map[string]string{"project " + compose.Slug(pp.Path): "project"} // name -> what it is; slugs only clash with slugs
 		for _, n := range pp.nets {
 			if def := pp.project.Networks[n.Key]; !n.External && (def == nil || def.Name == "") {
 				names[n.Name] = "network"

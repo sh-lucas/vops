@@ -845,6 +845,7 @@ volumes:
 func TestNameCollisions(t *testing.T) {
 	v := newEnv(t)
 	shop, api, upper, lower := v.ns+"/shop", v.ns+"/shop-api", v.ns+"/Web", v.ns+"/web"
+	lookalike := "vops-" + v.ns + "/shop-api" // its slug is shop's network name, its podman names are not
 	plain := `services:
   app:
     image: APP
@@ -867,8 +868,9 @@ volumes:
 volumes:
   data:
 `,
-		upper + "/compose.yml": plain,
-		lower + "/compose.yml": plain,
+		upper + "/compose.yml":     plain,
+		lower + "/compose.yml":     plain,
+		lookalike + "/compose.yml": plain,
 	})
 	plan, out, err := v.apply(ApplyOpts{})
 	if err == nil {
@@ -878,10 +880,10 @@ volumes:
 	for _, pp := range plan.Projects {
 		errs[pp.Path] = pp.Error
 	}
-	if errs[shop] != "" || errs[upper] != "" || !strings.Contains(errs[api], "is also "+shop+"'s") || !strings.Contains(errs[lower], "differ only in case") {
+	if errs[shop] != "" || errs[upper] != "" || errs[lookalike] != "" || !strings.Contains(errs[api], "is also "+shop+"'s") || !strings.Contains(errs[lower], "differ only in case") {
 		t.Fatalf("errors: %q", errs)
 	}
-	for p, n := range map[string]int{shop: 1, upper: 1, api: 0, lower: 0} {
+	for p, n := range map[string]int{shop: 1, upper: 1, lookalike: 1, api: 0, lower: 0} {
 		if got := len(v.containers(p)); got != n {
 			t.Fatalf("%s: %d containers, want %d", p, got, n)
 		}

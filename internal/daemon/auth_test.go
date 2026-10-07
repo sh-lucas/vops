@@ -223,6 +223,13 @@ func TestAuthLimiter(t *testing.T) {
 	if code := reg("[2001:db8::1]:1", "ci", "token-ci-01234"); code != 200 {
 		t.Fatalf("another client: %d", code)
 	}
+	// `vops ui` tunnels all come from loopback, already authenticated by ssh: never refused
+	for range authMaxFails + 1 {
+		from("127.0.0.1:5000", "POST", "/api/login", `{"user":"admin","password":"guess"}`)
+	}
+	if w := from("[::1]:5001", "POST", "/api/login", `{"user":"admin","password":"admin password 1"}`); w.Code != 200 {
+		t.Fatalf("a tunnel after another tunnel's failures: %d", w.Code)
+	}
 	if code := reg(attacker, "vops-internal", d.pullToken); code != 200 {
 		t.Fatalf("the internal user: %d", code)
 	}
