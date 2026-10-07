@@ -149,7 +149,7 @@ git add -A && git commit -m site && vops sync
 Know these before putting something important on it:
 
 - **Compose is a subset, run by vops itself** (not podman-compose): it translates each service into `podman run`. Unsupported keys are errors, never silently ignored. Not supported: `secrets`, `configs`, `extends`, `links`, `container_name`, `depends_on.restart`, `network_mode: service:x`, most of `deploy`. Full list: [reference/compose.md](reference/compose.md).
-- **Semantics that differ from compose:** containers are named `vops-...` (so `podman compose ps` doesn't see them), `restart` defaults to `unless-stopped`, every `depends_on` waits for readiness, and during a rolling release two versions run side by side for a few seconds.
+- **Semantics that differ from compose:** containers are named `vops-...` (so `podman compose ps` doesn't see them), `restart` defaults to `unless-stopped`, every `depends_on` waits for readiness, and during a rolling release two versions run side by side for a few seconds. Podman names come from the project dir, so dirs that only differ in case (`Shop`, `shop`), or a project `shop-api` next to `shop`'s network `api`, are refused by the plan.
 - **One host.** No clustering, no failover; the daemon, proxy and registry run on the same machine as the containers. The proxy is a separate process, so a daemon crash or upgrade doesn't stop the sites, but the host (and the proxy restarting for new http/https/tls) still does.
 - **Podman only, netavark only.** CNI setups can't resolve service names.
 - **Env values are hidden from the api and dashboard, not from the host:** anyone with a shell on the host can see them with `podman inspect`.
