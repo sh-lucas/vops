@@ -242,8 +242,23 @@ func (h headerTimeout) RoundTrip(r *http.Request) (*http.Response, error) {
 		cancel()
 		return nil, err
 	}
+	if rwc, ok := resp.Body.(io.ReadWriteCloser); ok && resp.StatusCode == http.StatusSwitchingProtocols {
+		resp.Body = cancelConn{rwc, cancel} // websockets: ReverseProxy needs a writable body
+		return resp, nil
+	}
 	resp.Body = cancelBody{resp.Body, cancel}
 	return resp, nil
+}
+
+type cancelConn struct {
+	io.ReadWriteCloser
+	cancel context.CancelFunc
+}
+
+func (c cancelConn) Close() error {
+	err := c.ReadWriteCloser.Close()
+	c.cancel()
+	return err
 }
 
 type cancelBody struct {

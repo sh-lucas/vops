@@ -26,7 +26,7 @@ import (
 
 // Version is the proxy's behaviour plus the daemon<->proxy protocol. Bump it when either changes:
 // `vops setup` restarts the running proxy (every site blinks) only when it reports another Version.
-const Version = 3
+const Version = 4
 
 // ControlSocket is where the proxy takes its routing table from the daemon.
 func ControlSocket(vopsHome string) string { return filepath.Join(vopsHome, "proxy.sock") }
