@@ -778,3 +778,52 @@ func TestFileBind(t *testing.T) {
 		t.Fatalf("read in the container: %q %v", out, err)
 	}
 }
+
+// The undo point of a data rollback can't prune the snapshot being restored (snapshot_keep: 1).
+func TestRollbackToTheOldestSnapshot(t *testing.T) {
+	v := newEnv(t)
+	if !snapshot.Supported(v.e.SnapshotDir) {
+		t.Skip("not on btrfs")
+	}
+	ctx := context.Background()
+	v.e.SnapshotKeep = 1
+	p := v.ns + "/db"
+	compose := func(version string) string {
+		return `services:
+  db:
+    image: APP
+    environment: {V: "` + version + `"}
+    volumes: ["data:/data"]
+volumes:
+  data:
+`
+	}
+	exec := func(args ...string) string {
+		t.Helper()
+		cs := slices.DeleteFunc(v.containers(p), func(c podman.Container) bool { return c.State != "running" })
+		if len(cs) == 0 {
+			t.Fatal("db not running")
+		}
+		out, err := podman.Run(ctx, append([]string{"exec", cs[0].ID, "/app"}, args...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	v.commit(map[string]string{p + "/compose.yml": compose("1")})
+	v.mustApply()
+	exec("write", "/data/f", "A")
+	v.commit(map[string]string{p + "/compose.yml": compose("2")})
+	v.mustApply()
+	exec("write", "/data/f", "B")
+	var buf strings.Builder
+	if err := v.e.Rollback(ctx, &buf, RollbackOpts{Project: p, Data: true}); err != nil {
+		t.Fatalf("%v\n%s", err, buf.String())
+	}
+	if got := exec("read", "/data/f"); got != "A" {
+		t.Fatalf("after rollback: %q\n%s", got, buf.String())
+	}
+	if snaps, _ := v.e.DB.Snapshots(p); len(snaps) != 1 || snaps[0].Reason != "pre-rollback" {
+		t.Fatalf("retention after the rollback: %+v", snaps)
+	}
+}

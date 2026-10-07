@@ -179,7 +179,7 @@ func (e *Engine) DataState(ctx context.Context, project string) DataState {
 var unsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
 
 // snap takes read-only snapshots of vols as one snapshot. Running containers using them are paused
-// meanwhile (milliseconds), so all volumes are captured at the same instant. Caller holds e.mu.
+// meanwhile (milliseconds), so all volumes are captured at the same instant. Caller holds e.mu and prunes.
 func (e *Engine) snap(ctx context.Context, w io.Writer, s store.Snapshot, users []string) (store.Snapshot, error) {
 	if len(s.Volumes) == 0 {
 		return s, errNoData
@@ -209,7 +209,6 @@ func (e *Engine) snap(ctx context.Context, w io.Writer, s store.Snapshot, users 
 	s.ID = id
 	fmt.Fprintf(w, "%s: snapshot #%d (%s) of %s\n", s.Project, id, s.Reason, names(s.Volumes))
 	e.DB.Event(s.Project, "snapshot", "#%d %s: %s", id, s.Reason, names(s.Volumes))
-	e.prune(ctx, w, s.Project)
 	return s, nil
 }
 
@@ -260,6 +259,9 @@ func (e *Engine) preDeploy(ctx context.Context, w io.Writer, pp *ProjectPlan, co
 	s, err := e.snap(ctx, w, store.Snapshot{Project: pp.Path, Reason: "pre-deploy", Note: "before " + short(commit), Commit: current[pp.Path].Commit, Volumes: vols}, users)
 	if err != nil && !errors.Is(err, errNoData) {
 		return 0, fmt.Errorf("pre-deploy snapshot failed, nothing was deployed (snapshots: off in vops.yml skips them): %w", err)
+	}
+	if err == nil {
+		e.prune(ctx, w, pp.Path)
 	}
 	return s.ID, nil
 }

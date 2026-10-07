@@ -574,6 +574,7 @@ func (e *Engine) restore(ctx context.Context, w io.Writer, project string, s sto
 		restored = append(restored, [2]string{v.Name, target})
 	}
 	fmt.Fprintf(w, "%s: data restored to #%d (%s, commit %s)\n", project, s.ID, s.Reason, short(s.Commit))
+	e.prune(ctx, w, project) // only now: the undo point may push s itself out of retention
 	return undo.ID, true, nil
 }
 
