@@ -116,7 +116,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 ## depends_on, jobs, profiles
 
 - vops always waits for readiness between services, so `service_started` behaves like `service_healthy`: stricter than compose, never looser.
-- `service_completed_successfully` makes the dependency a job: ready = exit 0, default `restart: no` (an always-restarting job would loop), 10 min timeout. A finished job isn't rerun until its definition changes (like compose `up`); a failed one is retried on the next apply.
+- `service_completed_successfully` makes the dependency a job: ready = exit 0, default `restart: no` (an always-restarting job would loop), 10 min timeout. A finished job isn't rerun until its definition changes (like compose `up`); a failed one is retried on the next apply. Restarting a project leaves finished jobs alone too (restarting the job's service by name reruns it).
 - When a service fails, its dependents are skipped in that apply instead of deployed against a broken dependency.
 - Active profiles come from `COMPOSE_PROFILES` in the project env (the compose-standard variable, set the vops way). `depends_on.restart` is rejected: vops never restarts dependents behind your back.
 

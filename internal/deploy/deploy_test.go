@@ -505,6 +505,19 @@ networks:
 	if plan, _ := v.e.Plan(ctx); plan.Changes() {
 		t.Fatalf("finished job must not be rerun: %s", actions(plan))
 	}
+	// nor by restarting the project
+	started := func() string {
+		cs, _ := podman.PS(ctx, LProject+"="+p, LService+"=migrate")
+		out, _ := podman.Run(ctx, "inspect", "--format", "{{.State.StartedAt}}", cs[0].ID)
+		return out
+	}
+	before := started()
+	if err := v.e.Restart(ctx, p, ""); err != nil {
+		t.Fatal(err)
+	}
+	if after := started(); after != before {
+		t.Fatalf("restart reran the finished job: %s -> %s", before, after)
+	}
 	// profiles come from COMPOSE_PROFILES in the project env
 	v.e.DB.SetEnv(p, "COMPOSE_PROFILES", "debug")
 	if plan, _ := v.e.Plan(ctx); actions(plan) != p+"/db:none "+p+"/debug:create "+p+"/migrate:none "+p+"/web:none "+other+"/probe:none" {

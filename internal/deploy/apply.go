@@ -665,7 +665,7 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 	e.RefreshRoutes(ctx)
 }
 
-// Restart restarts the containers of a project (or one service of it).
+// Restart restarts the containers of a project (or one service of it). A whole project leaves its finished jobs alone.
 func (e *Engine) Restart(ctx context.Context, project, service string) error {
 	e.lock()
 	defer e.unlock()
@@ -676,6 +676,9 @@ func (e *Engine) Restart(ctx context.Context, project, service string) error {
 	cs, err := podman.PS(ctx, filters...)
 	if err != nil {
 		return err
+	}
+	if service == "" { // a finished job (a migration) runs again only when asked for by name
+		cs = slices.DeleteFunc(cs, func(c podman.Container) bool { return c.Labels[LJob] != "" && c.State != "running" })
 	}
 	if len(cs) == 0 {
 		return fmt.Errorf("no containers for %s %s", project, service)
