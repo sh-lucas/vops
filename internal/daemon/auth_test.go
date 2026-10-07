@@ -3,6 +3,7 @@ package daemon
 import (
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -272,5 +273,45 @@ func TestAuthLimiterParallel(t *testing.T) {
 	wg.Wait()
 	if checked != authMaxFails {
 		t.Fatalf("%d passwords checked, want %d", checked, authMaxFails)
+	}
+}
+
+// With ui: off, podman still pulls our images from a loopback port that serves only the registry.
+func TestPullsWithUIOff(t *testing.T) {
+	dir := t.TempDir()
+	vh := filepath.Join(dir, ".vops")
+	os.MkdirAll(vh, 0o700)
+	if err := os.WriteFile(LockPath(vh), []byte("ui: \"off\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d, err := New(vh, filepath.Join(dir, "vops"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { d.DB.Close() })
+	if d.pulls == nil || d.Engine.PullAddr != d.pulls.Addr().String() || !strings.HasPrefix(d.Engine.PullAddr, "127.0.0.1:") {
+		t.Fatalf("pull address with ui: off: %q", d.Engine.PullAddr)
+	}
+	go http.Serve(d.pulls, d.pullHandler())
+	t.Cleanup(func() { d.pulls.Close() })
+	get := func(path, user, pass string) int {
+		req, _ := http.NewRequest("GET", "http://"+d.Engine.PullAddr+path, nil)
+		req.SetBasicAuth(user, pass)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	if code := get("/v2/", "vops-internal", d.pullToken); code != 200 {
+		t.Fatalf("registry on the pull port: %d", code)
+	}
+	if code := get("/api/status", "vops-internal", d.pullToken); code != 404 {
+		t.Fatalf("the pull port serves more than the registry: %d", code)
+	}
+	b, _ := os.ReadFile(d.Engine.PullAuthFile)
+	if !strings.Contains(string(b), d.Engine.PullAddr) {
+		t.Fatalf("pull auth file: %s", b)
 	}
 }

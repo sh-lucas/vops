@@ -53,6 +53,7 @@ type Daemon struct {
 	backup     backup // the encrypted secrets backup (secrets.go)
 	notify     *notify.Notifier
 	monitor    *notify.Monitor
+	pulls      net.Listener // ui: off: loopback port for podman's pulls from our registry
 }
 
 type cachedAuth struct {
@@ -104,7 +105,15 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	d.Routes.OnChange = d.pushRoutes
 	reg.Auth = d.registryAuth
 	reg.OnPush = d.onPush
-	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
+	pullAddr := loopback(host.UI)
+	if host.UI == "off" {
+		// podman still pulls our images from loopback: a port of its own, serving only the registry
+		if d.pulls, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			return nil, err
+		}
+		pullAddr = d.pulls.Addr().String()
+	}
+	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: pullAddr, PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
 		SnapshotDir: filepath.Join(vopsHome, "snapshots"), SnapshotKeep: host.SnapshotKeep, SnapshotsOff: host.Snapshots == "off",
 		PreviewDir: filepath.Join(vopsHome, "previews"),
 		Config:     func() config.Config { return *d.cfg.Load() }, ApplyConfig: d.applyConfig}
@@ -365,6 +374,13 @@ func (d *Daemon) UIHandler() http.Handler {
 	return securityHeaders(mux)
 }
 
+// pullHandler serves only the registry, for podman's loopback pulls when the ui listener is off.
+func (d *Daemon) pullHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/v2/", d.Reg)
+	return mux
+}
+
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v2") {
@@ -419,6 +435,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return fmt.Errorf("ui: %w", err)
 		}
 		serve("ui", l, d.UIHandler())
+	}
+	if d.pulls != nil {
+		serve("registry pulls (ui: off)", d.pulls, d.pullHandler())
 	}
 	sdnotify.Notify("READY=1")
 	go sdnotify.Watchdog(ctx, d.ping)
