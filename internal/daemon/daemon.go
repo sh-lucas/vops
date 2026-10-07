@@ -3,6 +3,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
 	"errors"
@@ -42,7 +43,8 @@ type Daemon struct {
 	cfg        atomic.Pointer[config.Config] // the lock (~/.vops/config.yml): what is in effect
 	restart    chan struct{}                 // the ui listener changed: Run returns ErrRestart
 	pullToken  string
-	authCache  sync.Map // sha256(user:pass) -> cachedAuth
+	authCache  sync.Map     // sha256(user:pass) -> cachedAuth
+	limiter    *authLimiter // wrong credentials per client, dashboard and registry together (limit.go)
 	proxy      *proxy.Client
 	pushMu     sync.Mutex
 	proxyDirty atomic.Bool // the last push failed: retried every second
@@ -51,6 +53,7 @@ type Daemon struct {
 	backup     backup // the encrypted secrets backup (secrets.go)
 	notify     *notify.Notifier
 	monitor    *notify.Monitor
+	pulls      net.Listener // ui: off: loopback port for podman's pulls from our registry
 }
 
 type cachedAuth struct {
@@ -97,12 +100,20 @@ func New(vopsHome, repo string) (*Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1), proxy: proxy.NewClient(vopsHome), sys: sysmon.New(vopsHome, repo)}
+	d := &Daemon{Home: vopsHome, Repo: repo, DB: db, Reg: reg, Routes: proxy.NewTable(), pullToken: store.Token(), restart: make(chan struct{}, 1), limiter: newAuthLimiter(), proxy: proxy.NewClient(vopsHome), sys: sysmon.New(vopsHome, repo)}
 	d.cfg.Store(&host)
 	d.Routes.OnChange = d.pushRoutes
 	reg.Auth = d.registryAuth
 	reg.OnPush = d.onPush
-	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: loopback(host.UI), PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
+	pullAddr := loopback(host.UI)
+	if host.UI == "off" {
+		// podman still pulls our images from loopback: a port of its own, serving only the registry
+		if d.pulls, err = net.Listen("tcp", "127.0.0.1:0"); err != nil {
+			return nil, err
+		}
+		pullAddr = d.pulls.Addr().String()
+	}
+	d.Engine = &deploy.Engine{Repo: repo, DB: db, Routes: d.Routes, Registry: reg, PullAddr: pullAddr, PullAuthFile: filepath.Join(vopsHome, "pull-auth.json"),
 		SnapshotDir: filepath.Join(vopsHome, "snapshots"), SnapshotKeep: host.SnapshotKeep, SnapshotsOff: host.Snapshots == "off",
 		PreviewDir: filepath.Join(vopsHome, "previews"),
 		Config:     func() config.Config { return *d.cfg.Load() }, ApplyConfig: d.applyConfig}
@@ -233,27 +244,36 @@ func (d *Daemon) registryHost() string {
 // ---- auth
 
 // registryAuth: the internal user pulls everything; admins and global deployers push and pull everything,
-// other deployers their repos. Push and pull are the same permission.
-func (d *Daemon) registryAuth(user, pass string) *registry.Perm {
+// other deployers their repos. Push and pull are the same permission. Wrong credentials count against the
+// client like failed logins (the internal user only comes from loopback and is never refused).
+func (d *Daemon) registryAuth(r *http.Request, user, pass string) (*registry.Perm, error) {
 	all := func(string) bool { return true }
 	none := func(string) bool { return false }
 	if user == "vops-internal" {
-		if pass == d.pullToken {
-			return &registry.Perm{Name: user, Pull: all, Push: none}
+		if subtle.ConstantTimeCompare([]byte(pass), []byte(d.pullToken)) == 1 {
+			return &registry.Perm{Name: user, Pull: all, Push: none}, nil
 		}
-		return nil
+		return nil, nil
 	}
 	key := store.Hash(user + "\x00" + pass)
 	if c, ok := d.authCache.Load(key); ok && time.Now().Before(c.(cachedAuth).expires) {
-		return c.(cachedAuth).perm
+		return c.(cachedAuth).perm, nil
 	}
-	u, ok := d.DB.CheckUser(user, pass)
+	var u store.User
+	ok, blocked, err := d.limiter.check(r, func() bool {
+		var ok bool
+		u, ok = d.DB.CheckUser(user, pass)
+		return ok
+	})
+	if blocked {
+		d.DB.Event("", "auth", "too many wrong registry credentials from %s (last as %q): refused for %s", r.RemoteAddr, user, authWindow)
+	}
 	if !ok {
-		return nil
+		return nil, err
 	}
 	perm := &registry.Perm{Name: user, Pull: u.Allows, Push: u.Allows}
 	d.authCache.Store(key, cachedAuth{perm, time.Now().Add(5 * time.Minute)})
-	return perm
+	return perm, nil
 }
 
 // forgetAuth drops cached registry credentials: every user change calls it, so a deleted user or an old token
@@ -354,13 +374,21 @@ func (d *Daemon) UIHandler() http.Handler {
 	return securityHeaders(mux)
 }
 
+// pullHandler serves only the registry, for podman's loopback pulls when the ui listener is off.
+func (d *Daemon) pullHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.Handle("/v2/", d.Reg)
+	return mux
+}
+
 func securityHeaders(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v2") {
 			w.Header().Set("X-Frame-Options", "DENY")
 			w.Header().Set("X-Content-Type-Options", "nosniff")
 			w.Header().Set("Referrer-Policy", "same-origin")
-			w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+			w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+			w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'; object-src 'none'")
 		}
 		h.ServeHTTP(w, r)
 	})
@@ -407,6 +435,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			return fmt.Errorf("ui: %w", err)
 		}
 		serve("ui", l, d.UIHandler())
+	}
+	if d.pulls != nil {
+		serve("registry pulls (ui: off)", d.pulls, d.pullHandler())
 	}
 	sdnotify.Notify("READY=1")
 	go sdnotify.Watchdog(ctx, d.ping)

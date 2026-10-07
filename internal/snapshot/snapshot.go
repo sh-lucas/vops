@@ -67,16 +67,20 @@ func run(ctx context.Context, name string, args ...string) error {
 }
 
 // EnsureSubvolume makes path an empty subvolume if it doesn't exist or is an empty directory.
-// A non-empty plain directory is left alone (created reports false): vops never moves existing data.
+// A non-empty plain directory or anything else (a bind-mounted file) is left alone (created reports false):
+// vops never moves existing data.
 func EnsureSubvolume(ctx context.Context, path string) (created bool, err error) {
 	if IsSubvolume(path) || !Supported(path) {
 		return false, nil
 	}
 	mode := os.FileMode(0o755)
 	if st, err := os.Stat(path); err == nil {
-		entries, _ := os.ReadDir(path)
-		if len(entries) > 0 {
+		if !st.IsDir() {
 			return false, nil
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil || len(entries) > 0 {
+			return false, err
 		}
 		mode = st.Mode().Perm()
 		if err := os.Remove(path); err != nil {

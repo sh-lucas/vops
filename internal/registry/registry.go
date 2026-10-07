@@ -38,8 +38,8 @@ type Perm struct {
 
 type Registry struct {
 	Root string
-	// Auth returns nil when credentials are wrong.
-	Auth func(user, pass string) *Perm
+	// Auth returns nil when credentials are wrong, an error when the client may not try now (429).
+	Auth func(r *http.Request, user, pass string) (*Perm, error)
 	// OnPush is called after a tag is written.
 	OnPush func(repo, tag, digest string)
 
@@ -88,7 +88,12 @@ func writeErr(w http.ResponseWriter, e *apiErr) {
 
 func (reg *Registry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
-	perm := reg.authenticate(r)
+	perm, err := reg.authenticate(r)
+	if err != nil {
+		w.Header().Set("Retry-After", "900")
+		writeErr(w, errf(429, "TOOMANYREQUESTS", "%v", err))
+		return
+	}
 	if perm == nil {
 		w.Header().Set("WWW-Authenticate", `Basic realm="vops"`)
 		writeErr(w, errf(401, "UNAUTHORIZED", "authentication required"))
@@ -114,21 +119,21 @@ func (reg *Registry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, errf(403, "DENIED", "%s may not %s %s", perm.Name, map[bool]string{true: "push to", false: "pull from"}[write], name))
 		return
 	}
-	var err *apiErr
+	var aerr *apiErr
 	switch kind {
 	case "blobs":
-		err = reg.blob(w, r, name, rest)
+		aerr = reg.blob(w, r, name, rest)
 	case "uploads":
-		err = reg.upload(w, r, perm, name, rest)
+		aerr = reg.upload(w, r, perm, name, rest)
 	case "manifests":
-		err = reg.manifest(w, r, name, rest)
+		aerr = reg.manifest(w, r, name, rest)
 	case "tags":
-		err = reg.tags(w, r, name)
+		aerr = reg.tags(w, r, name)
 	case "referrers":
-		err = reg.referrers(w, r, name, rest)
+		aerr = reg.referrers(w, r, name, rest)
 	}
-	if err != nil {
-		writeErr(w, err)
+	if aerr != nil {
+		writeErr(w, aerr)
 	}
 }
 
@@ -154,12 +159,12 @@ func splitPath(p string) (name, kind, rest string, ok bool) {
 	return name, kind, rest, best > 0
 }
 
-func (reg *Registry) authenticate(r *http.Request) *Perm {
+func (reg *Registry) authenticate(r *http.Request) (*Perm, error) {
 	user, pass, ok := r.BasicAuth()
 	if !ok || reg.Auth == nil {
-		return nil
+		return nil, nil
 	}
-	return reg.Auth(user, pass)
+	return reg.Auth(r, user, pass)
 }
 
 // ---- paths
@@ -187,8 +192,9 @@ func touch(p string, content string) error {
 	return writeAtomic(p, []byte(content))
 }
 
+// writeAtomic writes through a dot file: no tag or digest starts with a dot, so listings can skip them.
 func writeAtomic(p string, data []byte) error {
-	tmp := p + ".tmp" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	tmp := filepath.Join(filepath.Dir(p), "."+filepath.Base(p)+".tmp"+strconv.FormatInt(time.Now().UnixNano(), 36))
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
@@ -565,7 +571,7 @@ func (reg *Registry) tagMap(name string) map[string]string {
 	out := map[string]string{}
 	entries, _ := os.ReadDir(reg.repoPath(name, "tags"))
 	for _, e := range entries {
-		if strings.Contains(e.Name(), ".tmp") {
+		if strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		b, err := os.ReadFile(reg.repoPath(name, "tags", e.Name()))

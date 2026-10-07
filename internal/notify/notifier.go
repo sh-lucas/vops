@@ -319,9 +319,9 @@ func projectURL(project, tab string) string {
 
 func trunc(s string, n int) string {
 	if len(s) <= n {
-		return s
+		return strings.ToValidUTF8(s, "")
 	}
-	return s[:n] + "…"
+	return strings.ToValidUTF8(s[:n], "") + "…" // never half a rune: json refuses invalid utf-8
 }
 
 func firstErr(errs ...error) error {

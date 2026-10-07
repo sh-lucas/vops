@@ -11,7 +11,6 @@ Timeouts, header size and connection caps are done (reference/decisions.md, "The
 
 ## Security
 
-- Login throttle is a global mutex + 1s sleep: an attacker's failed attempts queue in front of the real admins and nothing is per ip. Per-ip backoff (token bucket in memory, like the proxy's limiter), keeping the failed-login event. Same for registry basic auth failures.
 - Dashboard roles below admin (viewer, per-project scopes) if someone needs them; notifications already filter through `notify.CanSee`.
 - Fuzz the registry manifest parser and the log query parser.
 

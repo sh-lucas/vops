@@ -505,6 +505,19 @@ networks:
 	if plan, _ := v.e.Plan(ctx); plan.Changes() {
 		t.Fatalf("finished job must not be rerun: %s", actions(plan))
 	}
+	// nor by restarting the project
+	started := func() string {
+		cs, _ := podman.PS(ctx, LProject+"="+p, LService+"=migrate")
+		out, _ := podman.Run(ctx, "inspect", "--format", "{{.State.StartedAt}}", cs[0].ID)
+		return out
+	}
+	before := started()
+	if err := v.e.Restart(ctx, p, ""); err != nil {
+		t.Fatal(err)
+	}
+	if after := started(); after != before {
+		t.Fatalf("restart reran the finished job: %s -> %s", before, after)
+	}
 	// profiles come from COMPOSE_PROFILES in the project env
 	v.e.DB.SetEnv(p, "COMPOSE_PROFILES", "debug")
 	if plan, _ := v.e.Plan(ctx); actions(plan) != p+"/db:none "+p+"/debug:create "+p+"/migrate:none "+p+"/web:none "+other+"/probe:none" {
@@ -751,5 +764,128 @@ volumes:
 	gz.Close()
 	if _, err := v.e.ImportSnapshot(ctx, io.Discard, p, &buf2); err == nil || !strings.Contains(err.Error(), "is not data of") {
 		t.Fatalf("a backup of other volumes: %v", err)
+	}
+}
+
+// A bind-mounted file (config, sqlite db) is mounted as it is: never replaced by a dir or a subvolume.
+func TestFileBind(t *testing.T) {
+	v := newEnv(t)
+	p := v.ns + "/conf"
+	v.commit(map[string]string{
+		p + "/conf.txt": "hello",
+		p + "/compose.yml": `services:
+  app:
+    image: APP
+    volumes: ["./conf.txt:/conf.txt:ro"]
+`})
+	v.mustApply()
+	file := filepath.Join(v.repo, p, "conf.txt")
+	if st, err := os.Stat(file); err != nil || st.IsDir() || mustRead(t, file) != "hello" {
+		t.Fatalf("the bind-mounted file was replaced: %v", err)
+	}
+	cs := v.containers(p)
+	if len(cs) != 1 {
+		t.Fatalf("containers: %d", len(cs))
+	}
+	if out, err := podman.Run(context.Background(), "exec", cs[0].ID, "/app", "read", "/conf.txt"); err != nil || out != "hello" {
+		t.Fatalf("read in the container: %q %v", out, err)
+	}
+}
+
+// The undo point of a data rollback can't prune the snapshot being restored (snapshot_keep: 1).
+func TestRollbackToTheOldestSnapshot(t *testing.T) {
+	v := newEnv(t)
+	if !snapshot.Supported(v.e.SnapshotDir) {
+		t.Skip("not on btrfs")
+	}
+	ctx := context.Background()
+	v.e.SnapshotKeep = 1
+	p := v.ns + "/db"
+	compose := func(version string) string {
+		return `services:
+  db:
+    image: APP
+    environment: {V: "` + version + `"}
+    volumes: ["data:/data"]
+volumes:
+  data:
+`
+	}
+	exec := func(args ...string) string {
+		t.Helper()
+		cs := slices.DeleteFunc(v.containers(p), func(c podman.Container) bool { return c.State != "running" })
+		if len(cs) == 0 {
+			t.Fatal("db not running")
+		}
+		out, err := podman.Run(ctx, append([]string{"exec", cs[0].ID, "/app"}, args...)...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	v.commit(map[string]string{p + "/compose.yml": compose("1")})
+	v.mustApply()
+	exec("write", "/data/f", "A")
+	v.commit(map[string]string{p + "/compose.yml": compose("2")})
+	v.mustApply()
+	exec("write", "/data/f", "B")
+	var buf strings.Builder
+	if err := v.e.Rollback(ctx, &buf, RollbackOpts{Project: p, Data: true}); err != nil {
+		t.Fatalf("%v\n%s", err, buf.String())
+	}
+	if got := exec("read", "/data/f"); got != "A" {
+		t.Fatalf("after rollback: %q\n%s", got, buf.String())
+	}
+	if snaps, _ := v.e.DB.Snapshots(p); len(snaps) != 1 || snaps[0].Reason != "pre-rollback" {
+		t.Fatalf("retention after the rollback: %+v", snaps)
+	}
+}
+
+// Two projects whose podman names collide fail in the plan: the second one never shares the first one's data.
+func TestNameCollisions(t *testing.T) {
+	v := newEnv(t)
+	shop, api, upper, lower := v.ns+"/shop", v.ns+"/shop-api", v.ns+"/Web", v.ns+"/web"
+	lookalike := "vops-" + v.ns + "/shop-api" // its slug is shop's network name, its podman names are not
+	plain := `services:
+  app:
+    image: APP
+`
+	v.commit(map[string]string{
+		shop + "/compose.yml": `services:
+  app:
+    image: APP
+    networks: [api]
+    volumes: ["api-data:/data"]
+networks:
+  api:
+volumes:
+  api-data:
+`,
+		api + "/compose.yml": `services:
+  app:
+    image: APP
+    volumes: ["data:/data"]
+volumes:
+  data:
+`,
+		upper + "/compose.yml":     plain,
+		lower + "/compose.yml":     plain,
+		lookalike + "/compose.yml": plain,
+	})
+	plan, out, err := v.apply(ApplyOpts{})
+	if err == nil {
+		t.Fatalf("colliding projects applied\n%s", out)
+	}
+	errs := map[string]string{}
+	for _, pp := range plan.Projects {
+		errs[pp.Path] = pp.Error
+	}
+	if errs[shop] != "" || errs[upper] != "" || errs[lookalike] != "" || !strings.Contains(errs[api], "is also "+shop+"'s") || !strings.Contains(errs[lower], "differ only in case") {
+		t.Fatalf("errors: %q", errs)
+	}
+	for p, n := range map[string]int{shop: 1, upper: 1, lookalike: 1, api: 0, lower: 0} {
+		if got := len(v.containers(p)); got != n {
+			t.Fatalf("%s: %d containers, want %d", p, got, n)
+		}
 	}
 }

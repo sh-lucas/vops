@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path"
@@ -73,13 +74,23 @@ func (d *Daemon) file(ctx context.Context, p string) ([]byte, error) {
 	if !slices.Contains(files, p) || !textFile(p) {
 		return nil, fmt.Errorf("%q is not a tracked text file", p)
 	}
-	full := filepath.Join(d.Repo, filepath.FromSlash(p))
-	st, err := os.Lstat(full)
+	// tracked symlinks, and directories swapped for symlinks, must not lead out of the repo
+	if st, err := os.Lstat(filepath.Join(d.Repo, filepath.FromSlash(p))); err != nil || !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%q is not a regular file", p)
+	}
+	f, err := os.OpenInRoot(d.Repo, filepath.FromSlash(p))
 	if err != nil {
 		return nil, err
 	}
-	if !st.Mode().IsRegular() || st.Size() > 512<<10 {
-		return nil, fmt.Errorf("%q is not a regular file under 512KB", p)
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, maxFile+1))
+	if err != nil {
+		return nil, err
 	}
-	return os.ReadFile(full)
+	if len(b) > maxFile {
+		return nil, fmt.Errorf("%q is over 512KB", p)
+	}
+	return b, nil
 }
+
+const maxFile = 512 << 10

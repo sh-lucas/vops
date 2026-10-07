@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -32,7 +33,9 @@ func TestImageRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	all := func(string) bool { return true }
-	reg.Auth = func(user, pass string) *registry.Perm { return &registry.Perm{Name: user, Pull: all, Push: all} }
+	reg.Auth = func(_ *http.Request, user, pass string) (*registry.Perm, error) {
+		return &registry.Perm{Name: user, Pull: all, Push: all}, nil
+	}
 	srv := httptest.NewServer(reg)
 	t.Cleanup(srv.Close)
 	addr := strings.TrimPrefix(srv.URL, "http://")

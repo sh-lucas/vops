@@ -314,6 +314,9 @@ func secretHash(role, secret string) (string, error) {
 	return hex.EncodeToString(salt) + ":" + hex.EncodeToString(key), nil
 }
 
+// dummySecret is checked for unknown users.
+var dummySecret = strings.Repeat("00", 16) + ":" + strings.Repeat("00", 32)
+
 func checkSecret(stored, secret string) bool {
 	salt, key, ok := strings.Cut(stored, ":")
 	if !ok {
@@ -424,7 +427,11 @@ func (d *DB) User(name string) (u User, found bool, err error) {
 // CheckUser returns the user if name and secret (password or token) match.
 func (d *DB) CheckUser(name, secret string) (User, bool) {
 	r, err := d.q.GetUser(ctx, name)
-	if err != nil || !checkSecret(r.Secret, secret) {
+	if err != nil {
+		checkSecret(dummySecret, secret) // as slow as a wrong password: the timing doesn't tell who exists
+		return User{}, false
+	}
+	if !checkSecret(r.Secret, secret) {
 		return User{}, false
 	}
 	u, found, err := d.User(name)

@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -12,7 +13,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/sh-lucas/vops/internal/compose"
@@ -23,9 +23,12 @@ import (
 	"github.com/sh-lucas/vops/internal/store"
 )
 
+// writeJSON tolerates invalid utf-8 (container output, old rows): refusing it would send an empty 200.
 func writeJSON(w http.ResponseWriter, v any) {
 	w.Header().Set("Content-Type", "application/json")
-	json.MarshalWrite(w, v)
+	if err := json.MarshalWrite(w, v, jsontext.AllowInvalidUTF8(true)); err != nil {
+		log.Printf("api: json: %v", err)
+	}
 }
 
 func httpErr(w http.ResponseWriter, status int, format string, args ...any) {
@@ -189,8 +192,8 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		if in.Project == "" {
-			return errors.New("project is required")
+		if err := validProject(in.Project, "", false); err != nil {
+			return err
 		}
 		if err := d.DB.SetDisabled(in.Project, in.Disabled); err != nil {
 			return err
@@ -205,6 +208,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
+		if err := validProject(in.Project, in.Service, true); err != nil {
+			return err
+		}
 		if err := d.Engine.Restart(r.Context(), in.Project, in.Service); err != nil {
 			return err
 		}
@@ -214,6 +220,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 
 	h("GET /api/logs", func(w http.ResponseWriter, r *http.Request) error {
 		q := r.URL.Query()
+		if err := validProject(q.Get("project"), q.Get("service"), true); err != nil {
+			return err
+		}
 		n, _ := strconv.Atoi(q.Get("n"))
 		var since, until int64
 		if s := q.Get("since"); s != "" {
@@ -236,8 +245,8 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	// the project's history: deploys, rollbacks, manual snapshots, previews, newest first
 	h("GET /api/timeline", func(w http.ResponseWriter, r *http.Request) error {
 		project := r.URL.Query().Get("project")
-		if project == "" || strings.Contains(project, "@") {
-			return fmt.Errorf("invalid project %q", project)
+		if err := validProject(project, "", false); err != nil {
+			return err
 		}
 		t, err := d.Engine.Timeline(r.Context(), project)
 		if err != nil {
@@ -318,6 +327,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		scope, err := envScope(q.Get("project"), q.Get("preview") == "1")
 		if err != nil {
 			return err
+		}
+		if !envKeyRe.MatchString(q.Get("key")) {
+			return fmt.Errorf("invalid key %q", q.Get("key"))
 		}
 		if err := d.DB.UnsetEnv(scope, q.Get("key")); err != nil {
 			return err
@@ -475,6 +487,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	})
 	h("DELETE /api/users", func(w http.ResponseWriter, r *http.Request) error {
 		name := r.URL.Query().Get("name")
+		if !userRe.MatchString(name) {
+			return fmt.Errorf("invalid user name %q", name)
+		}
 		if err := d.DB.DeleteUser(name); err != nil {
 			return err
 		}
@@ -541,6 +556,11 @@ func (d *Daemon) API(trusted bool) http.Handler {
 
 	h("GET /api/snapshots", func(w http.ResponseWriter, r *http.Request) error {
 		project := r.URL.Query().Get("project")
+		if project != "" {
+			if err := validProject(project, "", false); err != nil {
+				return err
+			}
+		}
 		snaps, err := d.DB.Snapshots(project)
 		if err != nil {
 			return err
@@ -555,6 +575,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	h("POST /api/snapshots", func(w http.ResponseWriter, r *http.Request) error {
 		var in struct{ Project, Note string }
 		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		if err := validProject(in.Project, "", false); err != nil {
 			return err
 		}
 		var log strings.Builder
@@ -600,6 +623,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 	})
 	h("POST /api/snapshots/import", func(w http.ResponseWriter, r *http.Request) error {
 		project := r.URL.Query().Get("project")
+		if err := validProject(project, "", false); err != nil {
+			return err
+		}
 		var log strings.Builder
 		s, err := d.Engine.ImportSnapshot(r.Context(), &log, project, r.Body)
 		if err != nil {
@@ -667,6 +693,11 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		}
 		if err := readJSON(r, &in); err != nil {
 			return err
+		}
+		for _, s := range append([]string{""}, in.Services...) {
+			if err := validProject(in.Project, s, false); err != nil {
+				return err
+			}
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -756,10 +787,25 @@ var (
 
 func must[T any](v T, _ error) T { return v }
 
+// validProject checks a project path and, when given, a service name. A preview ("<project>@<name>") only
+// where previews is true (logs, restart).
+func validProject(project, service string, previews bool) error {
+	if project == "" || strings.Contains(project, "@") && !previews {
+		return fmt.Errorf("invalid project %q (for previews use the project and its preview's name)", project)
+	}
+	if err := compose.ValidProjectPath(project); err != nil {
+		return err
+	}
+	if service != "" && !compose.ValidService(service) {
+		return fmt.Errorf("invalid service %q", service)
+	}
+	return nil
+}
+
 // envScope is where env vars of a project live: the project, or its previews' secrets.
 func envScope(project string, preview bool) (string, error) {
-	if project == "" || strings.ContainsAny(project, "@*") {
-		return "", fmt.Errorf("invalid project %q (for previews use the project and preview=true)", project)
+	if err := validProject(project, "", false); err != nil {
+		return "", err
 	}
 	if preview {
 		return deploy.PreviewEnvScope(project), nil
@@ -788,10 +834,7 @@ func (f flushWriter) Write(p []byte) (int, error) {
 
 const sessionCookie = "vops_session"
 
-var (
-	loginMu    sync.Mutex
-	loginDelay = time.Second // what a failed login costs (tests shorten it)
-)
+var loginDelay = time.Second // what a failed login costs (tests shorten it)
 
 type userKey struct{}
 
@@ -820,14 +863,22 @@ func (d *Daemon) sessionAuth(api http.Handler) http.Handler {
 				in.User = "admin"
 			}
 			// only admins log in; a deployer's right token fails exactly like a wrong password
-			loginMu.Lock() // one attempt at a time, and a failed one costs a second
-			u, ok := d.DB.CheckUser(in.User, in.Password)
-			ok = ok && u.Role == store.Admin
-			if !ok {
-				time.Sleep(loginDelay)
+			var u store.User
+			ok, blocked, err := d.limiter.check(r, func() bool {
+				var ok bool
+				u, ok = d.DB.CheckUser(in.User, in.Password)
+				return ok && u.Role == store.Admin
+			})
+			if err != nil {
+				w.Header().Set("Retry-After", strconv.Itoa(int(authWindow.Seconds())))
+				httpErr(w, http.StatusTooManyRequests, "%v", err)
+				return
 			}
-			loginMu.Unlock()
+			if blocked {
+				d.DB.Event("", "auth", "too many failed logins from %s: refused for %s", r.RemoteAddr, authWindow)
+			}
 			if !ok {
+				time.Sleep(loginDelay) // a failed one costs a second
 				d.DB.Event("", "auth", "failed dashboard login as %q from %s", in.User, r.RemoteAddr)
 				httpErr(w, http.StatusUnauthorized, "wrong user or password")
 				return

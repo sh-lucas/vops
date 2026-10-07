@@ -215,3 +215,35 @@ func TestSaveFailureKeepsTheOldFile(t *testing.T) {
 		t.Fatalf("temp files left: %d entries", len(entries))
 	}
 }
+
+// Upgrades (websockets) pass through, and the header timeout doesn't cut them.
+func TestUpgrade(t *testing.T) {
+	srv := route(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, rw, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		rw.WriteString("HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+		rw.Flush()
+		line, _ := rw.ReadString('\n')
+		time.Sleep(1500 * time.Millisecond) // longer than the timeout
+		rw.WriteString("echo " + line)
+		rw.Flush()
+	}), &Limits{Timeout: 1})
+	c, err := net.Dial("tcp", strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	fmt.Fprint(c, "GET / HTTP/1.1\r\nHost: a.test\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	br := bufio.NewReader(c)
+	resp, err := http.ReadResponse(br, nil)
+	if err != nil || resp.StatusCode != 101 {
+		t.Fatalf("upgrade: %v %v", resp, err)
+	}
+	fmt.Fprint(c, "hi\n")
+	if line, err := br.ReadString('\n'); err != nil || line != "echo hi\n" {
+		t.Fatalf("upgraded connection: %q %v", line, err)
+	}
+}

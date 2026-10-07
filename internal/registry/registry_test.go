@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -28,15 +29,17 @@ func testRegistry(t *testing.T) (*Registry, *httptest.Server, chan string) {
 	}
 	pushed := make(chan string, 10)
 	reg.OnPush = func(repo, tag, digest string) { pushed <- repo + ":" + tag }
-	reg.Auth = func(user, pass string) *Perm {
+	reg.Auth = func(_ *http.Request, user, pass string) (*Perm, error) {
 		switch user + ":" + pass {
 		case "alice:secret":
 			own := func(r string) bool { return strings.HasPrefix(r, "app/") }
-			return &Perm{Name: user, Pull: own, Push: own}
+			return &Perm{Name: user, Pull: own, Push: own}, nil
 		case "admin:pw":
-			return &Perm{Name: user, Pull: func(string) bool { return true }, Push: func(string) bool { return false }}
+			return &Perm{Name: user, Pull: func(string) bool { return true }, Push: func(string) bool { return false }}, nil
+		case "flood:x":
+			return nil, errors.New("too many failed logins")
 		}
-		return nil
+		return nil, nil
 	}
 	srv := httptest.NewServer(reg)
 	t.Cleanup(srv.Close)
@@ -189,7 +192,7 @@ func pushManifest(c client, repo, ref string, config string, layers ...string) (
 
 // Protocol details podman doesn't exercise: chunked uploads, ranges, mounts, pagination, referrers, deletes.
 func TestProtocol(t *testing.T) {
-	reg, srv, _ := testRegistry(t)
+	_, srv, _ := testRegistry(t)
 	c := client{t, srv.URL, "alice"}
 
 	// chunked upload with Content-Range, a bad range, status, then finish with the last chunk
@@ -221,7 +224,6 @@ func TestProtocol(t *testing.T) {
 	c.expect(c.do("POST", "/v2/app/b/blobs/uploads/?mount="+d+"&from=app/a", nil), 201)
 	c.expect(c.do("GET", "/v2/app/b/blobs/"+d, nil), 200)
 	// mounting from a repo you can't read starts a normal upload instead
-	reg.Auth("alice", "secret") // no-op, documents who is calling
 	c.expect(c.do("POST", "/v2/app/b/blobs/uploads/?mount="+d+"&from=other/x", nil), 202)
 
 	// manifests: missing blob is rejected, then tag + digest reads
@@ -326,6 +328,81 @@ func TestGC(t *testing.T) {
 	}
 	if got := reg.Repos(); len(got) != 1 || got[0] != "app/a" {
 		t.Fatalf("repos %v", got)
+	}
+
+	// an empty repo goes, the repos nested under it stay
+	pushManifest(c, "app/a/web", "latest", pushBlob(c, "app/a/web", []byte("{}")))
+	if r := c.do("DELETE", "/v2/app/a/manifests/latest", nil); r.StatusCode != 202 {
+		t.Fatalf("delete tag: %d", r.StatusCode)
+	}
+	if _, err := reg.GC(0, nil); err != nil {
+		t.Fatal(err)
+	}
+	if got := reg.Repos(); len(got) != 1 || got[0] != "app/a/web" {
+		t.Fatalf("repos after removing app/a: %v", got)
+	}
+	c.expect(c.do("GET", "/v2/app/a/web/manifests/latest", nil), 200)
+}
+
+// Auth outcomes, permissions and inputs a client controls: each gets the right status and changes nothing.
+func TestAuthAndInputs(t *testing.T) {
+	reg, srv, _ := testRegistry(t)
+	get := func(user, pass, method, path string, body []byte) *http.Response {
+		req, _ := http.NewRequest(method, srv.URL+path, bytes.NewReader(body))
+		if user != "" {
+			req.SetBasicAuth(user, pass)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { resp.Body.Close() })
+		return resp
+	}
+	if r := get("", "", "GET", "/v2/", nil); r.StatusCode != 401 || r.Header.Get("WWW-Authenticate") == "" {
+		t.Fatalf("anonymous: %d %v", r.StatusCode, r.Header)
+	}
+	if r := get("alice", "wrong", "GET", "/v2/", nil); r.StatusCode != 401 {
+		t.Fatalf("wrong password: %d", r.StatusCode)
+	}
+	if r := get("flood", "x", "GET", "/v2/", nil); r.StatusCode != 429 || r.Header.Get("Retry-After") == "" || !strings.Contains(readAll(r), "TOOMANYREQUESTS") {
+		t.Fatalf("refused client: %d %v", r.StatusCode, r.Header)
+	}
+
+	alice, admin := client{t, srv.URL, "alice"}, client{t, srv.URL, "admin"}
+	cfg := pushBlob(alice, "app/a", []byte("{}"))
+	admin.expect(admin.do("POST", "/v2/app/a/blobs/uploads/", nil), 403) // pulls everything, pushes nothing
+	alice.expect(alice.do("GET", "/v2/other/x/tags/list", nil), 403)
+	alice.expect(alice.do("POST", "/v2/other/x/blobs/uploads/", nil), 403)
+	alice.expect(alice.do("GET", "/v2/app/a/blobs/sha256:xyz", nil), 400)
+	alice.expect(alice.do("GET", "/v2/app/a/manifests/bad:tag", nil), 400)
+	alice.expect(alice.do("PUT", "/v2/app/a/manifests/.hidden", []byte("{}")), 400)
+	alice.expect(alice.do("PUT", "/v2/app/a/manifests/v1", bytes.Repeat([]byte(" "), maxManifest+1)), 413)
+	alice.expect(alice.do("PUT", "/v2/app/a/manifests/v1", []byte("{not json")), 400)
+	alice.expect(alice.do("PUT", "/v2/app/a/manifests/"+digestOf([]byte("other")), []byte("{}")), 400)
+	// an upload belongs to its repo, and a digest that doesn't match leaves no blob
+	loc := alice.expect(alice.do("POST", "/v2/app/a/blobs/uploads/", nil), 202).Header.Get("Location")
+	id := loc[strings.LastIndex(loc, "/")+1:]
+	alice.expect(alice.do("PATCH", "/v2/app/b/blobs/uploads/"+id, []byte("x")), 404)
+	alice.expect(alice.do("PATCH", "/v2/app/a/blobs/uploads/../"+id, []byte("x")), 404)
+	alice.expect(alice.do("PUT", loc+"?digest="+digestOf([]byte("y")), []byte("x")), 400)
+	if exists(reg.blobPath(digestOf([]byte("x")))) || exists(reg.uploadPath(id)) {
+		t.Fatal("a failed upload left data behind")
+	}
+	if len(reg.Tags("app/a")) != 0 {
+		t.Fatalf("a refused manifest made a tag: %+v", reg.Tags("app/a"))
+	}
+
+	// a tag that looks like a temp file is still a tag; a crash's temp file is neither listed nor kept by gc
+	pushManifest(alice, "app/a", "v1.tmp2", cfg)
+	stale := reg.repoPath("app/a", "tags", ".v1.tmp2.tmpabc")
+	os.WriteFile(stale, []byte(cfg), 0o644)
+	if tags := reg.Tags("app/a"); len(tags) != 1 || tags[0].Name != "v1.tmp2" {
+		t.Fatalf("tags: %+v", tags)
+	}
+	reg.GC(0, nil)
+	if exists(stale) || reg.Resolve("app/a", "v1.tmp2") == "" {
+		t.Fatal("gc: the temp file stays or the tag went")
 	}
 }
 
