@@ -4,10 +4,13 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/store"
 )
 
@@ -46,13 +49,19 @@ func login(t *testing.T, h http.Handler, user, password string) (int, string) {
 	return w.Code, ""
 }
 
+// regAuth checks registry credentials as a client at 192.0.2.1 would send them.
+func regAuth(d *Daemon, user, pass string) *registry.Perm {
+	p, _ := d.registryAuth(httptest.NewRequest("GET", "/v2/", nil), user, pass)
+	return p
+}
+
 func TestRegistryAuth(t *testing.T) {
 	d := testDaemon(t)
 	d.DB.PutUser(store.User{Name: "admin", Role: store.Admin}, "admin password 1")
 	d.DB.PutUser(store.User{Name: "all", Role: store.Deployer, Global: true}, "token-all-0123")
 	d.DB.PutUser(store.User{Name: "ci", Role: store.Deployer, Repos: []string{"shop/web:latest", "shop/api"}}, "token-ci-01234")
 	can := func(user, pass, repo string) (pull, push bool) {
-		p := d.registryAuth(user, pass)
+		p := regAuth(d, user, pass)
 		if p == nil {
 			return false, false
 		}
@@ -77,7 +86,7 @@ func TestRegistryAuth(t *testing.T) {
 			t.Errorf("%s on %s: pull %v push %v, want %v", c.user, c.repo, pull, push, c.ok)
 		}
 	}
-	if p := d.registryAuth("vops-internal", d.pullToken); p == nil || !p.Pull("x/y") || p.Push("x/y") {
+	if p := regAuth(d, "vops-internal", d.pullToken); p == nil || !p.Pull("x/y") || p.Push("x/y") {
 		t.Error("the internal user pulls everything and pushes nothing")
 	}
 
@@ -87,13 +96,13 @@ func TestRegistryAuth(t *testing.T) {
 	if w := call(h, "DELETE", "/api/users?name=ci", "", cookie); w.Code != 200 {
 		t.Fatalf("delete: %d %s", w.Code, w.Body)
 	}
-	if d.registryAuth("ci", "token-ci-01234") != nil {
+	if regAuth(d, "ci", "token-ci-01234") != nil {
 		t.Fatal("a deleted user still pushes (auth cache)")
 	}
 	if w := call(h, "POST", "/api/users", `{"name":"all","new_token":true}`, cookie); w.Code != 200 || !strings.Contains(w.Body.String(), `"token":"`) {
 		t.Fatalf("new token: %d %s", w.Code, w.Body)
 	}
-	if d.registryAuth("all", "token-all-0123") != nil {
+	if regAuth(d, "all", "token-all-0123") != nil {
 		t.Fatal("an old token still works (auth cache)")
 	}
 	if w := call(h, "POST", "/api/users", `{"name":"all","global":false,"repos":["a/b"]}`, cookie); w.Code != 200 {
@@ -162,5 +171,106 @@ func TestDashboardLogin(t *testing.T) {
 	}
 	if w := call(h, "GET", "/api/status", "", cookie); w.Code == 401 {
 		t.Fatalf("status: %d", w.Code)
+	}
+}
+
+// Wrong credentials from one client, dashboard and registry together, get it refused for a while; other clients,
+// the internal user and earlier sessions aren't affected, and a right password doesn't reset the count.
+func TestAuthLimiter(t *testing.T) {
+	d := testDaemon(t)
+	clock := time.Now()
+	d.limiter.now = func() time.Time { return clock }
+	h := d.UIHandler()
+	d.DB.PutUser(store.User{Name: "admin", Role: store.Admin}, "admin password 1")
+	d.DB.PutUser(store.User{Name: "ci", Role: store.Deployer, Global: true}, "token-ci-01234")
+	_, before := login(t, h, "admin", "admin password 1")
+
+	from := func(ip, method, path, body string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(method, "http://vops.test"+path, strings.NewReader(body))
+		r.RemoteAddr = ip
+		r.Header.Set("X-Vops", "1")
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w
+	}
+	reg := func(ip, user, pass string) int {
+		r := httptest.NewRequest("GET", "http://vops.test/v2/", nil)
+		r.RemoteAddr = ip
+		r.SetBasicAuth(user, pass)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	attacker := "203.0.113.7:4000"
+	if w := from(attacker, "POST", "/api/login", `{"user":"admin","password":"admin password 1"}`); w.Code != 200 {
+		t.Fatalf("right password: %d", w.Code)
+	}
+	for i := range authMaxFails / 2 {
+		if w := from(attacker, "POST", "/api/login", `{"user":"admin","password":"guess"}`); w.Code != 401 {
+			t.Fatalf("guess %d: %d", i, w.Code)
+		}
+		if code := reg(attacker, "ci", "guess"); code != 401 {
+			t.Fatalf("registry guess %d: %d", i, code)
+		}
+	}
+	if w := from(attacker, "POST", "/api/login", `{"user":"admin","password":"admin password 1"}`); w.Code != 429 || w.Header().Get("Retry-After") == "" {
+		t.Fatalf("refused client, right password: %d", w.Code)
+	}
+	if code := reg(attacker, "ci", "token-ci-01234"); code != 429 {
+		t.Fatalf("refused client on the registry: %d", code)
+	}
+	if code := reg("[2001:db8::1]:1", "ci", "token-ci-01234"); code != 200 {
+		t.Fatalf("another client: %d", code)
+	}
+	if code := reg(attacker, "vops-internal", d.pullToken); code != 200 {
+		t.Fatalf("the internal user: %d", code)
+	}
+	if w := call(h, "GET", "/api/users", "", before); w.Code != 200 {
+		t.Fatalf("an earlier session: %d", w.Code)
+	}
+	if evs, _ := d.DB.Events("", 50); !slices.ContainsFunc(evs, func(e store.Event) bool { return strings.Contains(e.Message, "refused for 15m") }) {
+		t.Fatal("no event says the client was refused")
+	}
+	clock = clock.Add(authWindow + time.Second)
+	if w := from(attacker, "POST", "/api/login", `{"user":"admin","password":"admin password 1"}`); w.Code != 200 {
+		t.Fatalf("after the window: %d", w.Code)
+	}
+
+	// an ipv6 /64 is one client; proxied addresses come without a port
+	for addr, want := range map[string]string{
+		"203.0.113.7:4000":         "203.0.113.7",
+		"203.0.113.7":              "203.0.113.7",
+		"[2001:db8:1:2:3::9]:443":  "2001:db8:1:2::/64",
+		"2001:db8:1:2:ffff::1":     "2001:db8:1:2::/64",
+		"[::ffff:198.51.100.1]:80": "198.51.100.1",
+		"@":                        "@",
+	} {
+		if got := clientKey(addr); got != want {
+			t.Errorf("clientKey(%q) = %q, want %q", addr, got, want)
+		}
+	}
+}
+
+// Parallel guesses can't get past the limit: an attempt is reserved before the password is checked.
+func TestAuthLimiterParallel(t *testing.T) {
+	l := newAuthLimiter()
+	r := httptest.NewRequest("GET", "/", nil)
+	var mu sync.Mutex
+	checked := 0
+	var wg sync.WaitGroup
+	for range 50 {
+		wg.Go(func() {
+			l.check(r, func() bool {
+				mu.Lock()
+				checked++
+				mu.Unlock()
+				time.Sleep(10 * time.Millisecond)
+				return false
+			})
+		})
+	}
+	wg.Wait()
+	if checked != authMaxFails {
+		t.Fatalf("%d passwords checked, want %d", checked, authMaxFails)
 	}
 }

@@ -479,6 +479,9 @@ var (
 	envKeyRe  = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 )
 
+// ValidService reports whether s can be a service name.
+func ValidService(s string) bool { return serviceRe.MatchString(s) }
+
 // IsComposeFile reports whether a file name is a compose file.
 func IsComposeFile(name string) bool {
 	switch name {

@@ -111,6 +111,15 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 			}
 			os.Remove(p)
 		}
+		// temp files a crash left behind
+		for _, dir := range []string{"tags", "manifests"} {
+			entries, _ := os.ReadDir(reg.repoPath(name, dir))
+			for _, e := range entries {
+				if p := reg.repoPath(name, dir, e.Name()); strings.HasPrefix(e.Name(), ".") && !young(p) {
+					os.Remove(p)
+				}
+			}
+		}
 		if len(keep) == 0 && len(reg.tagMap(name)) == 0 && !young(reg.repoPath(name)) {
 			reg.removeRepo(name)
 		}
@@ -141,10 +150,16 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 	return res, nil
 }
 
-// removeRepo deletes the repo dir and empty parents up to repos/.
+// removeRepo deletes the repo's own dirs, then the repo dir and its parents up to repos/ while they are empty:
+// a nested repo (shop/web under shop) stays.
 func (reg *Registry) removeRepo(name string) {
 	p := reg.repoPath(name)
-	os.RemoveAll(p)
+	for _, d := range []string{"blobs", "manifests", "tags"} {
+		os.RemoveAll(filepath.Join(p, d))
+	}
+	if os.Remove(p) != nil {
+		return
+	}
 	base := filepath.Join(reg.Root, "repos")
 	for dir := filepath.Dir(p); strings.HasPrefix(dir, base+string(filepath.Separator)); dir = filepath.Dir(dir) {
 		if os.Remove(dir) != nil {

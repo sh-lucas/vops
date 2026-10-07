@@ -41,7 +41,7 @@ func shortErr(err error) string {
 	if len(s) > 300 {
 		s = s[:297] + "..."
 	}
-	return s
+	return strings.ToValidUTF8(s, "") // a cut rune, or podman's own bytes, would break the json of the timeline
 }
 
 // runningImages is what a project runs now, per service: the desired image when the containers run the
