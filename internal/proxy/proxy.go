@@ -379,8 +379,8 @@ func Handler(t *Table) http.Handler {
 			backends = tg.canary()
 		}
 		sw := &statusWriter{ResponseWriter: w}
+		defer func() { t.count(tg.key, tg.e.canary, on, sw.code) }() // also when the client left mid-stream (ErrAbortHandler)
 		ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, backends[0]), timeoutKey{}, timeout)
 		rp.ServeHTTP(sw, r.WithContext(ctx))
-		t.count(tg.key, tg.e.canary, on, sw.code)
 	})
 }

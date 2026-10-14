@@ -1,11 +1,15 @@
 package proxy
 
 import (
+	"bufio"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Tables without canaries hash and serialize as before canaries existed: a daemon and a proxy of different
@@ -117,5 +121,97 @@ func TestCanaryRouting(t *testing.T) {
 	tb.SetCanary(k, nil)
 	if body, resp := get("/?"+CanaryParam+"=on", "7.on"); body != "stable" || cookieOf(resp) != "" || resp.StatusCode != 200 || len(tb.Canaries()) != 0 {
 		t.Fatalf("without a canary: %q %d", body, resp.StatusCode)
+	}
+}
+
+// With a canary, both groups still stream (SSE: the first event arrives before the response ends) and upgrade
+// (101, then raw bytes both ways): statusWriter passes Flush and Hijack through, and a stream the client leaves
+// is still counted.
+func TestCanaryStreams(t *testing.T) {
+	backend := func(name string) string {
+		release := make(chan struct{})
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("Upgrade") == "echo" {
+				w.Header().Set("Connection", "Upgrade")
+				w.Header().Set("Upgrade", "echo")
+				w.WriteHeader(http.StatusSwitchingProtocols)
+				conn, brw, err := http.NewResponseController(w).Hijack()
+				if err != nil {
+					return
+				}
+				defer conn.Close()
+				line, _ := brw.ReadString('\n')
+				brw.WriteString(name + ":" + line)
+				brw.Flush()
+				return
+			}
+			w.Header().Set("Content-Type", "text/event-stream")
+			io.WriteString(w, "data: "+name+"\n\n")
+			http.NewResponseController(w).Flush()
+			select {
+			case <-release:
+			case <-r.Context().Done(): // the client left: the proxy closed its upstream request
+			}
+		}))
+		t.Cleanup(func() { close(release); s.Close() })
+		return strings.TrimPrefix(s.URL, "http://")
+	}
+	tb := NewTable()
+	tb.SetRoutes([]Route{{Project: "shop", Service: "web", Domains: []string{"shop.test"}, Backends: []string{backend("stable")}, Canary: &Canary{ID: 1, Weight: 50, Backends: []string{backend("canary")}}}})
+	front := httptest.NewServer(Handler(tb))
+	t.Cleanup(front.Close)
+	for _, group := range []string{"on", "off"} {
+		want := map[string]string{"on": "canary", "off": "stable"}[group]
+		// SSE
+		req, _ := http.NewRequest("GET", front.URL, nil)
+		req.Host = "shop.test"
+		req.Header.Set("Cookie", CanaryCookie+"=1."+group)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		line := make(chan string, 1)
+		go func() {
+			b := make([]byte, 64)
+			n, _ := resp.Body.Read(b)
+			line <- string(b[:n])
+		}()
+		select {
+		case got := <-line:
+			if got != "data: "+want+"\n\n" {
+				t.Fatalf("%s: SSE %q", group, got)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%s: the first event never arrived (no flush)", group)
+		}
+		resp.Body.Close()
+
+		// upgrade
+		conn, err := net.Dial("tcp", strings.TrimPrefix(front.URL, "http://"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.SetDeadline(time.Now().Add(5 * time.Second))
+		fmt.Fprintf(conn, "GET / HTTP/1.1\r\nHost: shop.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\nCookie: %s=1.%s\r\n\r\n", CanaryCookie, group)
+		br := bufio.NewReader(conn)
+		up, err := http.ReadResponse(br, nil)
+		if err != nil || up.StatusCode != http.StatusSwitchingProtocols {
+			t.Fatalf("%s: upgrade: %v %+v", group, err, up)
+		}
+		io.WriteString(conn, "ping\n")
+		if got, _ := br.ReadString('\n'); got != want+":ping\n" {
+			t.Fatalf("%s: echo %q", group, got)
+		}
+		conn.Close()
+	}
+	// counted when each response ends (a stream or an upgraded connection closes)
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		st := tb.Canaries()["shop/web"]
+		if st.Canary.Requests == 2 && st.Stable.Requests == 2 && st.Canary.Errors+st.Stable.Errors == 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stats: %+v", st)
+		}
 	}
 }
