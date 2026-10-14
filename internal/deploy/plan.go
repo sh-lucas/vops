@@ -769,6 +769,11 @@ func (p *Plan) Watching(repo, tag string) []proxy.Key {
 	return out
 }
 
+// WatchingIn is Watching for one project.
+func (p *Plan) WatchingIn(project, repo, tag string) []proxy.Key {
+	return slices.DeleteFunc(p.Watching(repo, tag), func(k proxy.Key) bool { return k.Project != project })
+}
+
 // ServiceState is a service as the ui shows it: what git wants, what podman runs, what apply would do.
 type ServiceState struct {
 	Name       string             `json:"name"`

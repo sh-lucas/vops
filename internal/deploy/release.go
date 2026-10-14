@@ -155,7 +155,7 @@ func (e *Engine) Pushed(ctx context.Context, w io.Writer, p registry.Push) error
 	}
 	var deploy []proxy.Key
 	for _, pp := range plan.Projects {
-		keys := slices.DeleteFunc(plan.Watching(p.Repo, p.Tag), func(k proxy.Key) bool { return k.Project != pp.Path })
+		keys := plan.WatchingIn(pp.Path, p.Repo, p.Tag)
 		if len(keys) == 0 {
 			continue
 		}
@@ -285,7 +285,7 @@ func (e *Engine) Approve(ctx context.Context, w io.Writer, id int64, by string) 
 	if err != nil {
 		return e.failRelease(r, err)
 	}
-	keys := slices.DeleteFunc(plan.Watching(r.Repo, r.Tag), func(k proxy.Key) bool { return k.Project != r.Project })
+	keys := plan.WatchingIn(r.Project, r.Repo, r.Tag)
 	if len(keys) == 0 {
 		fmt.Fprintf(w, "%s: no service runs %s:%s anymore: nothing to deploy\n", r.Project, r.Repo, r.Tag)
 		return nil
