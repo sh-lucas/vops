@@ -25,6 +25,16 @@ type entry struct {
 	domains  []string
 	backends []string
 	next     *atomic.Uint64
+	canary   *Canary // a canary group (release modes), nil = none
+	cnext    *atomic.Uint64
+}
+
+// Canary is a second group of backends taking Weight% of a service's clients, sticky by cookie (a release
+// waiting for approval with x-vops.release: canary). ID is the release's.
+type Canary struct {
+	ID       int64    `json:"id"`
+	Weight   int      `json:"weight"`
+	Backends []string `json:"backends"`
 }
 
 // Table maps hosts to backends. Services own their domains; Set replaces a service atomically.
@@ -34,6 +44,7 @@ type Table struct {
 	hosts    map[string]Key
 	limits   map[string]*Limits // per project; a preview without its own uses its project's
 	limiter  *limiter
+	groups   sync.Map // Key -> *groupStats: requests and 5xx per group while a canary runs
 
 	// OnChange runs after every Set/Replace, synchronously (the daemon pushes the table to the proxy process with it).
 	// Its error (the proxy did not confirm) is what Set and Replace return.
@@ -44,21 +55,42 @@ func NewTable() *Table {
 	return &Table{services: map[Key]entry{}, hosts: map[string]Key{}, limits: map[string]*Limits{}, limiter: newLimiter()}
 }
 
-// Set replaces the domains and backends ("127.0.0.1:port") of a service. No backends removes it.
+func newEntry(domains, backends []string, c *Canary) entry {
+	if c != nil && len(c.Backends) == 0 {
+		c = nil
+	}
+	if c != nil {
+		c = &Canary{c.ID, c.Weight, slices.Clone(c.Backends)}
+	}
+	return entry{slices.Clone(domains), slices.Clone(backends), new(atomic.Uint64), c, new(atomic.Uint64)}
+}
+
+// Set replaces the domains and backends ("127.0.0.1:port") of a service, keeping its canary. No backends removes it.
 func (t *Table) Set(k Key, domains, backends []string) error {
 	t.mu.Lock()
 	if len(backends) == 0 || len(domains) == 0 {
 		delete(t.services, k)
 	} else {
-		t.services[k] = entry{slices.Clone(domains), slices.Clone(backends), new(atomic.Uint64)}
+		t.services[k] = newEntry(domains, backends, t.services[k].canary)
 	}
 	t.reindex()
 	t.mu.Unlock()
 	return t.changed()
 }
 
-// Replace swaps the whole table and the projects' limits (used when rebuilding from podman).
-func (t *Table) Replace(all map[Key][2][]string, limits map[string]Limits) error {
+// SetCanary sets (nil: removes) the canary group of a routed service.
+func (t *Table) SetCanary(k Key, c *Canary) error {
+	t.mu.Lock()
+	if e, ok := t.services[k]; ok {
+		t.services[k] = newEntry(e.domains, e.backends, c)
+	}
+	t.mu.Unlock()
+	return t.changed()
+}
+
+// Replace swaps the whole table and the projects' limits (used when rebuilding from podman). The routes' own
+// Limits are ignored: limits is per project.
+func (t *Table) Replace(routes []Route, limits map[string]Limits) error {
 	t.mu.Lock()
 	t.limits = map[string]*Limits{}
 	for p, l := range limits {
@@ -67,9 +99,9 @@ func (t *Table) Replace(all map[Key][2][]string, limits map[string]Limits) error
 		}
 	}
 	t.services = map[Key]entry{}
-	for k, v := range all {
-		if len(v[0]) > 0 && len(v[1]) > 0 {
-			t.services[k] = entry{v[0], v[1], new(atomic.Uint64)}
+	for _, r := range routes {
+		if len(r.Domains) > 0 && len(r.Backends) > 0 {
+			t.services[Key{r.Project, r.Service}] = newEntry(r.Domains, r.Backends, r.Canary)
 		}
 	}
 	t.reindex()
@@ -79,14 +111,13 @@ func (t *Table) Replace(all map[Key][2][]string, limits map[string]Limits) error
 
 // SetRoutes swaps the whole table for a list of routes (what the proxy process receives).
 func (t *Table) SetRoutes(routes []Route) {
-	all, limits := map[Key][2][]string{}, map[string]Limits{}
+	limits := map[string]Limits{}
 	for _, r := range routes {
-		all[Key{r.Project, r.Service}] = [2][]string{r.Domains, r.Backends}
 		if r.Limits != nil {
 			limits[r.Project] = *r.Limits
 		}
 	}
-	t.Replace(all, limits) // the proxy process has no OnChange
+	t.Replace(routes, limits) // the proxy process has no OnChange
 }
 
 // limitsOf is a project's limits; previews (project@name) inherit their project's.
@@ -133,28 +164,44 @@ func (t *Table) Has(host string) bool {
 	return ok
 }
 
-// Backends of a host, round-robin ordered starting at the next one.
+// Backends of a host, round-robin ordered starting at the next one (the stable group).
 func (t *Table) Backends(host string) []string {
-	b, _, _ := t.lookup(host)
-	return b
+	tg := t.lookup(host)
+	if tg == nil {
+		return nil
+	}
+	return tg.stable()
 }
 
-// lookup is a host's backends (round-robin ordered), its project and that project's limits.
-func (t *Table) lookup(host string) ([]string, string, *Limits) {
+// target is what a host routes to.
+type target struct {
+	key    Key
+	e      entry
+	limits *Limits
+}
+
+func roundRobin(backends []string, next *atomic.Uint64) []string {
+	n := len(backends)
+	start := int(next.Add(1) % uint64(n))
+	out := make([]string, 0, n)
+	for i := range n {
+		out = append(out, backends[(start+i)%n])
+	}
+	return out
+}
+
+func (tg *target) stable() []string { return roundRobin(tg.e.backends, tg.e.next) }
+
+func (tg *target) canary() []string { return roundRobin(tg.e.canary.Backends, tg.e.cnext) }
+
+func (t *Table) lookup(host string) *target {
 	t.mu.RLock()
 	defer t.mu.RUnlock()
 	k, ok := t.hosts[host]
 	if !ok {
-		return nil, "", nil
+		return nil
 	}
-	e := t.services[k]
-	n := len(e.backends)
-	start := int(e.next.Add(1) % uint64(n))
-	out := make([]string, 0, n)
-	for i := range n {
-		out = append(out, e.backends[(start+i)%n])
-	}
-	return out, k.Project, t.limitsOf(k.Project)
+	return &target{k, t.services[k], t.limitsOf(k.Project)}
 }
 
 type Route struct {
@@ -163,6 +210,7 @@ type Route struct {
 	Domains  []string `json:"domains"`
 	Backends []string `json:"backends"`
 	Limits   *Limits  `json:"limits,omitempty"`
+	Canary   *Canary  `json:"canary,omitempty"`
 }
 
 func (t *Table) Routes() []Route {
@@ -170,7 +218,7 @@ func (t *Table) Routes() []Route {
 	defer t.mu.RUnlock()
 	out := []Route{}
 	for k, e := range t.services {
-		out = append(out, Route{k.Project, k.Service, e.domains, e.backends, t.limitsOf(k.Project)})
+		out = append(out, Route{k.Project, k.Service, e.domains, e.backends, t.limitsOf(k.Project), e.canary})
 	}
 	slices.SortFunc(out, func(a, b Route) int { return strings.Compare(a.Project+"/"+a.Service, b.Project+"/"+b.Service) })
 	return out
@@ -305,19 +353,34 @@ func Handler(t *Table) http.Handler {
 		},
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		backends, project, limits := t.lookup(Host(r.Host))
-		if len(backends) == 0 {
+		tg := t.lookup(Host(r.Host))
+		if tg == nil || len(tg.e.backends) == 0 {
 			http.Error(w, "vops: no such site", http.StatusNotFound)
 			return
 		}
-		if !t.limiter.limit(w, r, project, limits) {
+		if !t.limiter.limit(w, r, tg.key.Project, tg.limits) {
 			return
 		}
 		timeout := DefaultTimeout
-		if limits != nil && limits.Timeout > 0 {
-			timeout = time.Duration(limits.Timeout) * time.Second
+		if tg.limits != nil && tg.limits.Timeout > 0 {
+			timeout = time.Duration(tg.limits.Timeout) * time.Second
 		}
+		if tg.e.canary == nil {
+			ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, tg.stable()[0]), timeoutKey{}, timeout)
+			rp.ServeHTTP(w, r.WithContext(ctx))
+			return
+		}
+		on, done := canaryGroup(w, r, tg.e.canary)
+		if done {
+			return
+		}
+		backends := tg.stable()
+		if on {
+			backends = tg.canary()
+		}
+		sw := &statusWriter{ResponseWriter: w}
+		defer func() { t.count(tg.key, tg.e.canary, on, sw.code) }() // also when the client left mid-stream (ErrAbortHandler)
 		ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, backends[0]), timeoutKey{}, timeout)
-		rp.ServeHTTP(w, r.WithContext(ctx))
+		rp.ServeHTTP(sw, r.WithContext(ctx))
 	})
 }

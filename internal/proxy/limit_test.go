@@ -108,7 +108,7 @@ func TestUnlimitedAndPreviewsInherit(t *testing.T) {
 		}
 	}
 	tb := NewTable()
-	tb.Replace(map[Key][2][]string{{"a@pr-1", "web"}: {{"pr.test"}, {"127.0.0.1:1"}}}, map[string]Limits{"a": {Rate: 5, Burst: 5}})
+	tb.Replace([]Route{{Project: "a@pr-1", Service: "web", Domains: []string{"pr.test"}, Backends: []string{"127.0.0.1:1"}}}, map[string]Limits{"a": {Rate: 5, Burst: 5}})
 	if r := tb.Routes(); r[0].Limits == nil || r[0].Limits.Rate != 5 {
 		t.Fatalf("preview route without its project's limits: %+v", r)
 	}

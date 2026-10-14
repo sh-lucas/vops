@@ -791,6 +791,10 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 			if nd.Snapshot != nil {
 				snap = fmt.Sprintf("snapshot #%d", nd.Snapshot.ID)
 			}
+			if r := nd.Release; r != nil {
+				fmt.Fprintf(tw, "r%d\t%s\t%s\t\t%s\t\t%s\n", r.ID, ago(r.CreatedAt), "push", r.Status, releaseText(*r))
+				continue
+			}
 			if nd.Kind == "snapshot" {
 				s := nd.Snapshot
 				fmt.Fprintf(tw, "\t%s\t%s\t%.12s\t\t%s\t%s\n", ago(s.CreatedAt), s.Reason, s.Commit, snap, s.Note)
@@ -814,6 +818,39 @@ func runHere(cmd string, args []string, stdin io.Reader, out io.Writer) error {
 				what = append(what, "previews: "+strings.Join(nd.Previews, ","))
 			}
 			fmt.Fprintf(tw, "%d\t%s\t%s\t%.12s\t%s\t%s\t%s\n", d.ID, ago(d.StartedAt), d.Trigger, d.Commit, d.Result, snap, strings.Join(what, "; "))
+		}
+		return tw.Flush()
+
+	case "releases":
+		first, _ := arg(0, "")
+		if first == "approve" || first == "reject" {
+			id, err := arg(1, "release id")
+			if err != nil {
+				return err
+			}
+			n, err := strconv.ParseInt(strings.TrimPrefix(id, "#"), 10, 64)
+			if err != nil {
+				return fmt.Errorf("release id: want a number, got %q", id)
+			}
+			resp, err := c.do("POST", "/api/releases/"+first, jsonBody(map[string]any{"id": n}))
+			if err != nil {
+				return err
+			}
+			return stream(resp, out)
+		}
+		var rs []store.Release
+		if err := getJSON(c, "/api/releases?project="+url.QueryEscape(first), &rs); err != nil {
+			return err
+		}
+		if *asJSON {
+			b, _ := json.Marshal(rs)
+			_, err := fmt.Fprintln(out, string(b))
+			return err
+		}
+		tw := tabwriter.NewWriter(out, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "#\tPROJECT\tPUSHED\tSTATUS\tWHAT")
+		for _, r := range rs {
+			fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", r.ID, r.Project, ago(r.CreatedAt), r.Status, releaseText(r))
 		}
 		return tw.Flush()
 
@@ -1024,6 +1061,10 @@ func printStatus(c *client, out io.Writer) error {
 			if s.Pin != nil {
 				info = strings.TrimSpace(fmt.Sprintf("%s  pinned to #%d, compose says %s", info, s.Pin.DeployID, s.Pin.ComposeImage))
 			}
+			if s.Hold != nil {
+				_, text, _ := strings.Cut(s.Hold.Text(), ": ")
+				info = strings.TrimSpace(info + "  " + text)
+			}
 			if s.Pending != "" {
 				info = strings.TrimSpace(info + "  pending: " + s.Pending + " " + s.Reason)
 			}
@@ -1035,6 +1076,25 @@ func printStatus(c *client, out io.Writer) error {
 		fmt.Fprintln(out, "\nthe host differs from git: run `vops apply`")
 	}
 	return nil
+}
+
+// releaseText is a release for humans: "shop/web:latest @0123456789ab by ci (canary 10%), approve at 18:00".
+func releaseText(r store.Release) string {
+	s := fmt.Sprintf("%s:%s @%.12s by %s (%s", r.Repo, r.Tag, strings.TrimPrefix(r.Digest, "sha256:"), orDash(r.PushedBy), r.Mode)
+	if r.Mode == "canary" {
+		s += fmt.Sprintf(" %d%%", r.Weight)
+	}
+	s += ")"
+	if r.Status == "pending" && r.ApproveAt != 0 {
+		s += ", approve at " + time.Unix(r.ApproveAt, 0).Format("2006-01-02 15:04")
+	}
+	if r.DecidedBy != "" && r.Status != "pending" {
+		s += ", " + r.Status + " by " + r.DecidedBy
+	}
+	if r.Note != "" {
+		s += ": " + r.Note
+	}
+	return s
 }
 
 func orDash(s string) string {

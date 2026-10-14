@@ -126,6 +126,23 @@ type PushSubscription struct {
 	LastError string `json:"last_error"`
 }
 
+type Release struct {
+	ID        int64  `json:"id"`
+	Project   string `json:"project"`
+	Repo      string `json:"repo"`
+	Tag       string `json:"tag"`
+	Digest    string `json:"digest"`
+	Mode      string `json:"mode"`
+	Weight    int64  `json:"weight"`
+	PushedBy  string `json:"pushed_by"`
+	CreatedAt int64  `json:"created_at"`
+	Status    string `json:"status"`
+	ApproveAt int64  `json:"approve_at"`
+	DecidedBy string `json:"decided_by"`
+	DecidedAt int64  `json:"decided_at"`
+	Note      string `json:"note"`
+}
+
 type Session struct {
 	IDHash  string `json:"id_hash"`
 	User    string `json:"user"`

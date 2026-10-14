@@ -36,12 +36,18 @@ type Perm struct {
 	Push func(repo string) bool
 }
 
+// Push is a tag written by a client.
+type Push struct {
+	Repo, Tag, Digest string
+	User              string // who pushed
+}
+
 type Registry struct {
 	Root string
 	// Auth returns nil when credentials are wrong, an error when the client may not try now (429).
 	Auth func(r *http.Request, user, pass string) (*Perm, error)
-	// OnPush is called after a tag is written.
-	OnPush func(repo, tag, digest string)
+	// OnPush is called (in a goroutine) after a tag is written.
+	OnPush func(Push)
 
 	mu sync.Mutex // guards tag/manifest writes against GC
 }
@@ -126,7 +132,7 @@ func (reg *Registry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case "uploads":
 		aerr = reg.upload(w, r, perm, name, rest)
 	case "manifests":
-		aerr = reg.manifest(w, r, name, rest)
+		aerr = reg.manifest(w, r, perm.Name, name, rest)
 	case "tags":
 		aerr = reg.tags(w, r, name)
 	case "referrers":
@@ -434,7 +440,7 @@ func (reg *Registry) resolve(name, ref string) (digest, mediaType string, err *a
 	return digest, string(mt), nil
 }
 
-func (reg *Registry) manifest(w http.ResponseWriter, r *http.Request, name, ref string) *apiErr {
+func (reg *Registry) manifest(w http.ResponseWriter, r *http.Request, user, name, ref string) *apiErr {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead:
 		digest, mt, err := reg.resolve(name, ref)
@@ -454,7 +460,7 @@ func (reg *Registry) manifest(w http.ResponseWriter, r *http.Request, name, ref 
 		}
 		return nil
 	case http.MethodPut:
-		return reg.putManifest(w, r, name, ref)
+		return reg.putManifest(w, r, user, name, ref)
 	case http.MethodDelete:
 		reg.mu.Lock()
 		defer reg.mu.Unlock()
@@ -481,7 +487,7 @@ func (reg *Registry) manifest(w http.ResponseWriter, r *http.Request, name, ref 
 	return errf(405, "UNSUPPORTED", "method %s", r.Method)
 }
 
-func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, name, ref string) *apiErr {
+func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, user, name, ref string) *apiErr {
 	body, e := io.ReadAll(io.LimitReader(r.Body, maxManifest+1))
 	if e != nil {
 		return errf(400, "MANIFEST_INVALID", "%v", e)
@@ -546,7 +552,7 @@ func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, name, r
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(201)
 	if !isDigest && reg.OnPush != nil {
-		go reg.OnPush(name, ref, digest)
+		go reg.OnPush(Push{Repo: name, Tag: ref, Digest: digest, User: user})
 	}
 	return nil
 }

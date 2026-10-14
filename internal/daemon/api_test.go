@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -19,6 +20,11 @@ func TestEveryRouteNeedsASession(t *testing.T) {
 	h := d.UIHandler()
 	if len(d.webRoutes) < 20 {
 		t.Fatalf("only %d routes recorded", len(d.webRoutes))
+	}
+	for _, must := range []string{"GET /api/releases", "POST /api/releases/approve", "POST /api/releases/reject", "POST /api/releases/schedule"} {
+		if !slices.Contains(d.webRoutes, must) {
+			t.Errorf("%s is not walked", must)
+		}
 	}
 	wild := regexp.MustCompile(`\{[^}]*\}`)
 	for _, pattern := range d.webRoutes {

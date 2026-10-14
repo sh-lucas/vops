@@ -56,6 +56,7 @@ svg.i { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor;
 #hoststat > span { display: flex; align-items: center; gap: 6px; white-space: nowrap; min-width: 0; }
 #hoststat .dom { overflow: hidden; text-overflow: ellipsis; }
 .pending { display: inline-flex; align-items: center; gap: 8px; font: inherit; font-size: 13px; font-weight: 550; cursor: pointer; padding: 5px 12px; border-radius: 99px; border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 12%, var(--panel)); color: var(--warn); white-space: nowrap; }
+a.pending:hover { text-decoration: none; }
 .pending:hover { background: color-mix(in srgb, var(--warn) 20%, var(--panel)); }
 .mobile-only { display: none !important; }
 main { width: 100%; max-width: 1240px; padding: 24px 28px 64px; }
@@ -237,6 +238,9 @@ td.wrap { overflow-wrap: anywhere; min-width: 16ch; }
 .tl-node.now .tl-dot { width: 14px; height: 14px; margin: 3px 0 0 3px; background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 22%, transparent); }
 .tl-node.rollback .tl-dot { border-color: var(--warn); }
 .tl-node.failed .tl-dot { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 20%, var(--panel)); }
+.tl-node.release .tl-dot { border-color: var(--warn); border-style: dashed; }
+.releases { display: grid; gap: 10px; }
+.release { display: grid; gap: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
 .tl-node.snapshot .tl-dot { border-color: var(--idle); border-radius: 3px; }
 .tl-node.now { background: color-mix(in srgb, var(--accent) 4%, var(--panel)); }
 .tl-body { min-width: 0; display: grid; gap: 5px; }

@@ -172,6 +172,38 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) error 
 	return err
 }
 
+const createRelease = `-- name: CreateRelease :one
+INSERT INTO releases (project, repo, tag, digest, mode, weight, pushed_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id
+`
+
+type CreateReleaseParams struct {
+	Project   string `json:"project"`
+	Repo      string `json:"repo"`
+	Tag       string `json:"tag"`
+	Digest    string `json:"digest"`
+	Mode      string `json:"mode"`
+	Weight    int64  `json:"weight"`
+	PushedBy  string `json:"pushed_by"`
+	CreatedAt int64  `json:"created_at"`
+}
+
+func (q *Queries) CreateRelease(ctx context.Context, arg CreateReleaseParams) (int64, error) {
+	row := q.db.QueryRowContext(ctx, createRelease,
+		arg.Project,
+		arg.Repo,
+		arg.Tag,
+		arg.Digest,
+		arg.Mode,
+		arg.Weight,
+		arg.PushedBy,
+		arg.CreatedAt,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
 const createSession = `-- name: CreateSession :exec
 INSERT INTO sessions (id_hash, user, expires) VALUES (?, ?, ?)
 `
@@ -234,6 +266,33 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) error {
 		arg.CreatedAt,
 	)
 	return err
+}
+
+const decideRelease = `-- name: DecideRelease :execrows
+UPDATE releases SET status = ?, decided_by = ?, decided_at = ?, note = ?, approve_at = 0 WHERE id = ? AND status = 'pending'
+`
+
+type DecideReleaseParams struct {
+	Status    string `json:"status"`
+	DecidedBy string `json:"decided_by"`
+	DecidedAt int64  `json:"decided_at"`
+	Note      string `json:"note"`
+	ID        int64  `json:"id"`
+}
+
+// only a pending release changes its fate
+func (q *Queries) DecideRelease(ctx context.Context, arg DecideReleaseParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, decideRelease,
+		arg.Status,
+		arg.DecidedBy,
+		arg.DecidedAt,
+		arg.Note,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const deleteExpiredSessions = `-- name: DeleteExpiredSessions :execrows
@@ -360,6 +419,20 @@ func (q *Queries) DeleteUserRepos(ctx context.Context, user string) error {
 	return err
 }
 
+const failRelease = `-- name: FailRelease :exec
+UPDATE releases SET status = 'failed', note = ? WHERE id = ? AND status = 'approved'
+`
+
+type FailReleaseParams struct {
+	Note string `json:"note"`
+	ID   int64  `json:"id"`
+}
+
+func (q *Queries) FailRelease(ctx context.Context, arg FailReleaseParams) error {
+	_, err := q.db.ExecContext(ctx, failRelease, arg.Note, arg.ID)
+	return err
+}
+
 const getAlert = `-- name: GetAlert :one
 SELECT id, kind, "key", project, service, title, body, url, first_at, last_at, sent_at, sends, occurrences, state, ended_at, closed_at, closed_by FROM alerts WHERE id = ?
 `
@@ -451,6 +524,32 @@ func (q *Queries) GetPreview(ctx context.Context, arg GetPreviewParams) (Preview
 		&i.UpdatedAt,
 		&i.DeployID,
 		&i.Services,
+	)
+	return i, err
+}
+
+const getRelease = `-- name: GetRelease :one
+SELECT id, project, repo, tag, digest, mode, weight, pushed_by, created_at, status, approve_at, decided_by, decided_at, note FROM releases WHERE id = ?
+`
+
+func (q *Queries) GetRelease(ctx context.Context, id int64) (Release, error) {
+	row := q.db.QueryRowContext(ctx, getRelease, id)
+	var i Release
+	err := row.Scan(
+		&i.ID,
+		&i.Project,
+		&i.Repo,
+		&i.Tag,
+		&i.Digest,
+		&i.Mode,
+		&i.Weight,
+		&i.PushedBy,
+		&i.CreatedAt,
+		&i.Status,
+		&i.ApproveAt,
+		&i.DecidedBy,
+		&i.DecidedAt,
+		&i.Note,
 	)
 	return i, err
 }
@@ -561,6 +660,49 @@ func (q *Queries) LatestDeploys(ctx context.Context) ([]Deploy, error) {
 			&i.FinishedAt,
 			&i.BeforeID,
 			&i.Parts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const latestReleases = `-- name: LatestReleases :many
+SELECT id, project, repo, tag, digest, mode, weight, pushed_by, created_at, status, approve_at, decided_by, decided_at, note FROM releases WHERE id IN (SELECT max(id) FROM releases GROUP BY project, repo, tag)
+`
+
+// the newest release of every project and repo:tag (it decides whether its services hold)
+func (q *Queries) LatestReleases(ctx context.Context) ([]Release, error) {
+	rows, err := q.db.QueryContext(ctx, latestReleases)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Release{}
+	for rows.Next() {
+		var i Release
+		if err := rows.Scan(
+			&i.ID,
+			&i.Project,
+			&i.Repo,
+			&i.Tag,
+			&i.Digest,
+			&i.Mode,
+			&i.Weight,
+			&i.PushedBy,
+			&i.CreatedAt,
+			&i.Status,
+			&i.ApproveAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.Note,
 		); err != nil {
 			return nil, err
 		}
@@ -1003,6 +1145,56 @@ func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
 	return items, nil
 }
 
+const listReleases = `-- name: ListReleases :many
+SELECT id, project, repo, tag, digest, mode, weight, pushed_by, created_at, status, approve_at, decided_by, decided_at, note FROM releases
+WHERE ?1 = '' OR project = ?1
+ORDER BY id DESC LIMIT ?2
+`
+
+type ListReleasesParams struct {
+	Project interface{} `json:"project"`
+	N       int64       `json:"n"`
+}
+
+// newest first; ” = every project
+func (q *Queries) ListReleases(ctx context.Context, arg ListReleasesParams) ([]Release, error) {
+	rows, err := q.db.QueryContext(ctx, listReleases, arg.Project, arg.N)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Release{}
+	for rows.Next() {
+		var i Release
+		if err := rows.Scan(
+			&i.ID,
+			&i.Project,
+			&i.Repo,
+			&i.Tag,
+			&i.Digest,
+			&i.Mode,
+			&i.Weight,
+			&i.PushedBy,
+			&i.CreatedAt,
+			&i.Status,
+			&i.ApproveAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.Note,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listReposOfUser = `-- name: ListReposOfUser :many
 SELECT repo FROM user_repos WHERE user = ? ORDER BY repo
 `
@@ -1242,6 +1434,48 @@ func (q *Queries) LiveAlerts(ctx context.Context) ([]Alert, error) {
 	return items, nil
 }
 
+const pendingReleases = `-- name: PendingReleases :many
+SELECT id, project, repo, tag, digest, mode, weight, pushed_by, created_at, status, approve_at, decided_by, decided_at, note FROM releases WHERE status = 'pending' ORDER BY id
+`
+
+func (q *Queries) PendingReleases(ctx context.Context) ([]Release, error) {
+	rows, err := q.db.QueryContext(ctx, pendingReleases)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []Release{}
+	for rows.Next() {
+		var i Release
+		if err := rows.Scan(
+			&i.ID,
+			&i.Project,
+			&i.Repo,
+			&i.Tag,
+			&i.Digest,
+			&i.Mode,
+			&i.Weight,
+			&i.PushedBy,
+			&i.CreatedAt,
+			&i.Status,
+			&i.ApproveAt,
+			&i.DecidedBy,
+			&i.DecidedAt,
+			&i.Note,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const previousDeploy = `-- name: PreviousDeploy :one
 SELECT id, project, commit_sha, "trigger", images, snapshot_id, restored_id, undoes, result, error, summary, started_at, finished_at, before_id, parts FROM deploys WHERE project = ? AND id < ? ORDER BY id DESC LIMIT 1
 `
@@ -1439,6 +1673,24 @@ func (q *Queries) RecentDeployImages(ctx context.Context, keep int64) ([]string,
 		return nil, err
 	}
 	return items, nil
+}
+
+const scheduleRelease = `-- name: ScheduleRelease :execrows
+UPDATE releases SET approve_at = ?, decided_by = ? WHERE id = ? AND status = 'pending'
+`
+
+type ScheduleReleaseParams struct {
+	ApproveAt int64  `json:"approve_at"`
+	DecidedBy string `json:"decided_by"`
+	ID        int64  `json:"id"`
+}
+
+func (q *Queries) ScheduleRelease(ctx context.Context, arg ScheduleReleaseParams) (int64, error) {
+	result, err := q.db.ExecContext(ctx, scheduleRelease, arg.ApproveAt, arg.DecidedBy, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
 }
 
 const setEnv = `-- name: SetEnv :exec

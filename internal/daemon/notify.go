@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sh-lucas/vops/internal/deploy"
 	"github.com/sh-lucas/vops/internal/notify"
 	"github.com/sh-lucas/vops/internal/store"
 )
@@ -42,6 +43,13 @@ func (d *Daemon) notifier() error {
 	}
 	d.notify = n
 	d.Engine.OnDeploy = n.Deployed
+	d.Engine.OnRelease = func(ev deploy.ReleaseEvent) {
+		if ev.What == "held" {
+			r := ev.Release
+			n.Approval(r.Project, fmt.Sprintf("%s: %s:%s waits for approval", r.Project, r.Repo, r.Tag),
+				fmt.Sprintf("#%d pushed by %s (%s): %s", r.ID, r.PushedBy, r.Mode, ev.Detail))
+		}
+	}
 	return nil
 }
 

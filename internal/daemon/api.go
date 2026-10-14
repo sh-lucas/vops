@@ -85,16 +85,17 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		flags, _ := d.DB.Projects()
 		last, _ := d.DB.LatestDeploys()
 		type project struct {
-			Path       string                `json:"path"`
-			Disabled   bool                  `json:"disabled"`
-			Gone       bool                  `json:"gone"`
-			Error      string                `json:"error,omitempty"`
-			Commit     string                `json:"commit"`
-			AppliedAt  int64                 `json:"applied_at"`
-			Services   []deploy.ServiceState `json:"services"`
-			LastDeploy *store.Deploy         `json:"last_deploy"`       // a rollback here: rolled back since the last deploy (the banner)
-			Limits     string                `json:"limits,omitempty"`  // proxy limits in effect ("rate 20/s burst 20, max_body 10MB")
-			Refused    *proxy.Counters       `json:"refused,omitempty"` // what they refused since the proxy started
+			Path       string                       `json:"path"`
+			Disabled   bool                         `json:"disabled"`
+			Gone       bool                         `json:"gone"`
+			Error      string                       `json:"error,omitempty"`
+			Commit     string                       `json:"commit"`
+			AppliedAt  int64                        `json:"applied_at"`
+			Services   []deploy.ServiceState        `json:"services"`
+			LastDeploy *store.Deploy                `json:"last_deploy"`        // a rollback here: rolled back since the last deploy (the banner)
+			Limits     string                       `json:"limits,omitempty"`   // proxy limits in effect ("rate 20/s burst 20, max_body 10MB")
+			Refused    *proxy.Counters              `json:"refused,omitempty"`  // what they refused since the proxy started
+			Canaries   map[string]proxy.CanaryStats `json:"canaries,omitempty"` // service -> requests and 5xx, canary vs stable
 		}
 		type preview struct {
 			Project string `json:"project"`
@@ -102,16 +103,17 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		}
 		px, pwarns := d.proxyState(r.Context())
 		out := struct {
-			Domain   string     `json:"domain"`
-			Commit   string     `json:"commit"`
-			Changes  bool       `json:"changes"`
-			Warnings []string   `json:"warnings"`
-			Projects []project  `json:"projects"`
-			Previews []preview  `json:"previews"`
-			Proxy    ProxyState `json:"proxy"`
-			User     string     `json:"user"`   // who is logged in ("cli" on the socket)
-			Alerts   int        `json:"alerts"` // open alerts the user can see (the sidebar badge)
-		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r), d.openAlerts(r)}
+			Domain   string          `json:"domain"`
+			Commit   string          `json:"commit"`
+			Changes  bool            `json:"changes"`
+			Warnings []string        `json:"warnings"`
+			Projects []project       `json:"projects"`
+			Previews []preview       `json:"previews"`
+			Proxy    ProxyState      `json:"proxy"`
+			User     string          `json:"user"`     // who is logged in ("cli" on the socket)
+			Alerts   int             `json:"alerts"`   // open alerts the user can see (the sidebar badge)
+			Releases []store.Release `json:"releases"` // pending (x-vops.release): the "waiting approval" badge
+		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r), d.openAlerts(r), must(d.DB.PendingReleases())}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
 			var ld *store.Deploy
@@ -126,7 +128,13 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			if c, ok := px.Limited[pp.Path]; ok {
 				refused = &c
 			}
-			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld, lim, refused})
+			canaries := map[string]proxy.CanaryStats{}
+			for k, c := range px.Canaries {
+				if svc, ok := strings.CutPrefix(k, pp.Path+"/"); ok && !strings.Contains(svc, "/") {
+					canaries[svc] = c
+				}
+			}
+			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld, lim, refused, canaries})
 		}
 		pvs, _ := d.DB.Previews("")
 		for _, pv := range pvs {
@@ -171,16 +179,11 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if !slices.Contains([]string{"sync", "apply", "ui"}, opts.Trigger) {
 			opts.Trigger = "apply"
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
 		// a client that disconnects must not abort a rollout halfway
-		ctx := context.WithoutCancel(r.Context())
-		_, err := d.Engine.Apply(ctx, flushWriter{w}, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects, Trigger: opts.Trigger})
-		if err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error {
+			_, err := d.Engine.Apply(context.WithoutCancel(r.Context()), out, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects, Trigger: opts.Trigger})
+			return err
+		})
 		return nil
 	})
 
@@ -368,13 +371,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.PreviewUp(context.WithoutCancel(r.Context()), flushWriter{w}, in); err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error { return d.Engine.PreviewUp(context.WithoutCancel(r.Context()), out, in) })
 		return nil
 	})
 	h("DELETE /api/previews", func(w http.ResponseWriter, r *http.Request) error {
@@ -676,15 +673,59 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.Rollback(context.WithoutCancel(r.Context()), flushWriter{w}, in); err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error { return d.Engine.Rollback(context.WithoutCancel(r.Context()), out, in) })
 		return nil
 	})
+	h("GET /api/releases", func(w http.ResponseWriter, r *http.Request) error {
+		project := r.URL.Query().Get("project")
+		if project != "" {
+			if err := validProject(project, "", false); err != nil {
+				return err
+			}
+		}
+		rs, err := d.DB.Releases(project, 200)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, rs)
+		return nil
+	})
+	// approve and reject stream like apply; schedule answers json
+	h("POST /api/releases/approve", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct{ ID int64 }
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		streamed(w, func(out io.Writer) error {
+			return d.Engine.Approve(context.WithoutCancel(r.Context()), out, in.ID, actor(r))
+		})
+		return nil
+	})
+	h("POST /api/releases/reject", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct {
+			ID   int64
+			Note string
+		}
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		streamed(w, func(out io.Writer) error {
+			return d.Engine.Reject(context.WithoutCancel(r.Context()), out, in.ID, actor(r), trunc(in.Note, 200))
+		})
+		return nil
+	})
+	h("POST /api/releases/schedule", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct{ ID, At int64 }
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		if err := d.Engine.Schedule(in.ID, in.At, actor(r)); err != nil {
+			return err
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+		return nil
+	})
+
 	// unpin: back to what compose says for these services (all pinned ones if none), streamed like apply
 	h("POST /api/unpin", func(w http.ResponseWriter, r *http.Request) error {
 		var in struct {
@@ -699,13 +740,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 				return err
 			}
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.Unpin(context.WithoutCancel(r.Context()), flushWriter{w}, in.Project, in.Services); err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error {
+			return d.Engine.Unpin(context.WithoutCancel(r.Context()), out, in.Project, in.Services)
+		})
 		return nil
 	})
 
@@ -835,6 +872,17 @@ func (f flushWriter) Write(p []byte) (int, error) {
 const sessionCookie = "vops_session"
 
 var loginDelay = time.Second // what a failed login costs (tests shorten it)
+
+// streamed runs fn with its progress streamed as text; the last line is "==> ok" or "==> error: ...".
+func streamed(w http.ResponseWriter, fn func(io.Writer) error) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if err := fn(flushWriter{w}); err != nil {
+		fmt.Fprintf(w, "==> error: %v\n", err)
+	} else {
+		fmt.Fprintln(w, "==> ok")
+	}
+}
 
 type userKey struct{}
 

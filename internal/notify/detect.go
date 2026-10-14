@@ -127,16 +127,17 @@ type Death struct {
 	Name             string
 	ExitCode         int
 	OOMKilled        bool
-	Job              bool // a compose job (service_completed_successfully): it is meant to exit
-	Expected         bool // the engine stopped, removed or restarted it
-	Gone             bool // removed right after: only vops (or someone by hand) removes containers
-	Stopping         bool // the daemon is shutting down (the host too, probably)
+	Job              bool   // a compose job (service_completed_successfully): it is meant to exit
+	Expected         bool   // the engine stopped, removed or restarted it
+	Gone             bool   // removed right after: only vops (or someone by hand) removes containers
+	Stopping         bool   // the daemon is shutting down (the host too, probably)
+	Canary           string // a release's canary container (its release id): its death rejects the release, no alert
 }
 
 // classify says which alerts a death raises: none for anything vops (or the host shutting down) caused, for jobs
 // (they exit; their failures are deploy failures) and previews; else a restart, and an oom when it was killed.
 func classify(d Death) []string {
-	if d.Expected || d.Gone || d.Stopping || d.Job || d.Project == "" || strings.Contains(d.Project, "@") {
+	if d.Expected || d.Gone || d.Stopping || d.Job || d.Canary != "" || d.Project == "" || strings.Contains(d.Project, "@") {
 		return nil
 	}
 	if d.OOMKilled || d.ExitCode == 137 {

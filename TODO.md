@@ -16,7 +16,8 @@ Timeouts, header size and connection caps are done (reference/decisions.md, "The
 
 ## Releases
 
-- Manual approval per project: `x-vops.approve: true`. A push that would redeploy records a pending release (repo, tag, digest, who pushed) instead of deploying; the dashboard shows Approve/Reject; approve runs the same apply as `onPush`. Needs a `pending_releases` table, a badge like "pending changes" and an `approval` notification kind.
+- Release modes: scheduled approval is Approve-at-a-time. Open: also a config window where pushes go live at a fixed hour without approval (a different feature)?
+- Release modes: automatic canary analysis (promote/reject on the 5xx ratio) if a human deciding turns out to be the bottleneck.
 - Tag semantics to document (they already work this way): a service on `myapp:v2.1.8` only redeploys when `v2.1.8` itself is pushed again; pushing `latest` does nothing to it. Warn when a push overwrites an existing non-`latest` tag.
 - Prebuilt release binaries (amd64/arm64) so install and CI don't need go.
 

@@ -8,7 +8,8 @@ gen:
 
 test:
     go vet ./...
-    go test -race ./...
+    go test -race -timeout 40m $(go list ./... | grep -v /e2e$)
+    go test -race -timeout 40m -count=1 ./e2e  # it builds the binary: a cached pass may be stale
 
 release:
     for arch in amd64 arm64; do CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -ldflags "-s -w -X main.version={{version}}" -o dist/vops-linux-$arch ./cmd/vops; done

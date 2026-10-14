@@ -350,6 +350,7 @@ $("scrim").onclick = () => document.body.classList.remove("nav-open");
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") document.body.classList.remove("nav-open"); });
 $pending.append(h("span", { class: "dot warn" }), h("span", {}, "Pending", h("span", { class: "long" }, " changes")));
 $pending.onclick = openPlan;
+const $waiting = $("waiting");
 
 // the proxy process serves every site; the dashboard may still be up (ui listener, `vops ui`) when it isn't
 const proxyChip = (px) => !px ? null : h("span", { title: px.up ? "proxy v" + px.version + " serves " + px.routes + " routes" + (px.in_sync ? "" : ", not the daemon's current table") : "the proxy is not running: sites are down" },
@@ -363,6 +364,10 @@ function renderChrome(st) {
     proxyChip(st.proxy),
     st.user ? h("span", { title: "logged in as " + st.user }, icon("user"), st.user) : null);
   $pending.hidden = !st.changes;
+  const waiting = (st.releases || []).length;
+  $waiting.hidden = !waiting;
+  $waiting.title = "pushes waiting for Approve (x-vops.release)";
+  $waiting.replaceChildren(h("span", { class: "dot warn" }), h("span", {}, waiting + " waiting", h("span", { class: "long" }, " approval")));
   $alertBadge.hidden = !st.alerts;
   $alertBadge.textContent = st.alerts || "";
   const sig = JSON.stringify([st.projects.map((p) => [p.path, health(p)]), st.previews]);
@@ -464,6 +469,7 @@ function projectList(st) {
       h("span", { class: "mono sname" }, s.name),
       h("span", { class: "doms small" }, s.domains.slice(0, 2).map((d) => h("a", { href: domainURL(st, d), target: "_blank", rel: "noopener" }, d))),
       s.pin ? h("span", { class: "tag warn", title: "rolled back: compose says " + s.pin.compose_image }, "pinned · #" + s.pin.deploy_id) : null,
+      holdTag(s),
       s.pending ? h("span", { class: "tag warn" }, "pending " + s.pending) : null)));
   }
   return panel(panelHead(h("h2", {}, "Projects"), h("span", { class: "tag" }, st.projects.length)), h("div", { class: "plist" }, rows));
@@ -473,19 +479,125 @@ async function overview(alive) {
   let st;
   try { st = await getStatus(); } catch (e) { return failed(e, alive); }
   if (!alive()) return;
+  const top = h("div", {}), bottom = h("div", {}), releases = releasesPanel();
+  page(top, releases.el, bottom);
   const render = (st) => {
     // a pin is a temporary emergency state: always visible
     const pins = st.projects.flatMap((p) => p.services.filter((s) => s.pin).map((s) => h("li", {}, h("a", { href: projectHref(p.path) }, p.path + "/" + s.name), " is pinned to the image of #" + s.pin.deploy_id + " (rolled back); compose says ", mono(s.pin.compose_image))));
     const warns = [...(st.warnings || []).map((w) => h("li", {}, w)), ...pins];
-    return page(
+    put(top,
     head({ title: "Overview", sub: [h("span", {}, "~/vops at ", mono(short(st.commit, 8) || "no commits yet")), sep(), st.domain || "no domain set in vops.yml"] }),
     warns.length ? alertBox("warn", warns.length === 1 ? "Warning" : warns.length + " warnings", h("ul", { class: "small" }, warns)) : null,
-    st.changes ? alertBox("info", "The host differs from git", h("span", { class: "small muted" }, "Changes are waiting to be applied (a push, env vars or enable/disable)."), h("button", { class: "btn primary sm", onclick: openPlan }, "Review and apply")) : null,
-    stats(st),
-    projectList(st));
+    st.changes ? alertBox("info", "The host differs from git", h("span", { class: "small muted" }, "Changes are waiting to be applied (a push, env vars or enable/disable)."), h("button", { class: "btn primary sm", onclick: openPlan }, "Review and apply")) : null);
+    releases.update(st);
+    put(bottom, stats(st), projectList(st));
   };
   render(st);
   onStatus = render;
+}
+
+// ---- releases (x-vops.release manual or canary): pushes waiting for an admin
+
+const relImage = (r) => [mono(r.repo + ":" + r.tag), h("span", { class: "faint mono" }, " @" + short(r.digest, 12))];
+const RELEASE_STATE = { pending: "warn", approved: "ok", rejected: "bad", failed: "bad", superseded: "" };
+
+// holdTag: a service keeping what it runs while its tag points at a push nobody approved
+function holdTag(s, style) {
+  const x = s.hold;
+  if (!x) return null;
+  const r = x.release;
+  const text = r && r.status === "pending" ? "waiting approval · #" + r.id : r ? "#" + r.id + " " + r.status : "held";
+  return h("span", { class: "tag warn", style, title: `${x.image} points at ${short(x.pushed, 12)}; runs ${x.running ? short(x.running, 12) : "nothing yet"} until a release is approved` }, text);
+}
+
+// canaryInfo: a service's canary container, its share, age and 5xx next to the stable's, and links that put
+// this browser on it (or back) on the real domain (?vops-canary=on|off sets the proxy's cookie)
+function canaryInfo(ctx, s) {
+  const c = s.canary;
+  if (!c || c.action === "remove") return null;
+  const stats = (ctx.p.canaries || {})[s.name];
+  const rate = (g) => g.requests ? `${g.errors} of ${g.requests} (${(100 * g.errors / g.requests).toFixed(1)}%)` : "no requests yet";
+  const url = s.domains.length ? domainURL(ctx.st, s.domains[0]) + "/?vops-canary=" : null;
+  return h("div", { class: "small", style: "margin-top:4px" },
+    h("span", { class: "tag accent" }, "canary · " + c.weight + "% · #" + c.release), " ", c.since ? ["since ", when(c.since)] : c.action,
+    stats ? h("div", { class: "muted" }, "5xx: canary " + rate(stats.canary) + ", stable " + rate(stats.stable)) : null,
+    url ? h("div", {}, h("a", { href: url + "on", target: "_blank", rel: "noopener", title: "Sets a cookie on that domain: this browser gets the canary" }, "Open the canary"), " · ",
+      h("a", { href: url + "off", target: "_blank", rel: "noopener" }, "back to stable")) : null);
+}
+
+function releaseRow(r) {
+  const approve = async () => (await confirmDialog({ title: `Approve #${r.id}?`, ok: "Approve",
+    body: [h("p", {}, "Deploys " + r.repo + ":" + r.tag + " " + short(r.digest, 12) + " to " + r.project + " now (rolling)" + (r.mode === "canary" ? ", then removes the canary." : "."))] })) && streamDialog({ title: `Approving #${r.id} in ${r.project}`, path: "/releases/approve", body: { id: r.id },
+    done: (ok) => { if (ok) toast("Approved #" + r.id); refreshStatus().catch(() => {}); } });
+  const reject = async () => {
+    if (!(await confirmDialog({ title: `Reject #${r.id}?`, ok: "Reject", danger: true,
+      body: [h("p", {}, r.repo + ":" + r.tag + " " + short(r.digest, 12) + " won't be deployed. The services keep what they run until a newer push of the tag.")] }))) return;
+    streamDialog({ title: `Rejecting #${r.id}`, path: "/releases/reject", body: { id: r.id },
+      done: (ok) => { if (ok) toast("Rejected #" + r.id); refreshStatus().catch(() => {}); } });
+  };
+  let inputValue = localInput(r.approve_at || Math.floor(Date.now() / 1000) + 3600);
+  const at = h("input", { type: "datetime-local", value: inputValue, "aria-label": "approve at" });
+  const schedule = async (unix) => {
+    try {
+      await api("POST", "/releases/schedule", { id: r.id, at: unix });
+      toast(unix ? "#" + r.id + " will be approved " + fmtUnix(unix) : "Schedule cancelled");
+      refreshStatus().catch(() => {});
+    } catch (e) { toast(e.message); }
+  };
+  const later = h("form", { class: "row", onsubmit: (e) => { e.preventDefault(); const t = Math.floor(new Date(at.value).getTime() / 1000); if (t) schedule(t); } },
+    at, h("button", { class: "btn sm" }, "Approve at"));
+  const scheduled = h("div", { class: "small" });
+  const pushed = h("span", { class: "muted small" });
+  const el = h("div", { class: "release" },
+    h("div", { class: "row wrap" }, h("strong", {}, "#" + r.id), h("a", { href: projectHref(r.project) }, r.project), relImage(r),
+      h("span", { class: "tag" + (r.mode === "canary" ? " accent" : "") }, r.mode === "canary" ? "canary " + r.weight + "%" : "manual"),
+      pushed),
+    scheduled,
+    h("div", { class: "row wrap" }, h("button", { class: "btn primary sm", onclick: approve }, "Approve now"), later, h("button", { class: "btn danger sm", onclick: reject }, "Reject")));
+  const update = (next) => {
+    if (next.approve_at !== r.approve_at) {
+      const value = localInput(next.approve_at || Math.floor(Date.now() / 1000) + 3600);
+      if (at.value === inputValue && document.activeElement !== at) at.value = value;
+      inputValue = value;
+    }
+    r = next;
+    put(pushed, "pushed by " + (r.pushed_by || "?") + " ", when(r.created_at));
+    scheduled.hidden = !r.approve_at;
+    put(scheduled, r.approve_at ? ["Approved automatically " + fmtUnix(r.approve_at) + " (scheduled by " + r.decided_by + ") ", h("button", { class: "linkbtn", onclick: () => schedule(0) }, "Cancel")] : []);
+  };
+  update(r);
+  return { el, update };
+}
+
+// releasesPanel lists the pending releases (of one project, or all of them)
+function releasesPanel(path) {
+  const title = h("span", {}), list = h("div", { class: "releases" }), rows = new Map();
+  const el = alertBox("warn", title,
+    h("div", { class: "releases" }, h("span", { class: "small muted" }, "Approve deploys exactly that digest (rolling); Reject keeps what runs until a newer push. Nothing else deploys it, not even an apply."), list));
+  return { el, update(st) {
+    const rs = (st.releases || []).filter((r) => !path || r.project === path);
+    el.hidden = !rs.length;
+    title.textContent = rs.length === 1 ? "A push waits for approval" : rs.length + " pushes wait for approval";
+    for (const [id, row] of rows) {
+      if (!rs.some((r) => r.id === id)) { row.el.remove(); rows.delete(id); }
+    }
+    rs.forEach((r, i) => {
+      let row = rows.get(r.id);
+      if (!row) { row = releaseRow(r); rows.set(r.id, row); list.insertBefore(row.el, list.children[i] || null); }
+      row.update(r);
+    });
+  } };
+}
+
+function releaseNode(r, at) {
+  return h("li", { class: "tl-node release" + (r.status === "rejected" || r.status === "failed" ? " failed" : "") },
+    h("span", { class: "tl-dot" }),
+    h("div", { class: "tl-body" },
+      h("div", { class: "tl-head" }, h("strong", {}, ["Push ", h("span", { class: "faint" }, "r#" + r.id)]), h("span", { class: "tag " + (RELEASE_STATE[r.status] || "") }, r.status),
+        h("span", { class: "tag" + (r.mode === "canary" ? " accent" : "") }, r.mode === "canary" ? "canary " + r.weight + "%" : "manual"),
+        h("span", { class: "spacer" }), h("span", { class: "muted small" }, when(at))),
+      h("div", { class: "tl-line small" }, relImage(r), h("span", { class: "muted" }, " pushed by " + (r.pushed_by || "?"))),
+      r.status !== "pending" && (r.decided_by || r.note) ? h("div", { class: "small muted wrapany" }, r.status, r.decided_by ? " by " + r.decided_by : "", r.decided_at ? [" ", when(r.decided_at)] : "", r.note ? ": " + r.note : "") : null));
 }
 
 // ---- one project: header + tabs. Add a tab by adding an entry here.
@@ -511,16 +623,18 @@ async function projectPage(alive, path, tabId, params) {
   const tab = TABS.find((t) => t.id === (TAB_ALIASES[tabId] || tabId)) || TABS[0];
   const ctx = { path, p: find(st), st, params, reload: null };
   const headBox = h("div", {}), alerts = h("div", {}), body = h("div", { class: tab.fill ? "grow" : "" }), tabs = h("nav", { class: "tabs" });
+  const releases = releasesPanel(path);
   const renderHead = () => {
     headBox.replaceChildren(projectHead(ctx));
     put(alerts, ctx.p.error ? alertBox("bad", "Invalid compose file", h("pre", {}, ctx.p.error)) : null, restoredBanner(ctx));
+    releases.update(ctx.st);
     tabs.replaceChildren(...TABS.map((t) => {
       const n = t.id === "services" ? ctx.p.services.length : t.count ? t.count(ctx) : null;
       return h("a", { href: projectHref(path, t.id), class: t === tab ? "active" : null }, t.label, n ? h("span", { class: "count" }, n) : null);
     }));
   };
   $app.className = tab.fill ? "fill" : "";
-  page(headBox, alerts, tabs, body);
+  page(headBox, alerts, releases.el, tabs, body);
   renderHead();
   tab.render(ctx, body);
   onStatus = (st) => {
@@ -564,7 +678,8 @@ function servicesTab(ctx, box) {
       h("td", {}, h("div", { class: "mono" }, s.name),
         s.domains.map((d) => h("div", { class: "small wrapany" }, h("a", { href: domainURL(st, d), target: "_blank", rel: "noopener" }, d))),
         s.pending ? h("span", { class: "tag warn", style: "margin-top:4px" }, "pending " + s.pending + (s.reason ? ": " + s.reason : "")) : null,
-        s.pin ? h("span", { class: "tag warn", style: "margin-top:4px", title: "Rolled back: runs the image deploy #" + s.pin.deploy_id + " ran; compose says " + s.pin.compose_image }, "pinned · #" + s.pin.deploy_id) : null),
+        s.pin ? h("span", { class: "tag warn", style: "margin-top:4px", title: "Rolled back: runs the image deploy #" + s.pin.deploy_id + " ran; compose says " + s.pin.compose_image }, "pinned · #" + s.pin.deploy_id) : null,
+        holdTag(s, "margin-top:4px"), canaryInfo(ctx, s)),
       h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "ctr small" }, h("span", { class: "dot " + stateOf(c) }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
       h("td", { class: "mono small wrap", title: s.image }, shortImage(s.image)),
       h("td", { class: "actions-cell" }, h("div", { class: "actions" }, h("a", { class: "btn sm", href: projectHref(path, "logs", "?service=" + enc(s.name)) }, "Logs"), restart,
@@ -843,6 +958,7 @@ function timelineTab(ctx, box) {
     };
     const chips = (n) => n.previews.map((name) => h("a", { class: "tag accent", href: projectHref(path, "previews"), title: "preview " + name + " branched from here" }, icon("git"), name));
     const node = (n) => {
+      if (n.kind === "release") return releaseNode(n.release, n.at);
       const dep = n.deploy, s = n.snapshot;
       let title, cls = n.kind;
       if (n.kind === "deploy") {
