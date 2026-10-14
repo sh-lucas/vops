@@ -59,34 +59,21 @@ func (e *Engine) holdRelease(ctx context.Context, src source, mode compose.Relea
 		}
 		return e.resolveAt(ctx, src.root, sp, domain, a.Digest)
 	}
-	if !mode.Gated() || !sp.Watch {
-		return d, nil
-	}
 	ran, hasRan := src.ran[sp.Service]
-	known := hasRan && ran.Image == sp.Image // the newest deploy row says what it runs from this tag
-	waiting := about && (rel.Status == "pending" || rel.Status == "rejected")
-	switch {
-	case known && ran.Digest == d.digest:
-		return d, nil // runs what the tag says
-	case about && (rel.Status == "approved" || rel.Status == "failed"):
+	in := gateInput{Gated: mode.Gated(), Watch: sp.Watch, HasRan: hasRan, Known: hasRan && ran.Image == sp.Image, Running: src.running[sp.Service],
+		Job: sp.Job, Canaryable: canaryable(sp), Digest: d.digest}
+	if in.Known {
+		in.RanDigest = ran.Digest
+	}
+	if about {
+		in.Status, in.Mode = rel.Status, rel.Mode
+	}
+	v := decideGate(in)
+	d.gate = v.Gate
+	if !v.Hold {
 		return d, nil
-	case about && rel.Status == "pending" && rel.Mode == "canary" && sp.Job:
-		return d, nil // a canary's jobs (migrations) run at push
 	}
-	d.gate = "held"
-	if !known {
-		d.gate = "new"
-		// running but on no row (pruned by retention): its digest is unknown, it waits. Else compose just added the
-		// service or changed its image (explicit, in git), or a pin runs another ref: an apply deploys it, unless a
-		// pending or rejected release is about that digest
-		if !waiting && !(src.running[sp.Service] && !hasRan) {
-			return d, nil
-		}
-	}
-	h := &Hold{Service: sp.Service, Image: sp.Image, Pushed: d.digest}
-	if known {
-		h.Running = ran.Digest
-	}
+	h := &Hold{Service: sp.Service, Image: sp.Image, Running: in.RanDigest, Pushed: d.digest}
 	if about {
 		h.Release = &rel
 	}
@@ -97,11 +84,53 @@ func (e *Engine) holdRelease(ctx context.Context, src source, mode compose.Relea
 			return nil, err
 		}
 	}
-	held.hold, held.gate = h, d.gate
-	if about && rel.Status == "pending" && rel.Mode == "canary" && canaryable(sp) && h.Running != "" {
+	held.hold, held.gate = h, v.Gate
+	if v.Canary {
 		held.canary, held.release = d, &rel
 	}
 	return held, nil
+}
+
+// gateInput is what decides whether a service on one of our tags deploys where the tag points.
+type gateInput struct {
+	Gated, Watch bool   // the project's x-vops.release is manual or canary; the service watches its tag
+	HasRan       bool   // a deploy row has the service
+	Known        bool   // ...with the same image ref as compose's
+	RanDigest    string // what that row says it runs (Known only)
+	Running      bool   // it has containers
+	Job          bool
+	Canaryable   bool   // routed with rolling
+	Digest       string // where the tag points
+	Status, Mode string // the newest release of the tag, when it is about Digest ("" = none)
+}
+
+// gateVerdict: Gate is "" (deploys), "held" or "new" (no digest on record: a push of the tag makes a release);
+// Hold keeps it on RanDigest (or, without one, as it is); Canary gives it a canary container.
+type gateVerdict struct {
+	Gate         string
+	Hold, Canary bool
+}
+
+// decideGate is the release rules (see the top of this file), pure.
+func decideGate(in gateInput) gateVerdict {
+	waiting := in.Status == "pending" || in.Status == "rejected"
+	switch {
+	case !in.Gated || !in.Watch:
+		return gateVerdict{}
+	case in.Known && in.RanDigest == in.Digest:
+		return gateVerdict{} // runs what the tag says
+	case in.Status == "approved" || in.Status == "failed":
+		return gateVerdict{}
+	case in.Status == "pending" && in.Mode == "canary" && in.Job:
+		return gateVerdict{} // a canary's jobs (migrations) run at push
+	case !in.Known && !waiting && !(in.Running && !in.HasRan):
+		// compose just added the service or changed its image (explicit, in git), or a pin runs another ref: an
+		// apply deploys it. Running on no row at all (pruned by retention): its digest is unknown, it waits
+		return gateVerdict{Gate: "new"}
+	case !in.Known:
+		return gateVerdict{Gate: "new", Hold: true}
+	}
+	return gateVerdict{Gate: "held", Hold: true, Canary: in.Status == "pending" && in.Mode == "canary" && in.Canaryable && in.RanDigest != ""}
 }
 
 // ReleaseEvent tells the daemon about a release: held (a push waits), approved, rejected, failed.
