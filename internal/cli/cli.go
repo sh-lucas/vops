@@ -59,7 +59,9 @@ anywhere (forwarded to the host over ssh when run inside a linked repo):
                                      back to right before a deploy (default: the last one): its images
                                      (pinned by digest) and its data; undo: rollback <project> <rollback-id>
   unpin <project> [service...]       back to the images compose says (rolling)
-  history <project> [-n N]           deploys, rollbacks and snapshots, newest first
+  history <project> [-n N]           deploys, rollbacks, releases and snapshots, newest first
+  releases [project]                 pushes to projects with x-vops.release manual or canary, and their fate
+  releases approve|reject <id>       what the dashboard's Approve and Reject do
   admin password                     same as user password admin
   events [project]                   what happened (deploys, pushes, config)
   notifications                      open alerts (being pushed to the dashboard's devices)
@@ -146,7 +148,7 @@ func dispatch(g globals, cmd string, rest []string) (err error) {
 		err = cmdRollback(g, rest)
 	case "preview":
 		err = cmdPreview(g, rest)
-	case "status", "plan", "logs", "restart", "enable", "disable", "registry", "events", "notifications", "audit", "history", "unpin":
+	case "status", "plan", "logs", "restart", "enable", "disable", "registry", "events", "notifications", "audit", "history", "unpin", "releases":
 		err = forward(g, cmd, rest, os.Stdin, os.Stdout)
 	default:
 		err = fmt.Errorf("unknown command %q\n\n%s", cmd, usage)

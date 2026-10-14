@@ -118,9 +118,10 @@ type Timeline struct {
 
 // Node is one point of the timeline: a deploy, a rollback, or a snapshot not taken by either (manual ones).
 type Node struct {
-	Kind     string                       `json:"kind"` // deploy | rollback | snapshot
+	Kind     string                       `json:"kind"` // deploy | rollback | snapshot | release
 	At       int64                        `json:"at"`
 	Deploy   *store.Deploy                `json:"deploy,omitempty"`
+	Release  *store.Release               `json:"release,omitempty"` // a push to a gated project (x-vops.release) and its fate
 	Snapshot *store.Snapshot              `json:"snapshot,omitempty"` // the data right before this event (or the snapshot itself); nil when none or pruned
 	Commit   string                       `json:"commit"`             // deploys: the commit deployed; snapshots: the commit running when taken
 	Images   map[string]store.DeployImage `json:"images"`
@@ -239,6 +240,13 @@ func (e *Engine) Timeline(ctx context.Context, project string) (Timeline, error)
 		}
 		t.Nodes = append(t.Nodes, n)
 	}
+	releases, err := e.DB.Releases(project, historyLimit)
+	if err != nil {
+		return t, err
+	}
+	for i, r := range releases {
+		t.Nodes = append(t.Nodes, Node{Kind: "release", At: r.CreatedAt, Release: &releases[i], Images: map[string]store.DeployImage{}, Changes: []ImageChange{}})
+	}
 	// newest first; at the same second a deploy comes after (above) a snapshot: snapshots never run during one
 	slices.SortStableFunc(t.Nodes, func(a, b Node) int {
 		if a.At != b.At {
@@ -295,7 +303,7 @@ func (e *Engine) available(img store.DeployImage) bool {
 	return !ok || e.Registry.Resolve(repo, img.Digest) != ""
 }
 
-// KeepDigests is what registry gc must keep untagged: the digests that pins, previews and the newest keep
+// KeepDigests is what registry gc must keep untagged: the digests that pins, previews, pending releases and the newest keep
 // deploys of every project run, so rollback and "Preview from here" still find them.
 func (e *Engine) KeepDigests(keep int) (map[string]bool, error) {
 	out := map[string]bool{}
@@ -319,6 +327,13 @@ func (e *Engine) KeepDigests(keep int) (map[string]bool, error) {
 		for _, img := range pv.Images {
 			add(img)
 		}
+	}
+	pending, err := e.DB.PendingReleases()
+	if err != nil {
+		return nil, err
+	}
+	for _, r := range pending {
+		out[r.Digest] = true
 	}
 	images, err := e.DB.RecentDeployImages(keep)
 	for _, img := range images {

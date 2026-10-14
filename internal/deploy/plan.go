@@ -60,6 +60,8 @@ type Engine struct {
 
 	// OnDeploy hears every deploy that changed something (err nil = ok) and every failed rollback or preview (notifications)
 	OnDeploy func(project string, err error)
+	// OnRelease hears what happens to releases (x-vops.release): held, approved, rejected, superseded, failed
+	OnRelease func(ReleaseEvent)
 
 	mu       sync.Mutex    // one apply at a time
 	busy     atomic.Bool   // an apply, rollback, restart, preview or snapshot holds mu
@@ -91,6 +93,7 @@ type ProjectPlan struct {
 	Error    string     `json:"error,omitempty"`
 	Actions  []Action   `json:"actions"`
 	Pins     []PinState `json:"pins,omitempty"`   // services running a past image (image rollback)
+	Holds    []Hold     `json:"holds,omitempty"`  // services waiting for a release's approval (x-vops.release)
 	Limits   string     `json:"limits,omitempty"` // proxy limits from x-vops, when they change: "old -> new"
 
 	limits string // desired limits (json proxy.Limits, '' = none)
@@ -124,6 +127,8 @@ type desired struct {
 
 	pin     *store.Pin // runs a pinned image instead of compose's (image rollback)
 	compose *desired   // pinned: what compose says
+	hold    *Hold      // keeps running Hold.Running instead of the pushed digest (x-vops.release)
+	gate    string     // what a push of its tag does in a gated project: "" deploys, "held" or "new" (never ran) waits
 }
 
 // Changes reports whether the plan does anything.
@@ -189,6 +194,9 @@ func (p *Plan) Print(w io.Writer) {
 		if pp.Limits != "" {
 			fmt.Fprintf(w, "  ~ limits: %s\n", pp.Limits)
 		}
+		for _, h := range pp.Holds {
+			fmt.Fprintf(w, "  ? %s\n", h.Text())
+		}
 		for _, pin := range pp.Pins {
 			if pin.Stale != "" {
 				fmt.Fprintf(w, "  @ %s: pin to #%d dropped (%s)\n", pin.Service, pin.DeployID, pin.Stale)
@@ -236,7 +244,10 @@ func DesiredProjects(ctx context.Context, repo string) (map[string][]string, err
 }
 
 // Plan computes what Apply would do.
-func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
+func (e *Engine) Plan(ctx context.Context) (*Plan, error) { return e.plan(ctx, nil) }
+
+// plan computes the plan; approve is the release being approved: its services run exactly its digest.
+func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error) {
 	plan := &Plan{Warnings: []string{}}
 	plan.Commit, _ = git(ctx, e.Repo, "rev-parse", "HEAD")
 	cfg, err := config.ReadRepo(e.Repo)
@@ -266,6 +277,21 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 	allPins, err := e.DB.Pins("")
 	if err != nil {
 		return nil, err
+	}
+	ran, err := e.DB.LatestDeploys()
+	if err != nil {
+		return nil, err
+	}
+	latest, err := e.DB.LatestReleases()
+	if err != nil {
+		return nil, err
+	}
+	releases := map[string]map[string]store.Release{} // project -> repo:tag -> its newest release
+	for _, r := range latest {
+		if releases[r.Project] == nil {
+			releases[r.Project] = map[string]store.Release{}
+		}
+		releases[r.Project][r.Repo+":"+r.Tag] = r
 	}
 	pins := map[string]map[string]store.Pin{}
 	for _, pin := range allPins {
@@ -326,7 +352,11 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) {
 			pp.Error = err.Error()
 			continue
 		}
-		if err := e.planProject(ctx, pp, source{root: e.Repo, files: files, env: env, pins: pins[p]}, cfg.Domain, &plan.Warnings); err != nil {
+		src := source{root: e.Repo, files: files, env: env, pins: pins[p], ran: ran[p].Images, releases: releases[p]}
+		if approve != nil && approve.Project == p {
+			src.approve = approve
+		}
+		if err := e.planProject(ctx, pp, src, cfg.Domain, &plan.Warnings); err != nil {
 			pp.Error = err.Error()
 			continue
 		}
@@ -393,6 +423,10 @@ type source struct {
 	images   map[string]string    // preview image overrides: service -> image
 	services []string             // what a preview is for (empty = every service with x-vops.preview)
 	pins     map[string]store.Pin // image rollback: service -> pinned image (projects only, previews ignore pins)
+
+	ran      map[string]store.DeployImage // what the newest deploy row says each service runs (release holds)
+	releases map[string]store.Release     // repo:tag -> its newest release
+	approve  *store.Release               // being approved: its services run exactly its digest
 }
 
 func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, domain string, warns *[]string) error {
@@ -444,6 +478,14 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 		if err != nil {
 			return fmt.Errorf("service %s: %w", sp.Service, err)
 		}
+		if d.own != "" && !compose.IsPreview(pp.Path) {
+			if d, err = e.holdRelease(ctx, src, proj.Release, d, domain); err != nil {
+				return fmt.Errorf("service %s: %w", sp.Service, err)
+			}
+			if d.hold != nil {
+				pp.Holds = append(pp.Holds, *d.hold)
+			}
+		}
 		if pin, ok := src.pins[sp.Service]; ok {
 			ps := PinState{Pin: pin}
 			if now := composeRef(d); now != pin.ComposeImage {
@@ -459,6 +501,10 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 			pp.Pins = append(pp.Pins, ps)
 		}
 		pp.specs[sp.Service] = d
+		if d.hold != nil && d.hold.Running == "" && len(pp.actual[sp.Service]) == 0 {
+			order = append(order, Action{sp.Service, "none", "waiting approval"}) // never ran: nothing to keep running
+			continue
+		}
 		order = append(order, compare(d, pp.actual[sp.Service]))
 	}
 	for _, s := range sortedKeys(pp.actual) {
@@ -529,6 +575,12 @@ func compare(d *desired, actual []podman.Container) Action {
 
 // resolve fixes the image of a spec and computes its hash. root is the git working tree the spec comes from.
 func (e *Engine) resolve(ctx context.Context, root string, sp *compose.Spec, domain string) (*desired, error) {
+	return e.resolveAt(ctx, root, sp, domain, "")
+}
+
+// resolveAt resolves an own-registry tag at a given digest instead of where the tag points now (release holds and
+// approvals): the hash is the one a deploy of that digest got, so a held service has nothing pending.
+func (e *Engine) resolveAt(ctx context.Context, root string, sp *compose.Spec, domain, at string) (*desired, error) {
 	d := &desired{spec: sp, image: sp.Image}
 	h := sha256.New()
 	w := func(s ...string) {
@@ -558,7 +610,9 @@ func (e *Engine) resolve(ctx context.Context, root string, sp *compose.Spec, dom
 	default:
 		if repo, ref, ok := e.ownImage(sp.Image, domain); ok {
 			digest := ref
-			if !strings.HasPrefix(ref, "sha256:") {
+			if at != "" && !strings.HasPrefix(ref, "sha256:") {
+				digest = at
+			} else if !strings.HasPrefix(ref, "sha256:") {
 				digest = e.Registry.Resolve(repo, ref)
 				if digest == "" {
 					return nil, fmt.Errorf("image %s is not in the vops registry yet (push it first)", sp.Image)
@@ -685,6 +739,7 @@ type ServiceState struct {
 	Pending    string             `json:"pending,omitempty"` // create | update | start | remove
 	Reason     string             `json:"reason,omitempty"`
 	Pin        *store.Pin         `json:"pin,omitempty"`     // runs a past image (image rollback), not what compose says
+	Hold       *Hold              `json:"hold,omitempty"`    // waits for a release's approval (x-vops.release)
 	Preview    bool               `json:"preview,omitempty"` // has x-vops.preview: it can get a preview
 	Containers []podman.Container `json:"containers"`
 }
@@ -712,6 +767,11 @@ func (pp *ProjectPlan) Services() []ServiceState {
 				st.Domains = []string{}
 			}
 			st.Pin = d.pin
+			if d.hold != nil {
+				st.Hold = d.hold
+			} else if d.compose != nil {
+				st.Hold = d.compose.hold
+			}
 			if pp.project != nil && pp.project.Services[n] != nil {
 				st.Preview = pp.project.Services[n].Vops.Preview != nil
 			}

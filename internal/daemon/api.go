@@ -111,7 +111,8 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			Proxy    ProxyState `json:"proxy"`
 			User     string     `json:"user"`   // who is logged in ("cli" on the socket)
 			Alerts   int        `json:"alerts"` // open alerts the user can see (the sidebar badge)
-		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r), d.openAlerts(r)}
+			Releases []store.Release `json:"releases"` // pending (x-vops.release): the "waiting approval" badge
+		}{plan.Domain, plan.Commit, plan.Changes(), slices.Concat(pwarns, plan.Warnings, d.backupWarnings()), []project{}, []preview{}, px, actor(r), d.openAlerts(r), must(d.DB.PendingReleases())}
 		for _, pp := range plan.Projects {
 			f := flags[pp.Path]
 			var ld *store.Deploy
@@ -685,6 +686,64 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		}
 		return nil
 	})
+	h("GET /api/releases", func(w http.ResponseWriter, r *http.Request) error {
+		project := r.URL.Query().Get("project")
+		if project != "" {
+			if err := validProject(project, "", false); err != nil {
+				return err
+			}
+		}
+		rs, err := d.DB.Releases(project, 200)
+		if err != nil {
+			return err
+		}
+		writeJSON(w, rs)
+		return nil
+	})
+	// approve and reject stream like apply; schedule answers json
+	h("POST /api/releases/approve", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct{ ID int64 }
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if err := d.Engine.Approve(context.WithoutCancel(r.Context()), flushWriter{w}, in.ID, actor(r)); err != nil {
+			fmt.Fprintf(w, "==> error: %v\n", err)
+		} else {
+			fmt.Fprintln(w, "==> ok")
+		}
+		return nil
+	})
+	h("POST /api/releases/reject", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct {
+			ID   int64
+			Note string
+		}
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		if err := d.Engine.Reject(context.WithoutCancel(r.Context()), flushWriter{w}, in.ID, actor(r), trunc(in.Note, 200)); err != nil {
+			fmt.Fprintf(w, "==> error: %v\n", err)
+		} else {
+			fmt.Fprintln(w, "==> ok")
+		}
+		return nil
+	})
+	h("POST /api/releases/schedule", func(w http.ResponseWriter, r *http.Request) error {
+		var in struct{ ID, At int64 }
+		if err := readJSON(r, &in); err != nil {
+			return err
+		}
+		if err := d.Engine.Schedule(in.ID, in.At, actor(r)); err != nil {
+			return err
+		}
+		writeJSON(w, map[string]bool{"ok": true})
+		return nil
+	})
+
 	// unpin: back to what compose says for these services (all pinned ones if none), streamed like apply
 	h("POST /api/unpin", func(w http.ResponseWriter, r *http.Request) error {
 		var in struct {

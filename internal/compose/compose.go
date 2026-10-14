@@ -30,6 +30,7 @@ type Project struct {
 	Inactive []string // services left out by COMPOSE_PROFILES
 	Copied   []string // previews: services whose data is copied from production (PreviewRun)
 	Limits   Limits   // top-level x-vops rate, burst, max_body, timeout: the proxy applies them to every routed service
+	Release  Release  // top-level x-vops.release: how a registry push reaches the services
 	Warnings []string
 	Refs     map[string]bool                // every ${VAR} the files use
 	EnvRefs  map[string]map[string][]string // service -> environment key -> the ${VAR}s its value uses
@@ -699,7 +700,7 @@ func (p *Project) topVops(root *yaml.Node) error {
 			continue
 		}
 		v := root.Content[i+1]
-		if err := strictKeys(v, "rate", "burst", "max_body", "timeout"); err != nil {
+		if err := strictKeys(v, "rate", "burst", "max_body", "timeout", "release"); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
 		}
 		var top struct {
@@ -707,6 +708,7 @@ func (p *Project) topVops(root *yaml.Node) error {
 			Burst   *int   `yaml:"burst"`
 			MaxBody string `yaml:"max_body"`
 			Timeout string `yaml:"timeout"`
+			Release string `yaml:"release"`
 		}
 		if err := v.Decode(&top); err != nil {
 			return fmt.Errorf("x-vops: %w", err)
@@ -714,8 +716,44 @@ func (p *Project) topVops(root *yaml.Node) error {
 		if err := p.limits(top.Rate, top.Burst, top.MaxBody, top.Timeout); err != nil {
 			return fmt.Errorf("x-vops.%w", err)
 		}
+		if top.Release != "" {
+			if p.Release.Mode != "" {
+				return errors.New("x-vops.release is set in two compose files")
+			}
+			r, err := ParseRelease(top.Release)
+			if err != nil {
+				return fmt.Errorf("x-vops.release: %w", err)
+			}
+			p.Release = r
+		}
 	}
 	return nil
+}
+
+// Release is how a registry push reaches a project: deployed at once (auto), after an admin approves it
+// (manual), or first as one canary container per routed service taking Weight% of requests (canary).
+type Release struct {
+	Mode   string `json:"mode"`             // auto | manual | canary ("" = auto)
+	Weight int    `json:"weight,omitempty"` // canary: % of requests (1-99)
+}
+
+// Gated: a push waits for an approval.
+func (r Release) Gated() bool { return r.Mode == "manual" || r.Mode == "canary" }
+
+// ParseRelease reads "auto", "manual", "canary" or "canary 25%".
+func ParseRelease(s string) (Release, error) {
+	f := strings.Fields(s)
+	switch {
+	case len(f) == 1 && (f[0] == "auto" || f[0] == "manual"):
+		return Release{Mode: f[0]}, nil
+	case len(f) == 1 && f[0] == "canary":
+		return Release{Mode: "canary", Weight: 10}, nil
+	case len(f) == 2 && f[0] == "canary" && strings.HasSuffix(f[1], "%"):
+		if w, err := strconv.Atoi(strings.TrimSuffix(f[1], "%")); err == nil && w >= 1 && w <= 99 {
+			return Release{Mode: "canary", Weight: w}, nil
+		}
+	}
+	return Release{}, fmt.Errorf("want auto, manual, canary or canary <1-99>%%, got %q", s)
 }
 
 // Limits are the proxy's per-project request limits (zero = unlimited). Same fields as proxy.Limits.

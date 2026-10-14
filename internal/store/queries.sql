@@ -234,3 +234,33 @@ ON CONFLICT (key) DO UPDATE SET value = excluded.value;
 
 -- name: DeleteNotifySetting :exec
 DELETE FROM notify_settings WHERE key = ?;
+
+-- name: CreateRelease :one
+INSERT INTO releases (project, repo, tag, digest, mode, weight, pushed_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+RETURNING id;
+
+-- name: GetRelease :one
+SELECT * FROM releases WHERE id = ?;
+
+-- name: ListReleases :many
+-- newest first; '' = every project
+SELECT * FROM releases
+WHERE sqlc.arg(project) = '' OR project = sqlc.arg(project)
+ORDER BY id DESC LIMIT sqlc.arg(n);
+
+-- name: PendingReleases :many
+SELECT * FROM releases WHERE status = 'pending' ORDER BY id;
+
+-- name: LatestReleases :many
+-- the newest release of every project and repo:tag (it decides whether its services hold)
+SELECT * FROM releases WHERE id IN (SELECT max(id) FROM releases GROUP BY project, repo, tag);
+
+-- name: DecideRelease :execrows
+-- only a pending release changes its fate
+UPDATE releases SET status = ?, decided_by = ?, decided_at = ?, note = ?, approve_at = 0 WHERE id = ? AND status = 'pending';
+
+-- name: FailRelease :exec
+UPDATE releases SET status = 'failed', note = ? WHERE id = ? AND status = 'approved';
+
+-- name: ScheduleRelease :execrows
+UPDATE releases SET approve_at = ?, decided_by = ? WHERE id = ? AND status = 'pending';

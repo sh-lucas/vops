@@ -25,6 +25,7 @@ var Kinds = []Kind{
 	{"down", "Service down", "A routed service has no running replica, or doesn't answer its probe.", true, false},
 	{"health", "Unhealthy", "The health path answers 4xx/5xx, or the compose healthcheck fails.", true, false},
 	{"resources", "Resources", "Host cpu, memory, disk or memory pressure high for a while; containers near their limits.", true, false},
+	{"approval", "Waiting approval", "A push to a project with x-vops.release manual or canary waits for Approve; a canary failed.", true, false},
 	{"resolved", "Resolved", "Also tell me when an alert I got is over.", false, false},
 	{"deploy_ok", "Deploy succeeded", "Every successful deploy.", false, false},
 }

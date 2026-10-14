@@ -787,3 +787,49 @@ func (d *DB) DeletePin(project, service string) (bool, error) {
 	n, err := d.q.DeletePin(ctx, queries.DeletePinParams{Project: project, Service: service})
 	return n > 0, err
 }
+
+// ---- releases (x-vops.release manual or canary: a push waits for an admin)
+
+type Release = queries.Release
+
+// AddRelease records a pending release and returns its id.
+func (d *DB) AddRelease(r Release) (int64, error) {
+	return d.q.CreateRelease(ctx, queries.CreateReleaseParams{Project: r.Project, Repo: r.Repo, Tag: r.Tag, Digest: r.Digest, Mode: r.Mode,
+		Weight: r.Weight, PushedBy: r.PushedBy, CreatedAt: now()})
+}
+
+// GetRelease returns a release; found is false when it doesn't exist.
+func (d *DB) GetRelease(id int64) (r Release, found bool, err error) {
+	r, err = d.q.GetRelease(ctx, id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Release{}, false, nil
+	}
+	return r, err == nil, err
+}
+
+// Releases lists the newest n releases ("" = of every project), newest first.
+func (d *DB) Releases(project string, n int) ([]Release, error) {
+	return d.q.ListReleases(ctx, queries.ListReleasesParams{Project: project, N: int64(n)})
+}
+
+func (d *DB) PendingReleases() ([]Release, error) { return d.q.PendingReleases(ctx) }
+
+// LatestReleases is the newest release of every project and repo:tag.
+func (d *DB) LatestReleases() ([]Release, error) { return d.q.LatestReleases(ctx) }
+
+// DecideRelease moves a pending release to status (approved, rejected, superseded); false when it wasn't pending.
+func (d *DB) DecideRelease(id int64, status, by, note string) (bool, error) {
+	n, err := d.q.DecideRelease(ctx, queries.DecideReleaseParams{Status: status, DecidedBy: by, DecidedAt: now(), Note: note, ID: id})
+	return n > 0, err
+}
+
+// FailRelease marks an approved release whose deploy failed.
+func (d *DB) FailRelease(id int64, note string) error {
+	return d.q.FailRelease(ctx, queries.FailReleaseParams{Note: note, ID: id})
+}
+
+// ScheduleRelease sets when a pending release is approved (0 = not scheduled), and by whom.
+func (d *DB) ScheduleRelease(id, at int64, by string) (bool, error) {
+	n, err := d.q.ScheduleRelease(ctx, queries.ScheduleReleaseParams{ApproveAt: at, DecidedBy: by, ID: id})
+	return n > 0, err
+}

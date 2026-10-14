@@ -571,3 +571,32 @@ func TestLimits(t *testing.T) {
 		t.Errorf("limits in two files: %v", err)
 	}
 }
+
+func TestRelease(t *testing.T) {
+	svc := "services:\n  a:\n    image: x\n    x-vops: {port: 80}\n"
+	for _, c := range []struct {
+		top  string
+		want Release
+	}{
+		{"", Release{}},
+		{"x-vops: {release: auto}\n", Release{Mode: "auto"}},
+		{"x-vops: {release: manual}\n", Release{Mode: "manual"}},
+		{"x-vops: {release: canary}\n", Release{Mode: "canary", Weight: 10}},
+		{"x-vops: {release: canary 25%}\n", Release{Mode: "canary", Weight: 25}},
+		{"x-vops: {release: canary 1%, rate: 1/s}\n", Release{Mode: "canary", Weight: 1}},
+		{"x-vops: {release: canary 99%}\n", Release{Mode: "canary", Weight: 99}},
+	} {
+		p, err := load(t, "p", c.top+svc, nil)
+		if err != nil || p.Release != c.want {
+			t.Errorf("%q: %+v %v, want %+v", c.top, p.Release, err, c.want)
+		}
+	}
+	for _, bad := range []string{"canary 0%", "canary 100%", "canary 25", "canary 2.5%", "manually", "canary 10% 20%", "Manual"} {
+		if _, err := load(t, "p", "x-vops: {release: "+bad+"}\n"+svc, nil); err == nil || !strings.Contains(err.Error(), "x-vops.release") {
+			t.Errorf("%q: %v, want an x-vops.release error", bad, err)
+		}
+	}
+	if _, err := load(t, "p", "x-vops: {release: manual}\n"+svc, nil, "b.compose.yml", "x-vops: {release: canary}\n"); err == nil || !strings.Contains(err.Error(), "two compose files") {
+		t.Errorf("release in two files: %v", err)
+	}
+}

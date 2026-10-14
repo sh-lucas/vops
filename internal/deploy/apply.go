@@ -36,11 +36,12 @@ type ApplyOpts struct {
 	Trigger  string      // for the deploy history: sync | apply | ui | push | unpin (default apply)
 	Unpin    string      // drop the pins of Services first, saying why (a push brought a newer version, vops unpin)
 
-	noSnapshot bool // rollback: the data was just restored, no pre-deploy snapshot
+	noSnapshot bool           // rollback: the data was just restored, no pre-deploy snapshot
+	approve    *store.Release // its services run exactly its digest (Approve)
 }
 
 // Triggers are what can start a deploy, as the history records them.
-var Triggers = []string{"sync", "apply", "ui", "push", "unpin", "rollback"}
+var Triggers = []string{"sync", "apply", "ui", "push", "unpin", "rollback", "approve"}
 
 func (o ApplyOpts) wantsProject(project string) bool {
 	if len(o.Projects) > 0 && !slices.Contains(o.Projects, project) {
@@ -69,7 +70,12 @@ func (e *Engine) Apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan,
 			e.unpin(w, k.Project, k.Service, opts.Unpin)
 		}
 	}
-	plan, err := e.Plan(ctx)
+	return e.apply(ctx, w, opts)
+}
+
+// apply is Apply with the engine lock held.
+func (e *Engine) apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan, error) {
+	plan, err := e.plan(ctx, opts.approve)
 	if err != nil {
 		return nil, err
 	}

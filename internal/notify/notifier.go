@@ -185,6 +185,11 @@ func (n *Notifier) Deployed(project string, err error) {
 	n.Once("deploy_ok", project, project+" deployed", "", url)
 }
 
+// Approval says a push to a gated project (x-vops.release) waits for an admin.
+func (n *Notifier) Approval(project, title, body string) {
+	n.Once("approval", project, title, body, projectURL(project, "services"))
+}
+
 // Once pushes a notification that is no alert (successful deploys).
 func (n *Notifier) Once(kind, project, title, body, url string) {
 	n.mu.Lock()

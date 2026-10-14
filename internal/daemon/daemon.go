@@ -282,8 +282,9 @@ func (d *Daemon) forgetAuth() { d.authCache.Clear() }
 
 // ---- push trigger (the watchtower replacement, and previews from tags)
 
-func (d *Daemon) onPush(repo, tag, digest string) {
-	d.DB.Event("", "push", "%s:%s pushed (%.19s)", repo, tag, digest)
+func (d *Daemon) onPush(p registry.Push) {
+	repo, tag := p.Repo, p.Tag
+	d.DB.Event("", "push", "%s:%s pushed (%.19s) by %s", repo, tag, p.Digest, p.User)
 	ctx := context.Background()
 	plan, err := d.Engine.Plan(ctx)
 	if err != nil {
@@ -305,15 +306,11 @@ func (d *Daemon) onPush(repo, tag, digest string) {
 			d.DB.Event(t.Project, "error", "preview %s from %s:%s: %v", t.Name, repo, tag, err)
 		}
 	}
-	var keys []proxy.Key
-	for _, sv := range plan.Watching(repo, tag) {
-		keys = append(keys, sv)
-	}
-	if len(keys) == 0 {
+	if len(plan.Watching(repo, tag)) == 0 {
 		return
 	}
-	// a pinned service (image rollback) running this tag gets the newer version: its pin ends
-	if _, err := d.Engine.Apply(ctx, w, deploy.ApplyOpts{Services: keys, Trigger: "push", Unpin: repo + ":" + tag + " pushed"}); err != nil {
+	// auto projects deploy (ending pins); gated ones (x-vops.release) record a pending release
+	if err := d.Engine.Pushed(ctx, w, p); err != nil {
 		log.Printf("push trigger %s:%s: %v", repo, tag, err)
 	}
 }
@@ -512,6 +509,7 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		n++
 		d.Engine.Lock(func() { d.Engine.RefreshRoutes(ctx) })
 		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
+		d.Engine.DueReleases(ctx, &logWriter{prefix: "releases: "}, time.Now())
 		d.DB.PurgeSessions()
 		d.backupNow() // authorized_keys may have changed
 		d.monitor.Reconcile(ctx)
