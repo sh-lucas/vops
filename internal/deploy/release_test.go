@@ -48,7 +48,6 @@ func ownRegistry(t *testing.T, v *env) (*registry.Registry, string, func(repo, t
 		}
 		os.WriteFile(filepath.Join(dir, "Containerfile"), []byte(file), 0o644)
 		ref := addr + "/" + repo + ":" + tag
-		previous := reg.Resolve(repo, tag)
 		if _, err := podman.Run(ctx, "build", "-q", "-t", ref, dir); err != nil {
 			t.Fatal(err)
 		}
@@ -56,7 +55,7 @@ func ownRegistry(t *testing.T, v *env) (*registry.Registry, string, func(repo, t
 		if _, err := podman.Run(ctx, "push", "-q", "--tls-verify=false", "--creds", "ci:y", ref); err != nil {
 			t.Fatal(err)
 		}
-		return registry.Push{Repo: repo, Tag: tag, Digest: reg.Resolve(repo, tag), Previous: previous, User: "ci"}
+		return registry.Push{Repo: repo, Tag: tag, Digest: reg.Resolve(repo, tag), User: "ci"}
 	}
 	return reg, addr, push
 }

@@ -39,7 +39,6 @@ type Perm struct {
 // Push is a tag written by a client.
 type Push struct {
 	Repo, Tag, Digest string
-	Previous          string // what the tag pointed to before ("" = a new tag)
 	User              string // who pushed
 }
 
@@ -540,11 +539,7 @@ func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, user, n
 	if err := touch(reg.repoPath(name, "manifests", hexOf(digest)), mt); err != nil {
 		return errf(500, "UNKNOWN", "%v", err)
 	}
-	var previous string
 	if !isDigest {
-		if b, err := os.ReadFile(reg.repoPath(name, "tags", ref)); err == nil {
-			previous = strings.TrimSpace(string(b))
-		}
 		if err := touch(reg.repoPath(name, "tags", ref), digest); err != nil {
 			return errf(500, "UNKNOWN", "%v", err)
 		}
@@ -557,7 +552,7 @@ func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, user, n
 	w.Header().Set("Content-Length", "0")
 	w.WriteHeader(201)
 	if !isDigest && reg.OnPush != nil {
-		go reg.OnPush(Push{Repo: name, Tag: ref, Digest: digest, Previous: previous, User: user})
+		go reg.OnPush(Push{Repo: name, Tag: ref, Digest: digest, User: user})
 	}
 	return nil
 }

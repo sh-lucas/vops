@@ -28,7 +28,7 @@ func testRegistry(t *testing.T) (*Registry, *httptest.Server, chan string) {
 		t.Fatal(err)
 	}
 	pushed := make(chan string, 10)
-	reg.OnPush = func(p Push) { pushed <- p.Repo + ":" + p.Tag + " by " + p.User + " from " + p.Previous }
+	reg.OnPush = func(p Push) { pushed <- p.Repo + ":" + p.Tag + " by " + p.User }
 	reg.Auth = func(_ *http.Request, user, pass string) (*Perm, error) {
 		switch user + ":" + pass {
 		case "alice:secret":
@@ -80,7 +80,7 @@ func TestPodmanPushPull(t *testing.T) {
 	}
 	select {
 	case got := <-pushed:
-		if got != "app/web:v1 by alice from " {
+		if got != "app/web:v1 by alice" {
 			t.Fatalf("OnPush got %s", got)
 		}
 	case <-time.After(5 * time.Second):
