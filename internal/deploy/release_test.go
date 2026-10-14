@@ -4,12 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -363,6 +365,10 @@ services:
 
 	// a compose change of web rebuilds its canary with the new definition and the same digest
 	v.commit(compose("2"))
+	v.e.CheckCanaries(ctx, io.Discard)
+	if csNow := canaries(); len(csNow) != 1 || csNow[0].ID != cs[0].ID {
+		t.Fatal("housekeeping applied a compose change before apply")
+	}
 	if _, out, err := v.apply(ApplyOpts{}); err != nil || len(canaries()) != 1 || canaries()[0].ID == cs[0].ID {
 		t.Fatalf("compose change with a canary: %v %d\n%s", err, len(canaries()), out)
 	}
@@ -409,12 +415,37 @@ services:
 	// a newer push replaces the canary; its death rejects it
 	pushed(push(repo, "latest", "four"))
 	first := canaries()
+	// Lost confirmations preserve every potentially routed backend, even if the proxy applied the table.
+	v.e.Routes.OnChange = func() error { return errors.New("proxy confirmation lost") }
 	pushed(push(repo, "latest", "five"))
 	second := canaries()
-	if len(first) != 1 || len(second) != 1 || first[0].ID == second[0].ID || second[0].Labels[LRelease] != fmt.Sprint(latest().ID) {
+	if len(first) != 1 || len(second) != 2 || !slices.ContainsFunc(second, func(c podman.Container) bool { return c.ID == first[0].ID }) {
+		t.Fatalf("failed confirmation removed an old canary: %d %d", len(first), len(second))
+	}
+	v.e.CheckCanaries(ctx, &out)
+	if cs := canaries(); len(cs) != 2 || !slices.ContainsFunc(cs, func(c podman.Container) bool { return c.ID == second[0].ID }) || !slices.ContainsFunc(cs, func(c podman.Container) bool { return c.ID == second[1].ID }) {
+		t.Fatalf("failed retry replaced existing canaries: %+v", cs)
+	}
+	v.e.Routes.OnChange = nil
+	v.e.CheckCanaries(ctx, &out)
+	second = canaries()
+	if len(second) != 1 || first[0].ID == second[0].ID || second[0].Labels[LRelease] != fmt.Sprint(latest().ID) {
 		t.Fatalf("newer push: %d %d", len(first), len(second))
 	}
+	if as(fmt.Sprintf("%d.on", latest().ID)) != "five" || as(fmt.Sprintf("%d.off", latest().ID)) != "two" {
+		t.Fatal("retry did not restore the newest canary split")
+	}
+	v.e.Routes.OnChange = func() error { return errors.New("proxy confirmation lost") }
 	v.e.CanaryDied(ctx, p, "web", second[0].Labels[LRelease], "exited with code 2")
+	if len(canaries()) != 1 {
+		t.Fatal("rejection removed a potentially routed canary without confirmation")
+	}
+	v.e.RefreshRoutes(ctx)
+	if routes := v.e.Routes.Routes(); routes[0].Canary != nil {
+		t.Fatal("route refresh restored a rejected canary")
+	}
+	v.e.Routes.OnChange = nil
+	v.e.CheckCanaries(ctx, &out)
 	if r := latest(); r.Status != "rejected" || len(canaries()) != 0 || as("") != "two" {
 		t.Fatalf("dead canary: %+v %d", r, len(canaries()))
 	}

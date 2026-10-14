@@ -8,9 +8,49 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestCanaryCountersIgnoreOldRequests(t *testing.T) {
+	tb := NewTable()
+	k := Key{"shop", "web"}
+	tb.Set(k, []string{"shop.test"}, []string{"127.0.0.1:1"})
+	old, current := &Canary{ID: 1, Weight: 10, Backends: []string{"127.0.0.1:2"}}, &Canary{ID: 2, Weight: 10, Backends: []string{"127.0.0.1:3"}}
+	tb.SetCanary(k, old)
+	tb.count(k, old, true, 200)
+	tb.SetCanary(k, current)
+	tb.count(k, current, true, 500)
+	tb.count(k, old, true, 200) // an earlier release's slow request completed after the swap
+	if got := tb.Canaries()["shop/web"].Canary; got != (Counts{1, 1}) {
+		t.Fatalf("old completion replaced current counters: %+v", got)
+	}
+	tb.count(k, current, false, 200)
+	if got := tb.Canaries()["shop/web"]; got.Canary != (Counts{1, 1}) || got.Stable != (Counts{1, 0}) {
+		t.Fatalf("old completion reset current counters: %+v", got)
+	}
+}
+
+func TestCanaryCountersConcurrentFirstRequests(t *testing.T) {
+	tb := NewTable()
+	k := Key{"shop", "web"}
+	tb.Set(k, []string{"shop.test"}, []string{"127.0.0.1:1"})
+	for id := int64(1); id <= 10; id++ {
+		c := &Canary{ID: id, Weight: 10, Backends: []string{"127.0.0.1:2"}}
+		tb.SetCanary(k, c)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for range 128 {
+			wg.Go(func() { <-start; tb.count(k, c, true, 500) })
+		}
+		close(start)
+		wg.Wait()
+		if got := tb.Canaries()["shop/web"].Canary; got != (Counts{128, 128}) {
+			t.Fatalf("concurrent initialization lost requests: %+v", got)
+		}
+	}
+}
 
 // Tables without canaries hash and serialize as before canaries existed: a daemon and a proxy of different
 // versions must agree on them, and routes.json from an older proxy still loads.

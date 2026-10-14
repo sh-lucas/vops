@@ -140,7 +140,10 @@ func (e *Engine) syncCanaries(ctx context.Context, w io.Writer, pp *ProjectPlan,
 			fmt.Fprintf(w, "%s/%s: canary: %s\n", pp.Path, c.Service, fmt.Sprintf(format, args...))
 		}
 		if c.Action == "remove" {
-			e.Routes.SetCanary(key, nil)
+			if err := e.Routes.SetCanary(key, nil); err != nil {
+				log("proxy did not confirm removal (%v); containers kept, retrying on housekeeping", err)
+				continue
+			}
 			time.Sleep(Drain)
 			if err := e.remove(ctx, c.Containers); err != nil {
 				log("remove: %v", err)
@@ -149,18 +152,37 @@ func (e *Engine) syncCanaries(ctx context.Context, w io.Writer, pp *ProjectPlan,
 			}
 			continue
 		}
-		r, err := e.runCanary(ctx, log, c.want, *c.rel)
+		var r replica
+		var err error
+		for _, x := range c.Containers {
+			if x.State == "running" && x.Labels[LHash] == c.want.hash && x.Labels[LRelease] == strconv.FormatInt(c.rel.ID, 10) {
+				r.id, r.name = x.ID, x.Name()
+				r.hostPort, _ = strconv.Atoi(x.Labels[LHostPort])
+				break
+			}
+		}
+		if r.id == "" {
+			r, err = e.runCanary(ctx, log, c.want, *c.rel)
+		} else {
+			err = e.waitReady(ctx, c.want.spec, r)
+		}
 		if err != nil {
 			log("✗ %v", err)
 			failed[c.rel.ID] = true
 			e.canaryFailed(ctx, w, *c.rel, fmt.Sprintf("%s: %v", c.Service, shortErr(err)))
 			continue
 		}
-		e.Routes.SetCanary(key, &proxy.Canary{ID: c.rel.ID, Weight: int(c.rel.Weight), Backends: []string{"127.0.0.1:" + strconv.Itoa(r.hostPort)}})
+		if err := e.Routes.SetCanary(key, &proxy.Canary{ID: c.rel.ID, Weight: int(c.rel.Weight), Backends: []string{"127.0.0.1:" + strconv.Itoa(r.hostPort)}}); err != nil {
+			log("proxy did not confirm the new routes (%v); containers kept, retrying on housekeeping", err)
+			continue
+		}
 		log("ready, %d%% of clients (release #%d)", c.rel.Weight, c.rel.ID)
-		if len(c.Containers) > 0 {
+		old := slices.DeleteFunc(slices.Clone(c.Containers), func(x podman.Container) bool { return x.ID == r.id })
+		if len(old) > 0 {
 			time.Sleep(Drain)
-			e.remove(ctx, c.Containers)
+			if err := e.remove(ctx, old); err != nil {
+				log("remove: %v", err)
+			}
 		}
 	}
 }
@@ -202,7 +224,10 @@ func (e *Engine) dropCanaries(ctx context.Context, w io.Writer, r store.Release)
 		return
 	}
 	for _, c := range cs {
-		e.Routes.SetCanary(proxy.Key{Project: r.Project, Service: c.Labels[LService]}, nil)
+		if err := e.Routes.SetCanary(proxy.Key{Project: r.Project, Service: c.Labels[LService]}, nil); err != nil {
+			fmt.Fprintf(w, "%s: proxy did not confirm removal of canaries of #%d (%v); containers kept, retrying on housekeeping\n", r.Project, r.ID, err)
+			return
+		}
 	}
 	time.Sleep(Drain)
 	if err := e.remove(ctx, cs); err != nil {
@@ -237,17 +262,23 @@ func (e *Engine) CheckCanaries(ctx context.Context, w io.Writer) {
 		return
 	}
 	for _, pp := range plan.Projects {
-		orphans := false
+		died := false
 		for _, c := range pp.Canaries {
-			if c.Action == "remove" {
-				orphans = true
-			}
-			if c.rel != nil && slices.ContainsFunc(c.Containers, func(x podman.Container) bool { return x.State != "running" }) {
+			if c.rel != nil && slices.ContainsFunc(c.Containers, func(x podman.Container) bool {
+				return x.Labels[LRelease] == strconv.FormatInt(c.rel.ID, 10) && x.State != "running"
+			}) {
 				e.canaryFailed(ctx, w, *c.rel, c.Service+" is not running")
+				died = true
 			}
 		}
-		if orphans {
-			e.syncCanaries(ctx, w, pp, func(string) bool { return true })
+		if !died {
+			e.syncCanaries(ctx, w, pp, func(svc string) bool {
+				return slices.ContainsFunc(pp.Canaries, func(c CanaryState) bool {
+					return c.Service == svc && (c.Action == "remove" || c.want != nil && slices.ContainsFunc(c.Containers, func(x podman.Container) bool {
+						return x.State == "running" && x.Labels[LHash] == c.want.hash && x.Labels[LRelease] == strconv.FormatInt(c.rel.ID, 10)
+					}))
+				})
+			})
 		}
 	}
 }

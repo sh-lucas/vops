@@ -91,6 +91,11 @@ type groupStats struct {
 }
 
 func (t *Table) count(k Key, c *Canary, on bool, code int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if current := t.services[k].canary; current == nil || current.ID != c.ID {
+		return // a slow response from a release that is no longer routed
+	}
 	v, _ := t.groups.Load(k)
 	g, _ := v.(*groupStats)
 	if g == nil || g.id != c.ID {

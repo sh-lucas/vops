@@ -479,17 +479,18 @@ async function overview(alive) {
   let st;
   try { st = await getStatus(); } catch (e) { return failed(e, alive); }
   if (!alive()) return;
+  const top = h("div", {}), bottom = h("div", {}), releases = releasesPanel();
+  page(top, releases.el, bottom);
   const render = (st) => {
     // a pin is a temporary emergency state: always visible
     const pins = st.projects.flatMap((p) => p.services.filter((s) => s.pin).map((s) => h("li", {}, h("a", { href: projectHref(p.path) }, p.path + "/" + s.name), " is pinned to the image of #" + s.pin.deploy_id + " (rolled back); compose says ", mono(s.pin.compose_image))));
     const warns = [...(st.warnings || []).map((w) => h("li", {}, w)), ...pins];
-    return page(
+    put(top,
     head({ title: "Overview", sub: [h("span", {}, "~/vops at ", mono(short(st.commit, 8) || "no commits yet")), sep(), st.domain || "no domain set in vops.yml"] }),
     warns.length ? alertBox("warn", warns.length === 1 ? "Warning" : warns.length + " warnings", h("ul", { class: "small" }, warns)) : null,
-    st.changes ? alertBox("info", "The host differs from git", h("span", { class: "small muted" }, "Changes are waiting to be applied (a push, env vars or enable/disable)."), h("button", { class: "btn primary sm", onclick: openPlan }, "Review and apply")) : null,
-    releasesPanel(st),
-    stats(st),
-    projectList(st));
+    st.changes ? alertBox("info", "The host differs from git", h("span", { class: "small muted" }, "Changes are waiting to be applied (a push, env vars or enable/disable)."), h("button", { class: "btn primary sm", onclick: openPlan }, "Review and apply")) : null);
+    releases.update(st);
+    put(bottom, stats(st), projectList(st));
   };
   render(st);
   onStatus = render;
@@ -534,7 +535,8 @@ function releaseRow(r) {
     streamDialog({ title: `Rejecting #${r.id}`, path: "/releases/reject", body: { id: r.id },
       done: (ok) => { if (ok) toast("Rejected #" + r.id); refreshStatus().catch(() => {}); } });
   };
-  const at = h("input", { type: "datetime-local", value: localInput(r.approve_at || Math.floor(Date.now() / 1000) + 3600), "aria-label": "approve at" });
+  let inputValue = localInput(r.approve_at || Math.floor(Date.now() / 1000) + 3600);
+  const at = h("input", { type: "datetime-local", value: inputValue, "aria-label": "approve at" });
   const schedule = async (unix) => {
     try {
       await api("POST", "/releases/schedule", { id: r.id, at: unix });
@@ -544,20 +546,47 @@ function releaseRow(r) {
   };
   const later = h("form", { class: "row", onsubmit: (e) => { e.preventDefault(); const t = Math.floor(new Date(at.value).getTime() / 1000); if (t) schedule(t); } },
     at, h("button", { class: "btn sm" }, "Approve at"));
-  return h("div", { class: "release" },
+  const scheduled = h("div", { class: "small" });
+  const pushed = h("span", { class: "muted small" });
+  const el = h("div", { class: "release" },
     h("div", { class: "row wrap" }, h("strong", {}, "#" + r.id), h("a", { href: projectHref(r.project) }, r.project), relImage(r),
       h("span", { class: "tag" + (r.mode === "canary" ? " accent" : "") }, r.mode === "canary" ? "canary " + r.weight + "%" : "manual"),
-      h("span", { class: "muted small" }, "pushed by " + (r.pushed_by || "?") + " ", when(r.created_at))),
-    r.approve_at ? h("div", { class: "small" }, "Approved automatically " + fmtUnix(r.approve_at) + " (scheduled by " + r.decided_by + ") ", h("button", { class: "linkbtn", onclick: () => schedule(0) }, "Cancel")) : null,
+      pushed),
+    scheduled,
     h("div", { class: "row wrap" }, h("button", { class: "btn primary sm", onclick: approve }, "Approve now"), later, h("button", { class: "btn danger sm", onclick: reject }, "Reject")));
+  const update = (next) => {
+    if (next.approve_at !== r.approve_at) {
+      const value = localInput(next.approve_at || Math.floor(Date.now() / 1000) + 3600);
+      if (at.value === inputValue && document.activeElement !== at) at.value = value;
+      inputValue = value;
+    }
+    r = next;
+    put(pushed, "pushed by " + (r.pushed_by || "?") + " ", when(r.created_at));
+    scheduled.hidden = !r.approve_at;
+    put(scheduled, r.approve_at ? ["Approved automatically " + fmtUnix(r.approve_at) + " (scheduled by " + r.decided_by + ") ", h("button", { class: "linkbtn", onclick: () => schedule(0) }, "Cancel")] : []);
+  };
+  update(r);
+  return { el, update };
 }
 
 // releasesPanel lists the pending releases (of one project, or all of them)
-function releasesPanel(st, path) {
-  const rs = (st.releases || []).filter((r) => !path || r.project === path);
-  if (!rs.length) return null;
-  return alertBox("warn", rs.length === 1 ? "A push waits for approval" : rs.length + " pushes wait for approval",
-    h("div", { class: "releases" }, h("span", { class: "small muted" }, "Approve deploys exactly that digest (rolling); Reject keeps what runs until a newer push. Nothing else deploys it, not even an apply."), rs.map(releaseRow)));
+function releasesPanel(path) {
+  const title = h("span", {}), list = h("div", { class: "releases" }), rows = new Map();
+  const el = alertBox("warn", title,
+    h("div", { class: "releases" }, h("span", { class: "small muted" }, "Approve deploys exactly that digest (rolling); Reject keeps what runs until a newer push. Nothing else deploys it, not even an apply."), list));
+  return { el, update(st) {
+    const rs = (st.releases || []).filter((r) => !path || r.project === path);
+    el.hidden = !rs.length;
+    title.textContent = rs.length === 1 ? "A push waits for approval" : rs.length + " pushes wait for approval";
+    for (const [id, row] of rows) {
+      if (!rs.some((r) => r.id === id)) { row.el.remove(); rows.delete(id); }
+    }
+    rs.forEach((r, i) => {
+      let row = rows.get(r.id);
+      if (!row) { row = releaseRow(r); rows.set(r.id, row); list.insertBefore(row.el, list.children[i] || null); }
+      row.update(r);
+    });
+  } };
 }
 
 function releaseNode(r, at) {
@@ -594,16 +623,18 @@ async function projectPage(alive, path, tabId, params) {
   const tab = TABS.find((t) => t.id === (TAB_ALIASES[tabId] || tabId)) || TABS[0];
   const ctx = { path, p: find(st), st, params, reload: null };
   const headBox = h("div", {}), alerts = h("div", {}), body = h("div", { class: tab.fill ? "grow" : "" }), tabs = h("nav", { class: "tabs" });
+  const releases = releasesPanel(path);
   const renderHead = () => {
     headBox.replaceChildren(projectHead(ctx));
-    put(alerts, ctx.p.error ? alertBox("bad", "Invalid compose file", h("pre", {}, ctx.p.error)) : null, restoredBanner(ctx), releasesPanel(ctx.st, path));
+    put(alerts, ctx.p.error ? alertBox("bad", "Invalid compose file", h("pre", {}, ctx.p.error)) : null, restoredBanner(ctx));
+    releases.update(ctx.st);
     tabs.replaceChildren(...TABS.map((t) => {
       const n = t.id === "services" ? ctx.p.services.length : t.count ? t.count(ctx) : null;
       return h("a", { href: projectHref(path, t.id), class: t === tab ? "active" : null }, t.label, n ? h("span", { class: "count" }, n) : null);
     }));
   };
   $app.className = tab.fill ? "fill" : "";
-  page(headBox, alerts, tabs, body);
+  page(headBox, alerts, releases.el, tabs, body);
   renderHead();
   tab.render(ctx, body);
   onStatus = (st) => {

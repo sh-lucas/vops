@@ -342,6 +342,11 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 				yield(p)
 			}
 		}
+		for p := range canaries {
+			if _, ok := projects[p]; !ok && actual[p] == nil {
+				yield(p)
+			}
+		}
 	})
 	slices.Sort(paths)
 	domains := map[string]string{}

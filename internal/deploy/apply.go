@@ -634,6 +634,10 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 		return err
 	}
 	flags, _ := e.DB.Projects()
+	pending, err := e.DB.PendingReleases()
+	if err != nil {
+		return err
+	}
 	limits := map[string]proxy.Limits{}
 	for p, f := range flags {
 		if f.Limits != "" {
@@ -659,10 +663,19 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 		}
 		r := proxy.Route{Project: k.Project, Service: k.Service, Domains: domains, Backends: backends}
 		if _, cb := routeOf(canaries[k]); len(cb) > 0 {
-			c := canaries[k][0]
+			var c podman.Container
+			for _, x := range canaries[k] {
+				id, _ := strconv.ParseInt(x.Labels[LRelease], 10, 64)
+				if x.State == "running" && slices.ContainsFunc(pending, func(r store.Release) bool { return r.ID == id && r.Project == k.Project }) && (c.ID == "" || x.Created > c.Created) {
+					c = x
+				}
+			}
+			_, cb = routeOf([]podman.Container{c})
 			id, _ := strconv.ParseInt(c.Labels[LRelease], 10, 64)
 			weight, _ := strconv.Atoi(c.Labels[LWeight])
-			r.Canary = &proxy.Canary{ID: id, Weight: weight, Backends: cb}
+			if len(cb) > 0 {
+				r.Canary = &proxy.Canary{ID: id, Weight: weight, Backends: cb}
+			}
 		}
 		routes = append(routes, r)
 	}
