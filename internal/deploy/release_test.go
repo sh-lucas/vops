@@ -199,6 +199,15 @@ services:
 	v5 := push(repo, "latest", "five")
 	pushed(v5)
 	r4 := latest()
+	// disable and enable while it waits: back on what ran, not the pending digest
+	v.e.DB.SetDisabled(p, true)
+	if _, out, err := v.apply(ApplyOpts{}); err != nil || len(v.containers(p)) != 0 {
+		t.Fatalf("disable: %v\n%s", err, out)
+	}
+	v.e.DB.SetDisabled(p, false)
+	if _, out, err := v.apply(ApplyOpts{}); err != nil || body() != "two" || latest().Status != "pending" {
+		t.Fatalf("enable with a pending release: %v %q %+v\n%s", err, body(), latest(), out)
+	}
 	if err := v.e.Schedule(r4.ID, time.Now().Add(time.Hour).Unix(), "admin"); err != nil {
 		t.Fatal(err)
 	}

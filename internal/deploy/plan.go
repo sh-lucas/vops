@@ -292,10 +292,6 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 	if err != nil {
 		return nil, err
 	}
-	ran, err := e.DB.LatestDeploys()
-	if err != nil {
-		return nil, err
-	}
 	latest, err := e.DB.LatestReleases()
 	if err != nil {
 		return nil, err
@@ -373,7 +369,7 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 			pp.Error = err.Error()
 			continue
 		}
-		src := source{root: e.Repo, files: files, env: env, pins: pins[p], ran: ran[p].Images, releases: releases[p], running: map[string]bool{}}
+		src := source{root: e.Repo, files: files, env: env, pins: pins[p], ran: e.lastImages(p), releases: releases[p], running: map[string]bool{}}
 		for svc := range actual[p] {
 			src.running[svc] = true
 		}
@@ -547,6 +543,21 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 	}
 	pp.Actions = order
 	return nil
+}
+
+// lastImages is what the newest deploy rows say each service of a project runs: per service, the newest row that
+// has it (a disable apply records none; enabling must find them again).
+func (e *Engine) lastImages(project string) map[string]store.DeployImage {
+	out := map[string]store.DeployImage{}
+	rows, _ := e.DB.Deploys(project, historyLimit)
+	for _, r := range rows {
+		for svc, img := range r.Images {
+			if _, seen := out[svc]; !seen {
+				out[svc] = img
+			}
+		}
+	}
+	return out
 }
 
 // networkHash returns the vops.nethash label of a network and whether it exists.
