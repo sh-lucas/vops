@@ -227,6 +227,9 @@ func (e *Engine) CanaryDied(ctx context.Context, project, service, release, why 
 // CheckCanaries (housekeeping) rejects the releases whose canary isn't running and removes canaries whose
 // release is over: the monitor's event stream can miss a death.
 func (e *Engine) CheckCanaries(ctx context.Context, w io.Writer) {
+	if cs, err := podman.PS(ctx, LRole+"=canary"); err != nil || len(cs) == 0 {
+		return
+	}
 	e.lock()
 	defer e.unlock()
 	plan, err := e.plan(ctx, nil)

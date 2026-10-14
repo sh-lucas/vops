@@ -31,9 +31,11 @@ func canaryGroup(w http.ResponseWriter, r *http.Request, c *Canary) (on, done bo
 		if v == "on" || v == "off" {
 			set(v == "on")
 			q.Del(CanaryParam)
-			u := *r.URL
-			u.RawQuery = q.Encode()
-			http.Redirect(w, r, u.RequestURI(), http.StatusFound)
+			loc := "/" + strings.TrimLeft(r.URL.EscapedPath(), "/\\") // never "//other.host"
+			if len(q) > 0 {
+				loc += "?" + q.Encode()
+			}
+			http.Redirect(w, r, loc, http.StatusFound)
 			return false, true
 		}
 	}

@@ -93,23 +93,23 @@ type ConfigChange struct {
 }
 
 type ProjectPlan struct {
-	Path     string     `json:"path"`
-	Disabled bool       `json:"disabled,omitempty"`
-	Gone     bool       `json:"gone,omitempty"` // directory removed from git
-	Error    string     `json:"error,omitempty"`
-	Actions  []Action   `json:"actions"`
-	Pins     []PinState `json:"pins,omitempty"`   // services running a past image (image rollback)
-	Holds    []Hold     `json:"holds,omitempty"`  // services waiting for a release's approval (x-vops.release)
+	Path     string        `json:"path"`
+	Disabled bool          `json:"disabled,omitempty"`
+	Gone     bool          `json:"gone,omitempty"` // directory removed from git
+	Error    string        `json:"error,omitempty"`
+	Actions  []Action      `json:"actions"`
+	Pins     []PinState    `json:"pins,omitempty"`  // services running a past image (image rollback)
+	Holds    []Hold        `json:"holds,omitempty"` // services waiting for a release's approval (x-vops.release)
 	Canaries []CanaryState `json:"canaries,omitempty"`
-	Limits   string     `json:"limits,omitempty"` // proxy limits from x-vops, when they change: "old -> new"
+	Limits   string        `json:"limits,omitempty"` // proxy limits from x-vops, when they change: "old -> new"
 
 	limits string // desired limits (json proxy.Limits, '' = none)
 
 	specs    map[string]*desired
 	actual   map[string][]podman.Container
 	canaries map[string][]podman.Container // canary containers, by service (not in actual: compare ignores them)
-	nets    []compose.NetworkDef
-	project *compose.Project
+	nets     []compose.NetworkDef
+	project  *compose.Project
 }
 
 // PinState is a pin as the plan sees it: in effect, or stale (the next apply drops it and runs what compose says).
@@ -138,7 +138,7 @@ type desired struct {
 	hold    *Hold      // keeps running Hold.Running instead of the pushed digest (x-vops.release)
 	canary  *desired   // held for a canary release: what its canary container runs (the pushed digest)
 	release *store.Release
-	gate    string     // what a push of its tag does in a gated project: "" deploys, "held" or "new" (never ran) waits
+	gate    string // what a push of its tag does in a gated project: "" deploys, "held" or "new" (never ran) waits
 }
 
 // Changes reports whether the plan does anything.
@@ -373,7 +373,10 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 			pp.Error = err.Error()
 			continue
 		}
-		src := source{root: e.Repo, files: files, env: env, pins: pins[p], ran: ran[p].Images, releases: releases[p]}
+		src := source{root: e.Repo, files: files, env: env, pins: pins[p], ran: ran[p].Images, releases: releases[p], running: map[string]bool{}}
+		for svc := range actual[p] {
+			src.running[svc] = true
+		}
 		if approve != nil && approve.Project == p {
 			src.approve = approve
 		}
@@ -451,6 +454,7 @@ type source struct {
 	ran      map[string]store.DeployImage // what the newest deploy row says each service runs (release holds)
 	releases map[string]store.Release     // repo:tag -> its newest release
 	approve  *store.Release               // being approved: its services run exactly its digest
+	running  map[string]bool              // services with containers
 }
 
 func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, domain string, warns *[]string) error {
@@ -525,8 +529,8 @@ func (e *Engine) planProject(ctx context.Context, pp *ProjectPlan, src source, d
 			pp.Pins = append(pp.Pins, ps)
 		}
 		pp.specs[sp.Service] = d
-		if d.hold != nil && d.hold.Running == "" && len(pp.actual[sp.Service]) == 0 {
-			order = append(order, Action{sp.Service, "none", "waiting approval"}) // never ran: nothing to keep running
+		if d.hold != nil && d.hold.Running == "" {
+			order = append(order, Action{sp.Service, "none", "waiting approval"}) // no digest on record to keep running
 			continue
 		}
 		order = append(order, compare(d, pp.actual[sp.Service]))

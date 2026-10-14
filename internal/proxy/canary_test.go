@@ -90,6 +90,11 @@ func TestCanaryRouting(t *testing.T) {
 	if resp.StatusCode != http.StatusFound || resp.Header.Get("Location") != "/x?a=1" || cookieOf(resp) != "7.off" {
 		t.Fatalf("param: %d %q %q", resp.StatusCode, resp.Header.Get("Location"), cookieOf(resp))
 	}
+	for _, path := range []string{"//evil.test/", "///evil.test/"} {
+		if _, resp := get(path+"?"+CanaryParam+"=on", ""); resp.Header.Get("Location") != "/evil.test/" {
+			t.Fatalf("%s: redirect to %q", path, resp.Header.Get("Location"))
+		}
+	}
 	if body, resp := get("/", "6.off"); body != "canary" || cookieOf(resp) != "7.on" {
 		t.Fatalf("an earlier canary's cookie rolls again: %q", body)
 	}

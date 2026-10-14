@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"context"
+	"database/sql"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -219,6 +220,22 @@ services:
 	}
 	if _, err := reg.GC(0, must(v.e.KeepDigests(10))); err != nil || reg.Resolve(repo, r5.Digest) == "" {
 		t.Fatalf("gc dropped a pending digest: %v", err)
+	}
+
+	// running services whose deploy rows were pruned (host-wide retention): their digest is unknown, they wait
+	db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(v.repo), "vops.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("DELETE FROM deploys WHERE project = ?", p); err != nil {
+		t.Fatal(err)
+	}
+	if pp := quiet("no rows"); len(pp.Holds) != 3 || pp.Holds[0].Running != "" {
+		t.Fatalf("holds without rows: %+v", pp.Holds)
+	}
+	if _, out, err := v.apply(ApplyOpts{}); err != nil || body() != "five" {
+		t.Fatalf("apply without rows deployed a push nobody approved: %v %q\n%s", err, body(), out)
 	}
 }
 

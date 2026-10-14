@@ -494,7 +494,9 @@ var logDriver struct {
 	name string
 }
 
-func (e *Engine) start(ctx context.Context, d *desired) (replica, error) { return e.startAs(ctx, d, nil) }
+func (e *Engine) start(ctx context.Context, d *desired) (replica, error) {
+	return e.startAs(ctx, d, nil)
+}
 
 // startAs starts a replica, or a canary of a release: labelled as such, without network aliases or fixed ips.
 func (e *Engine) startAs(ctx context.Context, d *desired, canary *store.Release) (replica, error) {

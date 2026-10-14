@@ -525,7 +525,8 @@ function canaryInfo(ctx, s) {
 }
 
 function releaseRow(r) {
-  const approve = () => streamDialog({ title: `Approving #${r.id} in ${r.project}`, path: "/releases/approve", body: { id: r.id },
+  const approve = async () => (await confirmDialog({ title: `Approve #${r.id}?`, ok: "Approve",
+    body: [h("p", {}, "Deploys " + r.repo + ":" + r.tag + " " + short(r.digest, 12) + " to " + r.project + " now (rolling)" + (r.mode === "canary" ? ", then removes the canary." : "."))] })) && streamDialog({ title: `Approving #${r.id} in ${r.project}`, path: "/releases/approve", body: { id: r.id },
     done: (ok) => { if (ok) toast("Approved #" + r.id); refreshStatus().catch(() => {}); } });
   const reject = async () => {
     if (!(await confirmDialog({ title: `Reject #${r.id}?`, ok: "Reject", danger: true,

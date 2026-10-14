@@ -123,7 +123,7 @@ type Node struct {
 	Kind     string                       `json:"kind"` // deploy | rollback | snapshot | release
 	At       int64                        `json:"at"`
 	Deploy   *store.Deploy                `json:"deploy,omitempty"`
-	Release  *store.Release               `json:"release,omitempty"` // a push to a gated project (x-vops.release) and its fate
+	Release  *store.Release               `json:"release,omitempty"`  // a push to a gated project (x-vops.release) and its fate
 	Snapshot *store.Snapshot              `json:"snapshot,omitempty"` // the data right before this event (or the snapshot itself); nil when none or pruned
 	Commit   string                       `json:"commit"`             // deploys: the commit deployed; snapshots: the commit running when taken
 	Images   map[string]store.DeployImage `json:"images"`

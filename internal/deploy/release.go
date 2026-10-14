@@ -1,6 +1,7 @@
 package deploy
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -36,7 +37,7 @@ func (h Hold) Text() string {
 	img := shortRef(h.Image) + " " + shortDigest(h.Pushed)
 	run := "runs " + shortDigest(h.Running)
 	if h.Running == "" {
-		run = "not running yet"
+		run = "nothing on record runs it: it waits"
 	}
 	switch {
 	case h.Release == nil:
@@ -62,10 +63,10 @@ func (e *Engine) holdRelease(ctx context.Context, src source, mode compose.Relea
 		return d, nil
 	}
 	ran, hasRan := src.ran[sp.Service]
+	known := hasRan && ran.Image == sp.Image // the newest deploy row says what it runs from this tag
+	waiting := about && (rel.Status == "pending" || rel.Status == "rejected")
 	switch {
-	case hasRan && ran.Image != sp.Image:
-		return d, nil // compose changed the image, or it was pinned: explicit
-	case hasRan && ran.Digest == d.digest:
+	case known && ran.Digest == d.digest:
 		return d, nil // runs what the tag says
 	case about && (rel.Status == "approved" || rel.Status == "failed"):
 		return d, nil
@@ -73,13 +74,19 @@ func (e *Engine) holdRelease(ctx context.Context, src source, mode compose.Relea
 		return d, nil // a canary's jobs (migrations) run at push
 	}
 	d.gate = "held"
-	if !hasRan {
+	if !known {
 		d.gate = "new"
-		if !about || rel.Status != "pending" && rel.Status != "rejected" {
-			return d, nil // a service compose just added: its first deploy is an apply's
+		// running but on no row (pruned by retention): its digest is unknown, it waits. Else compose just added the
+		// service or changed its image (explicit, in git), or a pin runs another ref: an apply deploys it, unless a
+		// pending or rejected release is about that digest
+		if !waiting && !(src.running[sp.Service] && !hasRan) {
+			return d, nil
 		}
 	}
-	h := &Hold{Service: sp.Service, Image: sp.Image, Running: ran.Digest, Pushed: d.digest}
+	h := &Hold{Service: sp.Service, Image: sp.Image, Pushed: d.digest}
+	if known {
+		h.Running = ran.Digest
+	}
 	if about {
 		h.Release = &rel
 	}
@@ -146,7 +153,7 @@ func (e *Engine) holdPush(w io.Writer, pp *ProjectPlan, keys []proxy.Key, p regi
 	var waits []string
 	mode := "manual"
 	for _, k := range keys {
-		if d := cmpOrDesired(pp.specs[k.Service].compose, pp.specs[k.Service]); d.gate != "" {
+		if d := cmpOrDesired(pp.specs[k.Service].compose, pp.specs[k.Service]); d.gate != "" || pp.specs[k.Service].pin != nil {
 			waits = append(waits, k.Service)
 			if pp.project.Release.Mode == "canary" && d.gate == "held" && canaryable(d.spec) {
 				mode = "canary" // else (nothing routed with rolling) it is a manual release, jobs wait too
@@ -238,7 +245,7 @@ func (e *Engine) Approve(ctx context.Context, w io.Writer, id int64, by string) 
 		return fmt.Errorf("%s is disabled: enable it first", r.Project)
 	}
 	if ok, err := e.DB.DecideRelease(id, "approved", by, ""); err != nil || !ok {
-		return cmpOrErr(err, fmt.Errorf("release #%d is not pending anymore", id))
+		return cmp.Or(err, fmt.Errorf("release #%d is not pending anymore", id))
 	}
 	r.Status, r.DecidedBy = "approved", by
 	msg := fmt.Sprintf("#%d %s:%s %s approved by %s", id, r.Repo, r.Tag, shortDigest(r.Digest), by)
@@ -299,7 +306,7 @@ func (e *Engine) Schedule(id, at int64, by string) error {
 		return errors.New("that time has passed: approve it now instead")
 	}
 	if ok, err := e.DB.ScheduleRelease(id, at, by); err != nil || !ok {
-		return cmpOrErr(err, fmt.Errorf("release #%d is not pending anymore", id))
+		return cmp.Or(err, fmt.Errorf("release #%d is not pending anymore", id))
 	}
 	if at == 0 {
 		e.DB.Event(r.Project, "release", "#%d: scheduled approval cancelled by %s", id, by)
@@ -326,11 +333,3 @@ func (e *Engine) DueReleases(ctx context.Context, w io.Writer, now time.Time) {
 		}
 	}
 }
-
-func cmpOrErr(err, fallback error) error {
-	if err != nil {
-		return err
-	}
-	return fallback
-}
-
