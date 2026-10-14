@@ -2,12 +2,7 @@ package deploy
 
 import (
 	"context"
-	"encoding/base64"
 	"io"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -16,7 +11,6 @@ import (
 	"time"
 
 	"github.com/sh-lucas/vops/internal/podman"
-	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/snapshot"
 	"github.com/sh-lucas/vops/internal/store"
 )
@@ -28,38 +22,12 @@ import (
 func TestImageRollback(t *testing.T) {
 	v := newEnv(t)
 	ctx := context.Background()
-	reg, err := registry.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	all := func(string) bool { return true }
-	reg.Auth = func(_ *http.Request, user, pass string) (*registry.Perm, error) {
-		return &registry.Perm{Name: user, Pull: all, Push: all}, nil
-	}
-	srv := httptest.NewServer(reg)
-	t.Cleanup(srv.Close)
-	addr := strings.TrimPrefix(srv.URL, "http://")
-	v.e.Registry, v.e.PullAddr = reg, addr
-	v.e.PullAuthFile = filepath.Join(t.TempDir(), "auth.json")
-	os.WriteFile(v.e.PullAuthFile, []byte(`{"auths":{"`+addr+`":{"auth":"`+base64.StdEncoding.EncodeToString([]byte("x:y"))+`"}}}`), 0o600)
+	reg, addr, pushTo := ownRegistry(t, v)
 
 	p := v.ns + "/shop"
 	repo := v.ns + "/web"
 	host := "web.shop." + v.ns + "." + v.ns + ".test"
-	push := func(tag, msg string) string {
-		t.Helper()
-		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, "Containerfile"), []byte("FROM "+v.app+"\nENV MSG="+msg+"\n"), 0o644)
-		ref := addr + "/" + repo + ":" + tag
-		if _, err := podman.Run(ctx, "build", "-q", "-t", ref, dir); err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { podman.Run(context.Background(), "rmi", "-f", ref) })
-		if _, err := podman.Run(ctx, "push", "-q", "--tls-verify=false", "--creds", "x:y", ref); err != nil {
-			t.Fatal(err)
-		}
-		return reg.Resolve(repo, tag)
-	}
+	push := func(tag, msg string) string { t.Helper(); return pushTo(repo, tag, msg).Digest }
 	// what the daemon does on a push: redeploy the services running that tag, ending their pins
 	pushed := func(tag string) {
 		t.Helper()
