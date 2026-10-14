@@ -54,7 +54,9 @@ func (e *Engine) runningImages(ctx context.Context, project string, specs map[st
 	}
 	by := map[string][]podman.Container{}
 	for _, c := range cs {
-		by[c.Labels[LService]] = append(by[c.Labels[LService]], c)
+		if !isCanary(c) {
+			by[c.Labels[LService]] = append(by[c.Labels[LService]], c)
+		}
 	}
 	for svc, list := range by {
 		d := specs[svc]

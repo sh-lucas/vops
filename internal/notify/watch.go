@@ -41,6 +41,7 @@ type Monitor struct {
 
 type ctrState struct {
 	ID, Name, Project, Service string
+	Canary                     string // release id of a canary container
 	Job                        bool
 	Status                     string
 	RestartCount               int
@@ -143,6 +144,9 @@ func (m *Monitor) died(ctx context.Context, ev podmanEvent) {
 	}
 	d := Death{Project: ev.Attributes[deploy.LProject], Service: ev.Attributes[deploy.LService], Name: ev.Name, ExitCode: ev.ExitCode,
 		Job: ev.Attributes[deploy.LJob] != "", Expected: m.Engine.Expected(ev.ID, ev.Name), Stopping: ctx.Err() != nil}
+	if ev.Attributes[deploy.LRole] == "canary" {
+		d.Canary = ev.Attributes[deploy.LRelease]
+	}
 	status := ""
 	if cs, err := inspect(context.Background(), ev.ID); err != nil || len(cs) == 0 {
 		d.Gone = true
@@ -157,6 +161,10 @@ func (m *Monitor) died(ctx context.Context, ev podmanEvent) {
 
 func (m *Monitor) raiseDeath(d Death, status, note string) {
 	target := d.Project + "/" + d.Service
+	if d.Canary != "" && !d.Expected && !d.Stopping {
+		go m.Engine.CanaryDied(context.Background(), d.Project, d.Service, d.Canary, d.cause())
+		return
+	}
 	for _, kind := range classify(d) {
 		body := fmt.Sprintf("%s %s; OOMKilled: %t; now %s%s", d.Name, d.cause(), d.OOMKilled, cmpOr(status, "gone"), note)
 		o := Obs{Kind: kind, Key: kind + ":" + target, Project: d.Project, Service: d.Service, Body: body, URL: projectURL(d.Project, "services")}
@@ -202,7 +210,11 @@ func inspect(ctx context.Context, ids ...string) ([]ctrState, error) {
 	var out []ctrState
 	for _, c := range cs {
 		l := c.Config.Labels
-		out = append(out, ctrState{ID: c.ID, Name: strings.TrimPrefix(c.Name, "/"), Project: l[deploy.LProject], Service: l[deploy.LService], Job: l[deploy.LJob] != "",
+		canary := ""
+		if l[deploy.LRole] == "canary" {
+			canary = l[deploy.LRelease]
+		}
+		out = append(out, ctrState{ID: c.ID, Name: strings.TrimPrefix(c.Name, "/"), Project: l[deploy.LProject], Service: l[deploy.LService], Job: l[deploy.LJob] != "", Canary: canary,
 			Status: c.State.Status, RestartCount: c.RestartCount, FinishedAt: c.State.FinishedAt, ExitCode: c.State.ExitCode, OOMKilled: c.State.OOMKilled, Cgroup: c.State.CgroupPath})
 	}
 	return out, nil
@@ -247,7 +259,7 @@ func (m *Monitor) Reconcile(ctx context.Context) {
 	m.ctrs, m.seen, m.recGen = next, map[string]int{}, gen
 	m.mu.Unlock()
 	for i, c := range missed {
-		d := Death{Project: c.Project, Service: c.Service, Name: c.Name, ExitCode: c.ExitCode, OOMKilled: c.OOMKilled, Job: c.Job, Expected: m.Engine.Expected(c.ID, c.Name)}
+		d := Death{Project: c.Project, Service: c.Service, Name: c.Name, ExitCode: c.ExitCode, OOMKilled: c.OOMKilled, Job: c.Job, Canary: c.Canary, Expected: m.Engine.Expected(c.ID, c.Name)}
 		m.raiseDeath(d, c.Status, fmt.Sprintf(" (%d death(s) found by reconciliation, missed by podman events)", counts[i]))
 	}
 }

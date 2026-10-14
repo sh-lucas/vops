@@ -206,6 +206,7 @@ func (e *Engine) deployProject(ctx context.Context, w io.Writer, plan *Plan, pp 
 		done = append(done, a.Service+" "+pastTense[a.Kind])
 		e.DB.Event(pp.Path, a.Kind, "%s: %s", a.Service, strings.TrimSpace(a.Kind+" "+a.Reason))
 	}
+	e.syncCanaries(ctx, w, pp, func(svc string) bool { return opts.wants(pp.Path, svc) && !failed[svc] })
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
@@ -493,9 +494,15 @@ var logDriver struct {
 	name string
 }
 
-func (e *Engine) start(ctx context.Context, d *desired) (replica, error) {
+func (e *Engine) start(ctx context.Context, d *desired) (replica, error) { return e.startAs(ctx, d, nil) }
+
+// startAs starts a replica, or a canary of a release: labelled as such, without network aliases or fixed ips.
+func (e *Engine) startAs(ctx context.Context, d *desired, canary *store.Release) (replica, error) {
 	sp := d.spec
 	r := replica{name: fmt.Sprintf("vops-%s-%s-%s", compose.Slug(sp.Project), strings.ToLower(sp.Service), randHex(3))}
+	if canary != nil {
+		r.name = fmt.Sprintf("vops-%s-%s-canary-%s", compose.Slug(sp.Project), strings.ToLower(sp.Service), randHex(3))
+	}
 	args := []string{"run", "-d", "--name", r.name,
 		"--label", LProject + "=" + sp.Project,
 		"--label", LService + "=" + sp.Service,
@@ -509,7 +516,13 @@ func (e *Engine) start(ctx context.Context, d *desired) (replica, error) {
 	if sp.Job {
 		args = append(args, "--label", LJob+"=1")
 	}
+	if canary != nil {
+		args = append(args, "--label", LRole+"=canary", "--label", LRelease+"="+strconv.FormatInt(canary.ID, 10), "--label", LWeight+"="+strconv.FormatInt(canary.Weight, 10))
+	}
 	for _, n := range sp.Networks {
+		if canary != nil {
+			n = compose.SpecNet{Name: n.Name}
+		}
 		args = append(args, "--network", n.Flag())
 	}
 	if sp.Port > 0 {
@@ -625,20 +638,33 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 			limits[p] = *LimitsOf(f.Limits)
 		}
 	}
-	byKey := map[proxy.Key][]podman.Container{}
+	byKey, canaries := map[proxy.Key][]podman.Container{}, map[proxy.Key][]podman.Container{}
 	for _, c := range cs {
 		if p := c.Labels[LProject]; !flags[p].Disabled {
 			k := proxy.Key{Project: p, Service: c.Labels[LService]}
-			byKey[k] = append(byKey[k], c)
+			if isCanary(c) {
+				canaries[k] = append(canaries[k], c)
+			} else {
+				byKey[k] = append(byKey[k], c)
+			}
 		}
 	}
-	all := map[proxy.Key][2][]string{}
+	var routes []proxy.Route
 	for k, cs := range byKey {
-		if domains, backends := routeOf(cs); len(backends) > 0 {
-			all[k] = [2][]string{domains, backends}
+		domains, backends := routeOf(cs)
+		if len(backends) == 0 {
+			continue
 		}
+		r := proxy.Route{Project: k.Project, Service: k.Service, Domains: domains, Backends: backends}
+		if _, cb := routeOf(canaries[k]); len(cb) > 0 {
+			c := canaries[k][0]
+			id, _ := strconv.ParseInt(c.Labels[LRelease], 10, 64)
+			weight, _ := strconv.Atoi(c.Labels[LWeight])
+			r.Canary = &proxy.Canary{ID: id, Weight: weight, Backends: cb}
+		}
+		routes = append(routes, r)
 	}
-	e.Routes.Replace(all, limits) // a proxy that doesn't answer gets it from the daemon's retry
+	e.Routes.Replace(routes, limits) // a proxy that doesn't answer gets it from the daemon's retry
 	return nil
 }
 

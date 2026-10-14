@@ -3,21 +3,26 @@ package deploy
 import (
 	"context"
 	"encoding/base64"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/sh-lucas/vops/internal/podman"
+	"github.com/sh-lucas/vops/internal/proxy"
 	"github.com/sh-lucas/vops/internal/registry"
 	"github.com/sh-lucas/vops/internal/store"
 )
 
 // ownRegistry gives the engine a vops registry and returns its address and a push of repo:tag answering msg.
-func ownRegistry(t *testing.T, v *env) (*registry.Registry, string, func(repo, tag, msg string) registry.Push) {
+func ownRegistry(t *testing.T, v *env) (*registry.Registry, string, func(repo, tag, msg string, env ...string) registry.Push) {
 	reg, err := registry.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -33,10 +38,14 @@ func ownRegistry(t *testing.T, v *env) (*registry.Registry, string, func(repo, t
 	v.e.PullAuthFile = filepath.Join(t.TempDir(), "auth.json")
 	os.WriteFile(v.e.PullAuthFile, []byte(`{"auths":{"`+addr+`":{"auth":"`+base64.StdEncoding.EncodeToString([]byte("x:y"))+`"}}}`), 0o600)
 	ctx := context.Background()
-	push := func(repo, tag, msg string) registry.Push {
+	push := func(repo, tag, msg string, env ...string) registry.Push {
 		t.Helper()
 		dir := t.TempDir()
-		os.WriteFile(filepath.Join(dir, "Containerfile"), []byte("FROM "+v.app+"\nENV MSG="+msg+"\n"), 0o644)
+		file := "FROM " + v.app + "\nENV MSG=" + msg + "\n"
+		for _, e := range env {
+			file += "ENV " + e + "\n"
+		}
+		os.WriteFile(filepath.Join(dir, "Containerfile"), []byte(file), 0o644)
 		ref := addr + "/" + repo + ":" + tag
 		previous := reg.Resolve(repo, tag)
 		if _, err := podman.Run(ctx, "build", "-q", "-t", ref, dir); err != nil {
@@ -218,4 +227,170 @@ func must[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+// x-vops.release: canary 50%. A push runs the migration job at once and gives web (2 replicas) one canary
+// container with the pushed digest, no alias, routed to its share of clients (sticky by cookie) while the worker
+// waits; the split survives a rebuild of the routes from podman (daemon restart); a compose change of web rebuilds
+// the canary; Approve rolls web to that digest under load with 0 failed requests and removes the canary; a
+// canary that never gets ready, or dies, rejects its release; a newer push replaces the canary.
+func TestCanaryRelease(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	_, addr, push := ownRegistry(t, v)
+	p := v.ns + "/shop"
+	repo := v.ns + "/web"
+	host := "web.shop." + v.ns + "." + v.ns + ".test"
+	image := addr + "/" + repo + ":latest"
+	compose := func(env string) map[string]string {
+		return map[string]string{"vops.yml": "domain: " + v.ns + ".test\n", p + "/compose.yml": `x-vops: {release: canary 50%}
+services:
+  web:
+    image: ` + image + `
+    environment: {A: "` + env + `"}
+    depends_on: {migrate: {condition: service_completed_successfully}}
+    x-vops: {port: 8080, health: /health, replicas: 2, timeout: 4s}
+  worker:
+    image: ` + image + `
+  migrate:
+    image: ` + image + `
+    command: [read, /etc/hosts]
+`}
+	}
+	v.commit(compose("1"))
+	var failures []error
+	v.e.OnDeploy = func(_ string, err error) {
+		if err != nil {
+			failures = append(failures, err)
+		}
+	}
+	pushed := func(pu registry.Push) {
+		t.Helper()
+		var out strings.Builder
+		if err := v.e.Pushed(ctx, &out, pu); err != nil {
+			t.Fatalf("pushed: %v\n%s", err, out.String())
+		}
+	}
+	latest := func() store.Release {
+		rs, _ := v.e.DB.Releases(p, 1)
+		return rs[0]
+	}
+	canaries := func() []podman.Container {
+		cs, _ := podman.PS(ctx, LProject+"="+p, LRole+"=canary")
+		return cs
+	}
+	as := func(cookie string) string {
+		req, _ := http.NewRequest("GET", v.proxy.URL, nil)
+		req.Host = host
+		if cookie != "" {
+			req.Header.Set("Cookie", proxy.CanaryCookie+"="+cookie)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err.Error()
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(resp.Body)
+		return string(b)
+	}
+	split := func(id int64) {
+		t.Helper()
+		on, off := fmt.Sprintf("%d.on", id), fmt.Sprintf("%d.off", id)
+		seen := map[string]int{}
+		for range 40 {
+			seen[as("")]++
+		}
+		if as(on) != "two" || as(off) != "one" || seen["one"] == 0 || seen["two"] == 0 || seen["one"]+seen["two"] != 40 {
+			t.Fatalf("split: on %q off %q, without a cookie %v", as(on), as(off), seen)
+		}
+	}
+
+	push(repo, "latest", "one")
+	v.mustApply()
+	v2 := push(repo, "latest", "two")
+	pushed(v2)
+	r := latest()
+	cs := canaries()
+	if r.Mode != "canary" || r.Weight != 50 || r.Status != "pending" || len(cs) != 1 || cs[0].Labels[LService] != "web" || cs[0].Labels[LRelease] != fmt.Sprint(r.ID) {
+		t.Fatalf("canary: %+v %d containers", r, len(cs))
+	}
+	plan, _ := v.e.Plan(ctx)
+	var pp *ProjectPlan
+	for _, x := range plan.Projects {
+		if x.Path == p {
+			pp = x
+		}
+	}
+	var text strings.Builder
+	plan.Print(&text)
+	if plan.Changes() || len(pp.Canaries) != 1 || len(pp.actual["web"]) != 2 || !strings.Contains(text.String(), "web canary of #") || !strings.Contains(text.String(), "worker: waiting approval") || strings.Contains(text.String(), "migrate: waiting") {
+		t.Fatalf("plan with a canary:\n%s", text.String())
+	}
+	if nets, _ := podman.Run(ctx, "inspect", "--format", "{{range .NetworkSettings.Networks}}{{.Aliases}}{{end}}", cs[0].ID); strings.Contains(nets, "web") {
+		t.Fatalf("the canary has the service's alias: %s", nets)
+	}
+	split(r.ID)
+
+	// the routes come back from podman's labels (a daemon restart)
+	v.e.Routes.Replace(nil, nil)
+	v.e.RefreshRoutes(ctx)
+	split(r.ID)
+
+	// a compose change of web rebuilds its canary with the new definition and the same digest
+	v.commit(compose("2"))
+	if _, out, err := v.apply(ApplyOpts{}); err != nil || len(canaries()) != 1 || canaries()[0].ID == cs[0].ID {
+		t.Fatalf("compose change with a canary: %v %d\n%s", err, len(canaries()), out)
+	}
+	split(r.ID)
+
+	// approve under load: rolling, then the canary goes
+	var fails, total atomic.Int64
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Go(func() {
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				if code, b := v.get(host); code != 200 {
+					fails.Add(1)
+					t.Logf("failed request: %d %s", code, b)
+				}
+				total.Add(1)
+			}
+		})
+	}
+	var out strings.Builder
+	err := v.e.Approve(ctx, &out, r.ID, "admin")
+	time.Sleep(200 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+	if err != nil || fails.Load() > 0 || len(canaries()) != 0 || as("") != "two" || latest().Status != "approved" {
+		t.Fatalf("approve: %v, %d of %d failed, %d canaries, %q\n%s", err, fails.Load(), total.Load(), len(canaries()), as(""), out.String())
+	}
+	if routes := v.e.Routes.Routes(); len(routes) != 1 || routes[0].Canary != nil {
+		t.Fatalf("routes after approve: %+v", routes)
+	}
+
+	// a canary that never gets ready is rejected, and the release with it
+	pushed(push(repo, "latest", "three", "NEVER_READY=1"))
+	if r := latest(); r.Status != "rejected" || r.DecidedBy != "vops" || len(canaries()) != 0 || len(failures) == 0 || as("") != "two" {
+		t.Fatalf("failed canary: %+v %d %v %q", r, len(canaries()), failures, as(""))
+	}
+
+	// a newer push replaces the canary; its death rejects it
+	pushed(push(repo, "latest", "four"))
+	first := canaries()
+	pushed(push(repo, "latest", "five"))
+	second := canaries()
+	if len(first) != 1 || len(second) != 1 || first[0].ID == second[0].ID || second[0].Labels[LRelease] != fmt.Sprint(latest().ID) {
+		t.Fatalf("newer push: %d %d", len(first), len(second))
+	}
+	v.e.CanaryDied(ctx, p, "web", second[0].Labels[LRelease], "exited with code 2")
+	if r := latest(); r.Status != "rejected" || len(canaries()) != 0 || as("") != "two" {
+		t.Fatalf("dead canary: %+v %d", r, len(canaries()))
+	}
 }

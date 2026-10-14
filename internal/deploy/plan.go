@@ -37,7 +37,13 @@ const (
 	LImage    = "vops.image"
 	LJob      = "vops.job"
 	LNetHash  = "vops.nethash"
+	LRole     = "vops.role"    // "canary": a release's canary container, outside the service's replicas
+	LRelease  = "vops.release" // canary: the release (id) it runs
+	LWeight   = "vops.weight"  // canary: % of clients
 )
+
+// isCanary: a canary container (release modes), never one of the service's replicas.
+func isCanary(c podman.Container) bool { return c.Labels[LRole] == "canary" }
 
 type Engine struct {
 	Repo         string // the git working tree (~/vops)
@@ -94,12 +100,14 @@ type ProjectPlan struct {
 	Actions  []Action   `json:"actions"`
 	Pins     []PinState `json:"pins,omitempty"`   // services running a past image (image rollback)
 	Holds    []Hold     `json:"holds,omitempty"`  // services waiting for a release's approval (x-vops.release)
+	Canaries []CanaryState `json:"canaries,omitempty"`
 	Limits   string     `json:"limits,omitempty"` // proxy limits from x-vops, when they change: "old -> new"
 
 	limits string // desired limits (json proxy.Limits, '' = none)
 
-	specs   map[string]*desired
-	actual  map[string][]podman.Container
+	specs    map[string]*desired
+	actual   map[string][]podman.Container
+	canaries map[string][]podman.Container // canary containers, by service (not in actual: compare ignores them)
 	nets    []compose.NetworkDef
 	project *compose.Project
 }
@@ -128,6 +136,8 @@ type desired struct {
 	pin     *store.Pin // runs a pinned image instead of compose's (image rollback)
 	compose *desired   // pinned: what compose says
 	hold    *Hold      // keeps running Hold.Running instead of the pushed digest (x-vops.release)
+	canary  *desired   // held for a canary release: what its canary container runs (the pushed digest)
+	release *store.Release
 	gate    string     // what a push of its tag does in a gated project: "" deploys, "held" or "new" (never ran) waits
 }
 
@@ -137,7 +147,8 @@ func (p *Plan) Changes() bool {
 		return true
 	}
 	for _, pp := range p.Projects {
-		if pp.Error != "" || pp.Limits != "" || slices.ContainsFunc(pp.Pins, func(p PinState) bool { return p.Stale != "" }) {
+		if pp.Error != "" || pp.Limits != "" || slices.ContainsFunc(pp.Pins, func(p PinState) bool { return p.Stale != "" }) ||
+			slices.ContainsFunc(pp.Canaries, func(c CanaryState) bool { return c.Action != "none" }) {
 			return true
 		}
 		for _, a := range pp.Actions {
@@ -196,6 +207,9 @@ func (p *Plan) Print(w io.Writer) {
 		}
 		for _, h := range pp.Holds {
 			fmt.Fprintf(w, "  ? %s\n", h.Text())
+		}
+		for _, c := range pp.Canaries {
+			fmt.Fprintf(w, "  %s %s\n", map[string]string{"none": "?", "create": "+", "update": "~", "remove": "-"}[c.Action], c.Text())
 		}
 		for _, pin := range pp.Pins {
 			if pin.Stale != "" {
@@ -304,11 +318,18 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 	if err != nil {
 		return nil, err
 	}
-	actual := map[string]map[string][]podman.Container{}
+	actual, canaries := map[string]map[string][]podman.Container{}, map[string]map[string][]podman.Container{}
 	for _, c := range containers {
 		p, s := c.Labels[LProject], c.Labels[LService]
 		if compose.IsPreview(p) {
 			continue // previews live next to git, not in it (see preview.go)
+		}
+		if isCanary(c) {
+			if canaries[p] == nil {
+				canaries[p] = map[string][]podman.Container{}
+			}
+			canaries[p][s] = append(canaries[p][s], c)
+			continue
 		}
 		if actual[p] == nil {
 			actual[p] = map[string][]podman.Container{}
@@ -329,7 +350,7 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 	slices.Sort(paths)
 	domains := map[string]string{}
 	for _, p := range paths {
-		pp := &ProjectPlan{Path: p, Actions: []Action{}, specs: map[string]*desired{}, actual: actual[p]}
+		pp := &ProjectPlan{Path: p, Actions: []Action{}, specs: map[string]*desired{}, actual: actual[p], canaries: canaries[p]}
 		plan.Projects = append(plan.Projects, pp)
 		files, inGit := projects[p]
 		pp.Gone = !inGit
@@ -374,6 +395,9 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 		}
 	}
 	claimNames(plan.Projects)
+	for _, pp := range plan.Projects {
+		pp.canaryStates()
+	}
 	return plan, nil
 }
 
@@ -740,6 +764,7 @@ type ServiceState struct {
 	Reason     string             `json:"reason,omitempty"`
 	Pin        *store.Pin         `json:"pin,omitempty"`     // runs a past image (image rollback), not what compose says
 	Hold       *Hold              `json:"hold,omitempty"`    // waits for a release's approval (x-vops.release)
+	Canary     *CanaryState       `json:"canary,omitempty"`  // its canary container, while a canary release waits
 	Preview    bool               `json:"preview,omitempty"` // has x-vops.preview: it can get a preview
 	Containers []podman.Container `json:"containers"`
 }
@@ -777,6 +802,9 @@ func (pp *ProjectPlan) Services() []ServiceState {
 			}
 		} else if len(st.Containers) > 0 {
 			st.Image = st.Containers[0].Image
+		}
+		if i := slices.IndexFunc(pp.Canaries, func(c CanaryState) bool { return c.Service == n }); i >= 0 {
+			st.Canary = &pp.Canaries[i]
 		}
 		for _, a := range pp.Actions {
 			if a.Service == n && a.Kind != "none" {

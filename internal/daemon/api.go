@@ -95,6 +95,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			LastDeploy *store.Deploy         `json:"last_deploy"`       // a rollback here: rolled back since the last deploy (the banner)
 			Limits     string                `json:"limits,omitempty"`  // proxy limits in effect ("rate 20/s burst 20, max_body 10MB")
 			Refused    *proxy.Counters       `json:"refused,omitempty"` // what they refused since the proxy started
+			Canaries   map[string]proxy.CanaryStats `json:"canaries,omitempty"` // service -> requests and 5xx, canary vs stable
 		}
 		type preview struct {
 			Project string `json:"project"`
@@ -127,7 +128,13 @@ func (d *Daemon) API(trusted bool) http.Handler {
 			if c, ok := px.Limited[pp.Path]; ok {
 				refused = &c
 			}
-			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld, lim, refused})
+			canaries := map[string]proxy.CanaryStats{}
+			for k, c := range px.Canaries {
+				if svc, ok := strings.CutPrefix(k, pp.Path+"/"); ok && !strings.Contains(svc, "/") {
+					canaries[svc] = c
+				}
+			}
+			out.Projects = append(out.Projects, project{pp.Path, pp.Disabled, pp.Gone, pp.Error, f.Commit, f.AppliedAt, pp.Services(), ld, lim, refused, canaries})
 		}
 		pvs, _ := d.DB.Previews("")
 		for _, pv := range pvs {

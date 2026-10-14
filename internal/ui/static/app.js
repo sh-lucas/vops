@@ -509,6 +509,21 @@ function holdTag(s, style) {
   return h("span", { class: "tag warn", style, title: `${x.image} points at ${short(x.pushed, 12)}; runs ${x.running ? short(x.running, 12) : "nothing yet"} until a release is approved` }, text);
 }
 
+// canaryInfo: a service's canary container, its share, age and 5xx next to the stable's, and links that put
+// this browser on it (or back) on the real domain (?vops-canary=on|off sets the proxy's cookie)
+function canaryInfo(ctx, s) {
+  const c = s.canary;
+  if (!c || c.action === "remove") return null;
+  const stats = (ctx.p.canaries || {})[s.name];
+  const rate = (g) => g.requests ? `${g.errors} of ${g.requests} (${(100 * g.errors / g.requests).toFixed(1)}%)` : "no requests yet";
+  const url = s.domains.length ? domainURL(ctx.st, s.domains[0]) + "/?vops-canary=" : null;
+  return h("div", { class: "small", style: "margin-top:4px" },
+    h("span", { class: "tag accent" }, "canary · " + c.weight + "% · #" + c.release), " ", c.since ? ["since ", when(c.since)] : c.action,
+    stats ? h("div", { class: "muted" }, "5xx: canary " + rate(stats.canary) + ", stable " + rate(stats.stable)) : null,
+    url ? h("div", {}, h("a", { href: url + "on", target: "_blank", rel: "noopener", title: "Sets a cookie on that domain: this browser gets the canary" }, "Open the canary"), " · ",
+      h("a", { href: url + "off", target: "_blank", rel: "noopener" }, "back to stable")) : null);
+}
+
 function releaseRow(r) {
   const approve = () => streamDialog({ title: `Approving #${r.id} in ${r.project}`, path: "/releases/approve", body: { id: r.id },
     done: (ok) => { if (ok) toast("Approved #" + r.id); refreshStatus().catch(() => {}); } });
@@ -632,7 +647,7 @@ function servicesTab(ctx, box) {
         s.domains.map((d) => h("div", { class: "small wrapany" }, h("a", { href: domainURL(st, d), target: "_blank", rel: "noopener" }, d))),
         s.pending ? h("span", { class: "tag warn", style: "margin-top:4px" }, "pending " + s.pending + (s.reason ? ": " + s.reason : "")) : null,
         s.pin ? h("span", { class: "tag warn", style: "margin-top:4px", title: "Rolled back: runs the image deploy #" + s.pin.deploy_id + " ran; compose says " + s.pin.compose_image }, "pinned · #" + s.pin.deploy_id) : null,
-        holdTag(s, "margin-top:4px")),
+        holdTag(s, "margin-top:4px"), canaryInfo(ctx, s)),
       h("td", {}, s.containers.length ? s.containers.map((c) => h("div", { class: "ctr small" }, h("span", { class: "dot " + stateOf(c) }), h("span", { class: "mono" }, c.Names[0]), h("span", { class: "muted" }, c.Status))) : h("span", { class: "muted small" }, "none")),
       h("td", { class: "mono small wrap", title: s.image }, shortImage(s.image)),
       h("td", { class: "actions-cell" }, h("div", { class: "actions" }, h("a", { class: "btn sm", href: projectHref(path, "logs", "?service=" + enc(s.name)) }, "Logs"), restart,

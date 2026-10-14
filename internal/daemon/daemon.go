@@ -191,7 +191,8 @@ type ProxyState struct {
 	InSync  bool   `json:"in_sync"`
 	Error   string `json:"error,omitempty"`
 
-	Limited map[string]proxy.Counters `json:"limited,omitempty"` // per project: requests refused by x-vops limits
+	Limited  map[string]proxy.Counters    `json:"limited,omitempty"`  // per project: requests refused by x-vops limits
+	Canaries map[string]proxy.CanaryStats `json:"canaries,omitempty"` // "project/service": requests and 5xx per group
 }
 
 func (d *Daemon) proxyState(ctx context.Context) (ProxyState, []string) {
@@ -202,7 +203,7 @@ func (d *Daemon) proxyState(ctx context.Context) (ProxyState, []string) {
 		return ProxyState{Error: err.Error()}, []string{"the proxy is not running: sites are down until it is back (it restarts by itself; check: journalctl -u vops-proxy)"}
 	}
 	ours := d.Routes.Routes()
-	ps := ProxyState{Up: true, Version: st.Version, Binary: st.Binary, Routes: st.Routes, InSync: st.Hash == proxy.Hash(ours), Limited: st.Limited}
+	ps := ProxyState{Up: true, Version: st.Version, Binary: st.Binary, Routes: st.Routes, InSync: st.Hash == proxy.Hash(ours), Limited: st.Limited, Canaries: st.Canaries}
 	var warns []string
 	if !ps.InSync {
 		warns = append(warns, fmt.Sprintf("the proxy serves %d routes, the daemon has %d: they are resent every minute (if it lasts, restart vops-proxy)", st.Routes, len(ours)))
@@ -510,6 +511,7 @@ func (d *Daemon) housekeeping(ctx context.Context) {
 		d.Engine.Lock(func() { d.Engine.RefreshRoutes(ctx) })
 		d.Engine.ExpirePreviews(ctx, &logWriter{prefix: "previews: "})
 		d.Engine.DueReleases(ctx, &logWriter{prefix: "releases: "}, time.Now())
+		d.Engine.CheckCanaries(ctx, &logWriter{prefix: "canaries: "})
 		d.DB.PurgeSessions()
 		d.backupNow() // authorized_keys may have changed
 		d.monitor.Reconcile(ctx)

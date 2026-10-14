@@ -91,6 +91,9 @@ func (e *Engine) holdRelease(ctx context.Context, src source, mode compose.Relea
 		}
 	}
 	held.hold, held.gate = h, d.gate
+	if about && rel.Status == "pending" && rel.Mode == "canary" && canaryable(sp) && h.Running != "" {
+		held.canary, held.release = d, &rel
+	}
 	return held, nil
 }
 
@@ -127,7 +130,9 @@ func (e *Engine) Pushed(ctx context.Context, w io.Writer, p registry.Push) error
 			deploy = append(deploy, keys...)
 			continue
 		}
-		e.holdPush(w, pp, keys, p)
+		if r := e.holdPush(w, pp, keys, p); r != nil && r.Mode == "canary" {
+			e.startCanary(ctx, w, *r, keys)
+		}
 	}
 	if len(deploy) == 0 {
 		return nil
@@ -137,11 +142,15 @@ func (e *Engine) Pushed(ctx context.Context, w io.Writer, p registry.Push) error
 }
 
 // holdPush records a push to a gated project as a pending release, unless none of its services would change.
-func (e *Engine) holdPush(w io.Writer, pp *ProjectPlan, keys []proxy.Key, p registry.Push) {
+func (e *Engine) holdPush(w io.Writer, pp *ProjectPlan, keys []proxy.Key, p registry.Push) *store.Release {
 	var waits []string
+	mode := "manual"
 	for _, k := range keys {
 		if d := cmpOrDesired(pp.specs[k.Service].compose, pp.specs[k.Service]); d.gate != "" {
 			waits = append(waits, k.Service)
+			if pp.project.Release.Mode == "canary" && d.gate == "held" && canaryable(d.spec) {
+				mode = "canary" // else (nothing routed with rolling) it is a manual release, jobs wait too
+			}
 		}
 	}
 	pending, _ := e.DB.PendingReleases()
@@ -150,9 +159,12 @@ func (e *Engine) holdPush(w io.Writer, pp *ProjectPlan, keys []proxy.Key, p regi
 		if old >= 0 {
 			e.decide(w, pending[old], "superseded", "", p.Repo+":"+p.Tag+" points at what runs again")
 		}
-		return
+		return nil
 	}
-	r := store.Release{Project: pp.Path, Repo: p.Repo, Tag: p.Tag, Digest: p.Digest, Mode: "manual", PushedBy: p.User}
+	r := store.Release{Project: pp.Path, Repo: p.Repo, Tag: p.Tag, Digest: p.Digest, Mode: mode, PushedBy: p.User}
+	if mode == "canary" {
+		r.Weight = int64(pp.project.Release.Weight)
+	}
 	if old >= 0 {
 		e.decide(w, pending[old], "superseded", "", "a newer push of "+p.Repo+":"+p.Tag)
 	}
@@ -160,13 +172,14 @@ func (e *Engine) holdPush(w io.Writer, pp *ProjectPlan, keys []proxy.Key, p regi
 	if err != nil {
 		fmt.Fprintf(w, "%s: release: %v\n", pp.Path, err)
 		e.DB.Event(pp.Path, "error", "release of %s:%s: %v", p.Repo, p.Tag, err)
-		return
+		return nil
 	}
 	r, _, _ = e.DB.GetRelease(id)
 	msg := fmt.Sprintf("#%d %s:%s %s pushed by %s: waiting approval (%s)", id, p.Repo, p.Tag, shortDigest(p.Digest), cmpOr(p.User, "?"), strings.Join(waits, ", "))
 	fmt.Fprintf(w, "%s: %s\n", pp.Path, msg)
 	e.DB.Event(pp.Path, "release", "%s", msg)
 	e.released(r, "held", strings.Join(waits, ", "))
+	return &r
 }
 
 func (e *Engine) released(r store.Release, what, detail string) {
@@ -269,6 +282,9 @@ func (e *Engine) Reject(ctx context.Context, w io.Writer, id int64, by, note str
 	}
 	if !e.decide(w, r, "rejected", by, note) {
 		return fmt.Errorf("release #%d is not pending anymore", id)
+	}
+	if r.Mode == "canary" {
+		e.dropCanaries(ctx, w, r)
 	}
 	return nil
 }
