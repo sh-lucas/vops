@@ -179,16 +179,11 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if !slices.Contains([]string{"sync", "apply", "ui"}, opts.Trigger) {
 			opts.Trigger = "apply"
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
 		// a client that disconnects must not abort a rollout halfway
-		ctx := context.WithoutCancel(r.Context())
-		_, err := d.Engine.Apply(ctx, flushWriter{w}, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects, Trigger: opts.Trigger})
-		if err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error {
+			_, err := d.Engine.Apply(context.WithoutCancel(r.Context()), out, deploy.ApplyOpts{Commit: opts.Commit, Projects: opts.Projects, Trigger: opts.Trigger})
+			return err
+		})
 		return nil
 	})
 
@@ -376,13 +371,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.PreviewUp(context.WithoutCancel(r.Context()), flushWriter{w}, in); err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error { return d.Engine.PreviewUp(context.WithoutCancel(r.Context()), out, in) })
 		return nil
 	})
 	h("DELETE /api/previews", func(w http.ResponseWriter, r *http.Request) error {
@@ -684,13 +673,7 @@ func (d *Daemon) API(trusted bool) http.Handler {
 		if err := readJSON(r, &in); err != nil {
 			return err
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.Rollback(context.WithoutCancel(r.Context()), flushWriter{w}, in); err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error { return d.Engine.Rollback(context.WithoutCancel(r.Context()), out, in) })
 		return nil
 	})
 	h("GET /api/releases", func(w http.ResponseWriter, r *http.Request) error {
@@ -757,13 +740,9 @@ func (d *Daemon) API(trusted bool) http.Handler {
 				return err
 			}
 		}
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.Header().Set("X-Content-Type-Options", "nosniff")
-		if err := d.Engine.Unpin(context.WithoutCancel(r.Context()), flushWriter{w}, in.Project, in.Services); err != nil {
-			fmt.Fprintf(w, "==> error: %v\n", err)
-		} else {
-			fmt.Fprintln(w, "==> ok")
-		}
+		streamed(w, func(out io.Writer) error {
+			return d.Engine.Unpin(context.WithoutCancel(r.Context()), out, in.Project, in.Services)
+		})
 		return nil
 	})
 
