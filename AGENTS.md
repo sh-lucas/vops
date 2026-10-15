@@ -2,10 +2,10 @@
 
 Don't spam comments, don't add linebreaks in the middle of sentences, and keep your language as concise as possible (we all have TDAH today).
 
-README.md has the expected features, AGENTS.md has system instructions, reference/ has the styleguides and general documentation for anybody to understand how vops works.
+README.md is the short overview, AGENTS.md has system instructions, reference/ has the styleguides and general documentation for anybody to understand how vops works.
 Read it, and keep it up to date.
 
-Map: reference/decisions.md records every design decision (update it when you make or change one), reference/compose.md the supported compose subset, reference/architecture.md the package map. `just test` runs everything (needs podman). TODO.md has the next ideas with design sketches.
+Map: reference/decisions.md records every design decision (update it when you make or change one), reference/compose.md the supported compose subset, reference/architecture.md the package map, reference/features.md the full feature detail, reference/limitations.md the known limits, reference/deploying.md the new-app guide, reference/development.md the tests. `just test` runs everything (needs podman). TODO.md has the next ideas with design sketches.
 Bump `proxy.Version` (internal/proxy/server.go) when the proxy's behaviour or the daemon<->proxy protocol changes, and only then: `vops install` restarts the proxy (every site blinks) only when that number differs.
 SQL lives in internal/store/queries.sql and internal/store/migrations/ (new file per change, never edit an applied one); run `just gen` (sqlc) and commit the generated internal/store/queries/.
 
