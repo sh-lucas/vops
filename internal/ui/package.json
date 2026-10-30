@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "description": "dev only: lints the dashboard. The dashboard itself has no dependencies and no build step.",
+  "type": "module",
+  "scripts": {
+    "lint": "oxlint --deny-warnings",
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "oxlint": "1.90.0"
+  }
+}

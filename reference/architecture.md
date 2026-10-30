@@ -61,5 +61,5 @@ The thoughts above are the original brief. How it ended up (details and reasons 
 | `internal/snapshot` | btrfs primitives: subvolumes, read-only snapshots, restore in place, delete, commands in the user namespace (rootless via `podman unshare`) |
 | `internal/notify` | notifications: Web Push (VAPID + aes128gcm, `webpush.go`), the alert state machine and access rule (`alert.go`), kinds and thresholds (`settings.go`), detectors' pure logic (`detect.go`), the Notifier (db + delivery, `notifier.go`) and the Monitor in the daemon: podman events, reconciliation, probes, resources (`watch.go`). The api is `daemon/notify.go` |
 | `internal/sysmon` | host load from `/proc` and `/sys` (cpu, memory, disk io and space, network, PSI, kernel, uptime), rates from the previous sample, oom kills; `/api/system`, sampled in the background for alerts |
-| `internal/ui` | embedded dashboard (html/css/js), service worker and manifest (push, installable) |
+| `internal/ui` | embedded dashboard (html, css, ES modules in `static/js`: `state.js` store, `shell.js` sidebar/top bar, `router.js`, `pages/`), service worker and manifest (push, installable); oxlint config and a store test (dev only) |
 | `e2e` | the real binary end to end, with a fake ssh |

@@ -14,28 +14,15 @@
 </head>
 <body>
 <div id="shell" hidden>
-  <aside id="side">
-    <a href="#/" class="brand"><span class="logo">v</span><span>vops</span></a>
-    <nav id="nav"></nav>
-    <div class="side-label">Projects</div>
-    <div id="side-projects"></div>
-    <div class="side-foot"><button id="logout" class="btn ghost block"></button></div>
-  </aside>
+  <aside id="side" aria-label="Navigation"></aside>
   <div id="scrim"></div>
   <div class="col">
-    <header id="topbar">
-      <button id="menu" class="btn ghost icon" aria-label="Menu"></button>
-      <a href="#/" class="brand mobile-only"><span class="logo">v</span></a>
-      <div id="hoststat"></div>
-      <span class="spacer"></span>
-      <a id="waiting" class="pending" href="#/" hidden></a>
-      <button id="pending" class="pending" hidden></button>
-    </header>
+    <header id="topbar"></header>
     <main id="app"></main>
   </div>
 </div>
 <div id="login"></div>
-<div id="toasts"></div>
-<script src="app.js"></script>
+<div id="toasts" aria-live="polite"></div>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>
