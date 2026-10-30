@@ -541,6 +541,9 @@ func cmdUI(g globals, args []string) error {
 		return err
 	}
 	url := "http://" + *listen
+	if r == nil && !g.local {
+		return errors.New("no host to open a tunnel to: this clone has no vops-lock.yml (gitignored, written by vops install). Run vops ui --host user@host, or vops ui --local on the host itself")
+	}
 	if r == nil {
 		fmt.Println(url)
 		return nil
