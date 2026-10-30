@@ -104,6 +104,7 @@ type ProjectPlan struct {
 	Limits   string        `json:"limits,omitempty"` // proxy limits from x-vops, when they change: "old -> new"
 
 	limits string // desired limits (json proxy.Limits, '' = none)
+	held   string // the project is held (store.Project.Held) and that is its only error: specs are valid
 
 	specs    map[string]*desired
 	actual   map[string][]podman.Container
@@ -263,7 +264,8 @@ func (e *Engine) Plan(ctx context.Context) (*Plan, error) { return e.plan(ctx, n
 // plan computes the plan; approve is the release being approved: its services run exactly its digest.
 func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error) {
 	plan := &Plan{Warnings: []string{}}
-	plan.Commit, _ = git(ctx, e.Repo, "rev-parse", "HEAD")
+	var headErr error
+	plan.Commit, headErr = git(ctx, e.Repo, "rev-parse", "HEAD")
 	cfg, err := config.ReadRepo(e.Repo)
 	if e.Config != nil {
 		current := e.Config()
@@ -331,6 +333,10 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 			actual[p] = map[string][]podman.Container{}
 		}
 		actual[p][s] = append(actual[p][s], c)
+	}
+	if plan.Commit == "" && len(actual) > 0 {
+		// no commit means no project in git: a broken or unreadable repo must not plan removing everything that runs
+		return nil, fmt.Errorf("~/vops has no readable HEAD (%v) but projects run: refusing to plan their removal", headErr)
 	}
 
 	paths := slices.Collect(func(yield func(string) bool) {
@@ -400,6 +406,9 @@ func (e *Engine) plan(ctx context.Context, approve *store.Release) (*Plan, error
 	}
 	claimNames(plan.Projects)
 	for _, pp := range plan.Projects {
+		if h := flags[pp.Path].Held; h != "" && pp.Error == "" && !pp.Gone && !pp.Disabled {
+			pp.held, pp.Error, pp.Actions = h, "held: "+h, []Action{}
+		}
 		pp.canaryStates()
 	}
 	return plan, nil
@@ -759,7 +768,7 @@ func (p *Plan) Watching(repo, tag string) []proxy.Key {
 		return nil
 	}
 	for _, pp := range p.Projects {
-		if pp.Disabled || pp.Gone || pp.Error != "" {
+		if pp.Disabled || pp.Gone || pp.Error != "" && pp.held == "" { // a push to a held project fails with its error
 			continue
 		}
 		for name, d := range pp.specs {

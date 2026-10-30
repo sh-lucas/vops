@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -145,3 +146,47 @@ func TestLimitsSurviveRestart(t *testing.T) {
 		t.Fatalf("status: %+v %v", st, err)
 	}
 }
+
+// One ipv6 /64 is one client for the rate limit and the per-ip connection cap; an ipv4-mapped address is its ipv4.
+func TestIPv6PrefixIsOneClient(t *testing.T) {
+	tb, h := limited(t, &Limits{Rate: 1, Burst: 1})
+	tb.limiter.now = func() time.Time { return time.Unix(1000, 0) }
+	for _, c := range []struct {
+		ip   string
+		code int
+	}{{"[2001:db8::1]", 200}, {"[2001:db8::ffff]", 429}, {"[2001:db8:0:1::1]", 200}, {"10.0.0.1", 200}, {"[::ffff:10.0.0.1]", 429}} {
+		if w := serve(h, c.ip, "GET", nil, -1); w.Code != c.code {
+			t.Fatalf("%s: %d, want %d", c.ip, w.Code, c.code)
+		}
+	}
+
+	old := MaxConnsPerIP
+	MaxConnsPerIP = 1
+	t.Cleanup(func() { MaxConnsPerIP = old })
+	conns := make(chan net.Conn, 3)
+	for _, ip := range []string{"2001:db8::1", "2001:db8::2", "2001:db8:0:1::1"} {
+		c, _ := net.Pipe()
+		conns <- addrConn{c, &net.TCPAddr{IP: net.ParseIP(ip), Port: 1234}}
+	}
+	ll := limitListener{chanListener{conns: conns}, &connLimiter{perIP: map[string]int{}}}
+	for _, want := range []string{"2001:db8::1", "2001:db8:0:1::1"} { // 2001:db8::2 shares the first one's /64: closed at accept
+		c, err := ll.Accept()
+		if err != nil || c.RemoteAddr().(*net.TCPAddr).IP.String() != want {
+			t.Fatalf("accepted %v %v, want %s", c.RemoteAddr(), err, want)
+		}
+	}
+}
+
+type addrConn struct {
+	net.Conn
+	addr net.Addr
+}
+
+func (c addrConn) RemoteAddr() net.Addr { return c.addr }
+
+type chanListener struct {
+	net.Listener
+	conns chan net.Conn
+}
+
+func (l chanListener) Accept() (net.Conn, error) { return <-l.conns, nil }

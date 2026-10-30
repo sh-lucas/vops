@@ -66,7 +66,7 @@ func shellQuote(s string) string {
 
 // Shell runs a raw shell command on the host.
 func (r *Remote) Shell(script string, stdin io.Reader, stdout io.Writer) error {
-	args := append(r.sshOpts(), r.Host, script)
+	args := append(r.sshOpts(), "--", r.Host, script) // "--": a host like -oProxyCommand=... is never an option
 	cmd := exec.Command(sshBin(), args...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
@@ -89,7 +89,7 @@ func (r *Remote) Run(args []string, stdin io.Reader, stdout io.Writer, tty bool)
 	if tty {
 		opts = append(opts, "-t")
 	}
-	cmd := exec.Command(sshBin(), append(opts, r.Host, strings.Join(q, " "))...)
+	cmd := exec.Command(sshBin(), append(opts, "--", r.Host, strings.Join(q, " "))...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, os.Stderr
 	if err := cmd.Run(); err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {

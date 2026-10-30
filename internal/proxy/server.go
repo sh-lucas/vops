@@ -26,7 +26,7 @@ import (
 
 // Version is the proxy's behaviour plus the daemon<->proxy protocol. Bump it when either changes:
 // `vops setup` restarts the running proxy (every site blinks) only when it reports another Version.
-const Version = 6
+const Version = 7
 
 // ControlSocket is where the proxy takes its routing table from the daemon.
 func ControlSocket(vopsHome string) string { return filepath.Join(vopsHome, "proxy.sock") }
@@ -326,7 +326,7 @@ func (ll limitListener) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		ip, _, _ := net.SplitHostPort(c.RemoteAddr().String())
+		ip := clientKey(c.RemoteAddr().String())
 		ll.l.mu.Lock()
 		ok := ll.l.total < MaxConns && ll.l.perIP[ip] < MaxConnsPerIP
 		if ok {

@@ -889,3 +889,48 @@ volumes:
 		}
 	}
 }
+
+// Two previews of different projects can't share a slug (shop@a--b and shop--a@b): they would share volumes and a worktree.
+func TestPreviewNameCollision(t *testing.T) {
+	v := newEnv(t)
+	shop, other := v.ns+"/shop", v.ns+"/shop--a"
+	plain := "services:\n  app:\n    image: APP\n"
+	v.commit(map[string]string{shop + "/compose.yml": plain, other + "/compose.yml": plain})
+	if err := v.e.DB.PutPreview(store.Preview{Project: shop, Name: "a--b", Images: map[string]string{}}); err != nil {
+		t.Fatal(err)
+	}
+	err := v.e.PreviewUp(context.Background(), io.Discard, PreviewOpts{Project: other, Name: "b"})
+	if err == nil || !strings.Contains(err.Error(), "would take the names of preview "+shop+"@a--b") {
+		t.Fatalf("colliding preview: %v", err)
+	}
+}
+
+// A project's data is its own volumes: another project's volume it mounts as external is that project's.
+func TestProjectDataSkipsExternalVolumes(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	a, b := v.ns+"/a", v.ns+"/b"
+	shared := "vops-" + strings.ReplaceAll(a, "/", ".") + "-data"
+	v.commit(map[string]string{
+		a + "/compose.yml": "services:\n  app:\n    image: APP\n    volumes: [\"data:/data\"]\nvolumes:\n  data:\n",
+		b + "/compose.yml": "services:\n  app:\n    image: APP\n    volumes: [\"shared:/shared\", \"own:/own\"]\nvolumes:\n  own:\n  shared: {external: true, name: " + shared + "}\n",
+	})
+	v.mustApply()
+	names := func(p string) []string {
+		vols, _, _, err := v.e.projectData(ctx, p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, x := range vols {
+			out = append(out, x.Name)
+		}
+		return out
+	}
+	if got := names(a); !slices.Equal(got, []string{shared}) {
+		t.Fatalf("%s's data: %v", a, got)
+	}
+	if got := names(b); !slices.Equal(got, []string{"vops-" + strings.ReplaceAll(b, "/", ".") + "-own"}) {
+		t.Fatalf("%s's data: %v", b, got)
+	}
+}

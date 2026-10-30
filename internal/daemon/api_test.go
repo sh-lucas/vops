@@ -158,7 +158,8 @@ func TestSecurityHeaders(t *testing.T) {
 	if csp := w.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "frame-ancestors 'none'") || strings.Contains(csp, "script-src 'unsafe") {
 		t.Errorf("csp: %s", csp)
 	}
-	if w := call(h, "GET", "/v2/", "", ""); w.Header().Get("Content-Security-Policy") != "" || w.Code != 401 {
+	// the registry gets its own sandbox, not the dashboard's policy: a pushed manifest picks its Content-Type
+	if w := call(h, "GET", "/v2/", "", ""); !strings.HasPrefix(w.Header().Get("Content-Security-Policy"), "sandbox") || w.Header().Get("X-Content-Type-Options") != "nosniff" || w.Code != 401 {
 		t.Errorf("registry: %d %v", w.Code, w.Header())
 	}
 }

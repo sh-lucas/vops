@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -133,12 +133,19 @@ func (l *limiter) snapshot() map[string]Counters {
 	return out
 }
 
-// clientIP is the tcp peer: the proxy is the edge, X-Forwarded-For is whatever the client wrote.
-func clientIP(r *http.Request) string {
-	if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-		return host
+// clientKey is who a tcp peer ("ip:port") counts as: its ip, or the /64 of an ipv6 address (one host usually has all of it).
+// The peer, never X-Forwarded-For: the proxy is the edge, that header is whatever the client wrote.
+func clientKey(addr string) string {
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil {
+		return addr
 	}
-	return r.RemoteAddr
+	ip := ap.Addr().Unmap()
+	if ip.Is4() {
+		return ip.String()
+	}
+	p, _ := ip.Prefix(64)
+	return p.String()
 }
 
 // limit applies a project's limits to a request; false means it already answered (429 or 413).
@@ -147,7 +154,7 @@ func (l *limiter) limit(w http.ResponseWriter, r *http.Request, project string, 
 		return true
 	}
 	if lim.Rate > 0 {
-		if ok, wait := l.allow(project, clientIP(r), lim); !ok {
+		if ok, wait := l.allow(project, clientKey(r.RemoteAddr), lim); !ok {
 			l.count(project, 0)
 			w.Header().Set("Retry-After", strconv.Itoa(max(1, int(math.Ceil(wait.Seconds())))))
 			http.Error(w, "vops: too many requests", http.StatusTooManyRequests)

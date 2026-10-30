@@ -112,6 +112,7 @@ type Project struct {
 	CommitSha string `json:"commit_sha"`
 	AppliedAt int64  `json:"applied_at"`
 	Limits    string `json:"limits"`
+	Held      string `json:"held"`
 }
 
 type PushSubscription struct {

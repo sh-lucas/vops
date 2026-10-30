@@ -131,6 +131,11 @@ func (e *Engine) PreviewUp(ctx context.Context, w io.Writer, o PreviewOpts) erro
 		if err != nil {
 			return err
 		}
+		for _, other := range all { // shop@a--b and shop--a@b would share volumes, networks and the worktree
+			if op := PreviewPath(other.Project, other.Name); compose.Slug(op) == compose.Slug(path) || compose.DNSName(op) == compose.DNSName(path) {
+				return fmt.Errorf("preview %s would take the names of preview %s: pick another name", path, op)
+			}
+		}
 		if len(all) >= e.previewMax() {
 			return fmt.Errorf("%d previews already run on this host (preview_max in vops.yml): remove one with vops preview rm", len(all))
 		}

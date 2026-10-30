@@ -146,7 +146,8 @@ func Restore(ctx context.Context, snap, target string) error {
 		return err
 	}
 	if aside != "" {
-		return Delete(ctx, aside)
+		// shortcut: a failed cleanup leaves target.vops-old-* behind, restore still succeeds; retry it when disk space matters
+		Delete(ctx, aside)
 	}
 	return nil
 }

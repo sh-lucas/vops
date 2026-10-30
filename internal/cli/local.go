@@ -545,7 +545,7 @@ func cmdUI(g globals, args []string) error {
 		fmt.Println(url)
 		return nil
 	}
-	cmd := exec.Command(sshBin(), append(r.sshOpts(), "-N", "-o", "ExitOnForwardFailure=yes", "-L", *listen+":"+*remoteAddr, r.Host)...)
+	cmd := exec.Command(sshBin(), append(r.sshOpts(), "-N", "-o", "ExitOnForwardFailure=yes", "-L", *listen+":"+*remoteAddr, "--", r.Host)...)
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
 	if err := cmd.Start(); err != nil {
 		return err

@@ -59,7 +59,7 @@ type Settings struct {
 }
 
 var Defaults = Settings{Repeat: 3600, Expire: 86400, Quiet: 1800, ProbeInterval: 30, DownAfter: 3, SampleEvery: 30,
-	CPU: 90, CPUFor: 600, MemAvail: 10, MemFor: 300, Disk: 90, PSI: 20, CtrMem: 90, CtrMemFor: 300, CtrCPU: 90, CtrCPUFor: 600}
+	CPU: 90, CPUFor: 600, MemAvail: 10, MemFor: 300, Disk: 70, PSI: 20, CtrMem: 90, CtrMemFor: 300, CtrCPU: 90, CtrCPUFor: 600}
 
 // fields lists every setting with its bounds, in the order the dashboard shows them.
 func (s *Settings) fields() []struct {

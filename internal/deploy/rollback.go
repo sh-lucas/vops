@@ -158,7 +158,9 @@ func (e *Engine) rollbackPlan(ctx context.Context, o RollbackOpts) (*RollbackPla
 		rp.NoImages = o.Project + " is not in git"
 	case pp.Disabled:
 		rp.NoImages = o.Project + " is disabled"
-	case pp.Error != "":
+	case pp.held != "" && (!wantData || rp.Snapshot == nil):
+		rp.NoImages = o.Project + " is held: put its data back first (vops rollback " + o.Project + " --snapshot <id>)"
+	case pp.Error != "" && pp.held == "":
 		rp.NoImages = "fix the compose file first: " + pp.Error
 	case !found:
 		rp.NoImages = fmt.Sprintf("nothing ran before #%d", before.ID)
@@ -454,6 +456,9 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err
 				fix = fmt.Sprintf("vops rollback %s --snapshot %d (the data before this rollback) or %s (try again)", project, undo, fix)
 			}
 			err = fmt.Errorf("%w; %s is stopped: its data is partly restored and putting it back failed. recover with: %s, then vops restart %s", err, project, fix, project)
+			if herr := e.DB.SetHeld(project, err.Error()); herr != nil { // held: boot and apply must not start it
+				err = fmt.Errorf("%w (holding it failed, a daemon restart would start it: %v)", err, herr)
+			}
 			e.DB.Event(project, "error", "%v", err)
 			return err
 		}
@@ -461,6 +466,7 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err
 			start(nil)
 			return err
 		}
+		e.unhold(project, fmt.Sprintf("its data was restored to #%d", s.ID))
 	}
 
 	var keys []proxy.Key

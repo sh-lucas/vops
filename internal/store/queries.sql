@@ -20,6 +20,10 @@ ON CONFLICT (path) DO UPDATE SET commit_sha = excluded.commit_sha, applied_at = 
 INSERT INTO projects (path, limits) VALUES (?, ?)
 ON CONFLICT (path) DO UPDATE SET limits = excluded.limits;
 
+-- name: SetProjectHeld :exec
+INSERT INTO projects (path, held) VALUES (?, ?)
+ON CONFLICT (path) DO UPDATE SET held = excluded.held;
+
 -- name: DeleteProject :exec
 DELETE FROM projects WHERE path = ?;
 
@@ -83,7 +87,8 @@ INSERT INTO sessions (id_hash, user, expires) VALUES (?, ?, ?);
 DELETE FROM sessions WHERE expires < ?;
 
 -- name: GetSession :one
-SELECT user, expires FROM sessions WHERE id_hash = ?;
+-- only admins log in: a session created by a login that raced a demotion is not one
+SELECT s.user, s.expires FROM sessions s JOIN users u ON u.name = s.user WHERE s.id_hash = ? AND u.role = 'admin';
 
 -- name: DeleteSession :exec
 DELETE FROM sessions WHERE id_hash = ?;

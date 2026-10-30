@@ -36,10 +36,11 @@ func newAuthLimiter() *authLimiter {
 
 // check runs fn (a credential check) for the client of r, unless it is refused: errTooManyFails.
 // blocked is true when this failure is the one that got the client refused (log it once).
-// Loopback clients aren't limited: they are `vops ui` tunnels (ssh already authenticated them, and they all
-// share 127.0.0.1) or the host itself; the proxy forwards everyone else with their real address.
+// Loopback clients of the ui listener aren't limited: they are `vops ui` tunnels (ssh already authenticated them,
+// and they all share 127.0.0.1) or the host itself. Through the proxy, loopback is limited like anyone: rootless
+// containers reach it from 127.0.0.1 (pasta).
 func (l *authLimiter) check(r *http.Request, fn func() bool) (ok, blocked bool, err error) {
-	if ip, ok := parseAddr(r.RemoteAddr); ok && ip.IsLoopback() {
+	if ip, ok := parseAddr(r.RemoteAddr); ok && ip.IsLoopback() && r.Context().Value(forwardedKey{}) == nil {
 		return l.run(fn), false, nil
 	}
 	key := clientKey(r.RemoteAddr)

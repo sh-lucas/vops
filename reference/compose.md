@@ -101,7 +101,7 @@ services:
         copy: [db]          # services whose data is copied from production (they run with it too)
 
 x-vops:                     # top level: project settings
-  rate: 20/s                # requests per client ip, per s, m or h (600/m); default unlimited
+  rate: 20/s                # requests per client ip (ipv6: per /64), per s, m or h (600/m); default unlimited
   burst: 40                 # requests allowed at once (default: rate per second rounded up, min 1)
   max_body: 10MB            # request body size: B, KB, MB, GB, 1024-based (10MB = 10485760 bytes); default unlimited
   timeout: 5m               # how long the proxy waits for a container's response headers (whole seconds); default 60s
@@ -110,7 +110,7 @@ x-vops:                     # top level: project settings
 
 `release` gates registry pushes (only them): `auto` deploys, `manual` waits for Approve, `canary` runs the push's jobs, gives each routed rolling service one canary container with that share of clients and waits for Approve. Services with `watch: false` are not gated (pushes don't deploy them anyway). The rules (holds, supersede, reject) are in README "Releases" and reference/decisions.md. Changing `release` touches no container (not part of any service's hash) and doesn't change releases already pending.
 
-Limits apply in the proxy to every routed service of the project (and its previews), per client ip (the tcp peer; `X-Forwarded-For` is ignored): over `rate` the answer is `429` with `Retry-After`, a bigger body `413` (early on `Content-Length`, while streaming for chunked bodies), no response headers within `timeout` `504`. `timeout` only covers the wait for headers: once they arrive, a streamed body (SSE, downloads) runs as long as it wants, so raise it for long polling only. The top-level `timeout` is the proxy's; a service's `x-vops.timeout` is its readiness timeout. They are set in one compose file of the project. A change shows in the plan (`~ limits: unlimited -> rate 20/s burst 40`) and applies without restarting containers.
+Limits apply in the proxy to every routed service of the project (and its previews), per client ip (the tcp peer, ipv6 by /64; `X-Forwarded-For` is ignored): over `rate` the answer is `429` with `Retry-After`, a bigger body `413` (early on `Content-Length`, while streaming for chunked bodies), no response headers within `timeout` `504`. `timeout` only covers the wait for headers: once they arrive, a streamed body (SSE, downloads) runs as long as it wants, so raise it for long polling only. The top-level `timeout` is the proxy's; a service's `x-vops.timeout` is its readiness timeout. They are set in one compose file of the project. A change shows in the plan (`~ limits: unlimited -> rate 20/s burst 40`) and applies without restarting containers.
 
 Domains: project `shop/api` is `api.shop.<domain>`. Each routed service gets `<service>.api.shop.<domain>`; when a project has a single routed service it also gets `api.shop.<domain>`.
 

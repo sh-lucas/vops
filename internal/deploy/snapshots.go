@@ -114,12 +114,32 @@ func (e *Engine) projectData(ctx context.Context, project string) (vols []store.
 	if err != nil {
 		return nil, nil, nil, err
 	}
+	// only the project's own volumes: an external one is another project's, which keeps running while this one restores
+	own := map[string]bool{}
+	if out, err := podman.Run(ctx, "volume", "ls", "--format", "{{.Name}}", "--filter", "label="+LProject+"="+project); err == nil {
+		for _, v := range strings.Fields(out) {
+			own[v] = true
+		}
+	}
+	var specs []*desired
+	if plan, err := e.Plan(ctx); err == nil {
+		for _, pp := range plan.Projects {
+			if pp.Path == project {
+				for _, d := range pp.specs {
+					specs = append(specs, d)
+					for _, v := range d.spec.Volumes { // compose's, without external ones
+						own[v] = true
+					}
+				}
+			}
+		}
+	}
 	for _, c := range cs {
 		uses := false
 		for _, m := range mounts[c.ID] {
 			switch {
 			case !m.RW:
-			case m.Type == "volume" && m.Name != "":
+			case m.Type == "volume" && own[m.Name]:
 				add("volume", m.Name, m.Source)
 				uses = true
 			case m.Type == "bind" && within(m.Source, projectDir):
@@ -132,21 +152,14 @@ func (e *Engine) projectData(ctx context.Context, project string) (vols []store.
 		}
 	}
 	// desired data that no container mounts right now (disabled project, stopped service)
-	if plan, err := e.Plan(ctx); err == nil {
-		for _, pp := range plan.Projects {
-			if pp.Path != project {
-				continue
-			}
-			for _, d := range pp.specs {
-				for _, v := range d.spec.Volumes {
-					add("volume", v, podman.VolumePath(ctx, v))
-				}
-				for _, b := range d.spec.Binds {
-					if within(b, projectDir) {
-						if _, err := os.Stat(b); err == nil {
-							add("bind", bindName(b), b)
-						}
-					}
+	for _, d := range specs {
+		for _, v := range d.spec.Volumes {
+			add("volume", v, podman.VolumePath(ctx, v))
+		}
+		for _, b := range d.spec.Binds {
+			if within(b, projectDir) {
+				if _, err := os.Stat(b); err == nil {
+					add("bind", bindName(b), b)
 				}
 			}
 		}

@@ -132,6 +132,26 @@ func TestSettings(t *testing.T) {
 	}
 }
 
+// The disk alert fires from 70% used by default (the registry refuses uploads at 95%).
+func TestDiskDefault(t *testing.T) {
+	if Defaults.Disk != 70 {
+		t.Fatalf("default disk threshold %d", Defaults.Disk)
+	}
+	at := func(used uint64) bool {
+		st := sysmon.Stats{Filesystems: []sysmon.Filesystem{{Paths: []string{"/home"}, Total: 100, Used: used, Avail: 100 - used}}}
+		for _, c := range hostChecks(st, Defaults) {
+			if c.key == "resources:disk:/home" {
+				return c.cond
+			}
+		}
+		t.Fatal("no disk check")
+		return false
+	}
+	if at(70) || !at(71) {
+		t.Fatal("disk alert threshold")
+	}
+}
+
 func TestSustainedAndHostChecks(t *testing.T) {
 	s := Defaults
 	t0 := time.Unix(0, 0)

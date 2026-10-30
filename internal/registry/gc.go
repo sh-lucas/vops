@@ -2,6 +2,8 @@ package registry
 
 import (
 	"crypto/rand"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -29,20 +31,31 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 		return err == nil && st.ModTime().After(cutoff)
 	}
 
+	// a read that fails (EIO, EMFILE) stops GC before the blob sweep: deleting what it couldn't read loses images
 	keepBlobs := map[string]bool{}
-	for _, name := range reg.Repos() {
+	repos, err := reg.repos()
+	if err != nil {
+		return res, err
+	}
+	for _, name := range repos {
 		// mark: tagged manifests, recent manifests, their children, and referrers of anything kept
 		all := map[string]manifest{}
-		entries, _ := os.ReadDir(reg.repoPath(name, "manifests"))
+		entries, err := os.ReadDir(reg.repoPath(name, "manifests"))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return res, err
+		}
 		for _, e := range entries {
 			d := "sha256:" + e.Name()
 			if !digestRe.MatchString(d) {
 				continue
 			}
 			b, err := os.ReadFile(reg.blobPath(d))
-			if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
 				os.Remove(reg.repoPath(name, "manifests", e.Name()))
 				continue
+			}
+			if err != nil {
+				return res, err
 			}
 			m, _ := parseManifest(b)
 			all[d] = m
@@ -59,7 +72,11 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 				visit(c.Digest)
 			}
 		}
-		for tag, d := range reg.tagMap(name) {
+		tags, err := reg.readTags(name)
+		if err != nil {
+			return res, err
+		}
+		for tag, d := range tags {
 			if _, ok := all[d]; !ok {
 				os.Remove(reg.repoPath(name, "tags", tag))
 				continue
@@ -100,6 +117,7 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 				used[hexOf(x.Digest)] = true
 			}
 		}
+		fresh := false // a push in progress: its repo stays even with no tag yet
 		for _, l := range links {
 			p := reg.repoPath(name, "blobs", l.Name())
 			if used[l.Name()] {
@@ -107,6 +125,7 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 			}
 			if young(p) {
 				keepBlobs[l.Name()] = true
+				fresh = true
 				continue
 			}
 			os.Remove(p)
@@ -120,7 +139,7 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 				}
 			}
 		}
-		if len(keep) == 0 && len(reg.tagMap(name)) == 0 && !young(reg.repoPath(name)) {
+		if len(keep) == 0 && !fresh && len(reg.tagMap(name)) == 0 && !young(reg.repoPath(name)) {
 			reg.removeRepo(name)
 		}
 	}
@@ -145,6 +164,7 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 		p := filepath.Join(reg.Root, "uploads", e.Name())
 		if st, err := e.Info(); err == nil && time.Since(st.ModTime()) > 24*time.Hour {
 			os.Remove(p)
+			reg.uploading.Delete(strings.TrimSuffix(e.Name(), ".repo"))
 		}
 	}
 	return res, nil

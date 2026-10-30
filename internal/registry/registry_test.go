@@ -23,6 +23,7 @@ import (
 // testRegistry: "alice" pushes/pulls app/*, "admin" pulls everything and pushes nothing.
 func testRegistry(t *testing.T) (*Registry, *httptest.Server, chan string) {
 	t.Helper()
+	fakeDisk(t, 100, 900) // the machine's own disk must not decide a test
 	reg, err := New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -44,6 +45,14 @@ func testRegistry(t *testing.T) (*Registry, *httptest.Server, chan string) {
 	srv := httptest.NewServer(reg)
 	t.Cleanup(srv.Close)
 	return reg, srv, pushed
+}
+
+// fakeDisk makes statfs report usedGB used and availGB available.
+func fakeDisk(t *testing.T, usedGB, availGB uint64) {
+	t.Helper()
+	old := statfs
+	statfs = func(string) (uint64, uint64, error) { return usedGB << 30, availGB << 30, nil }
+	t.Cleanup(func() { statfs = old })
 }
 
 func host(srv *httptest.Server) string { return strings.TrimPrefix(srv.URL, "http://") }
@@ -342,6 +351,62 @@ func TestGC(t *testing.T) {
 		t.Fatalf("repos after removing app/a: %v", got)
 	}
 	c.expect(c.do("GET", "/v2/app/a/web/manifests/latest", nil), 200)
+
+	// a push in progress into an old empty repo keeps its fresh layers linked
+	fresh := pushBlob(c, "app/later", []byte("fresh layer"))
+	past := time.Now().Add(-2 * time.Hour)
+	os.Chtimes(reg.repoPath("app/later"), past, past)
+	if _, err := reg.GC(time.Hour, nil); err != nil {
+		t.Fatal(err)
+	}
+	c.expect(c.do("GET", "/v2/app/later/blobs/"+fresh, nil), 200)
+
+	// a dir it can't read stops gc before it deletes anything
+	os.Chmod(reg.repoPath("app/a/web", "manifests"), 0)
+	if _, err := reg.GC(0, nil); err == nil {
+		t.Error("gc ignored a read error")
+	}
+	os.Chmod(reg.repoPath("app/a/web", "manifests"), 0o755)
+	c.expect(c.do("GET", "/v2/app/a/web/manifests/latest", nil), 200)
+}
+
+// A PATCH still sending can't append to the blob a PUT of the same upload published: the PUT waits for it.
+func TestUploadSerialized(t *testing.T) {
+	reg, srv, _ := testRegistry(t)
+	c := client{t, srv.URL, "alice"}
+	loc := c.expect(c.do("POST", "/v2/app/a/blobs/uploads/", nil), 202).Header.Get("Location")
+	send := func(method, path string, body io.Reader, code chan<- int) {
+		req, _ := http.NewRequest(method, srv.URL+path, body)
+		req.SetBasicAuth("alice", "secret")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			code <- 0
+			return
+		}
+		resp.Body.Close()
+		code <- resp.StatusCode
+	}
+	pr, pw := io.Pipe()
+	patched, put := make(chan int, 1), make(chan int, 1)
+	go send("PATCH", loc, pr, patched)
+	pw.Write([]byte("hello ")) // returns once the server reads it: the PATCH is writing
+	layer := []byte("hello world")
+	go send("PUT", loc+"?digest="+digestOf(layer), strings.NewReader("world"), put)
+	select {
+	case code := <-put:
+		t.Fatalf("PUT finished while a PATCH was writing: %d", code)
+	case <-time.After(200 * time.Millisecond):
+	}
+	pw.Close()
+	if code := <-patched; code != 202 {
+		t.Fatalf("patch: %d", code)
+	}
+	if code := <-put; code != 201 {
+		t.Fatalf("put: %d", code)
+	}
+	if b, _ := os.ReadFile(reg.blobPath(digestOf(layer))); string(b) != string(layer) {
+		t.Fatalf("blob %q", b)
+	}
 }
 
 // Auth outcomes, permissions and inputs a client controls: each gets the right status and changes nothing.
@@ -403,6 +468,111 @@ func TestAuthAndInputs(t *testing.T) {
 	reg.GC(0, nil)
 	if exists(stale) || reg.Resolve("app/a", "v1.tmp2") == "" {
 		t.Fatal("gc: the temp file stays or the tag went")
+	}
+}
+
+// A nearly full disk refuses new data (507 DENIED) at every step of an upload, but not manifests or mounts, and leaves no upload file.
+func TestDiskFull(t *testing.T) {
+	reg, srv, _ := testRegistry(t)
+	c := client{t, srv.URL, "alice"}
+	// uploads checks how many upload files (an upload is two) are left
+	uploads := func(want int) {
+		t.Helper()
+		if e, _ := os.ReadDir(filepath.Join(reg.Root, "uploads")); len(e) != want*2 {
+			t.Fatalf("%d upload files, want %d uploads", len(e), want)
+		}
+	}
+	refused := func(resp *http.Response) {
+		t.Helper()
+		if b := readAll(c.expect(resp, 507)); !strings.Contains(b, `"DENIED"`) || !strings.Contains(b, "registry disk is") {
+			t.Fatalf("body: %s", b)
+		}
+	}
+	blob := []byte("layer")
+	cfg := pushBlob(c, "app/a", []byte("{}"))
+	newUpload := func() string {
+		return c.expect(c.do("POST", "/v2/app/a/blobs/uploads/", nil), 202).Header.Get("Location")
+	}
+
+	for _, tc := range []struct {
+		name        string
+		used, avail uint64 // GB
+		refuse      string // part of the message, empty = allowed
+	}{
+		{"exactly 95% used and over 2GB free", 9500, 500, ""},
+		{"over 95% used", 96, 4, "96.0% full"},
+		{"under 2GB free", 5, 1, "1.0GB free"},
+		{"plenty", 100, 900, ""},
+	} {
+		fakeDisk(t, tc.used, tc.avail)
+		if tc.refuse == "" {
+			d := pushBlob(c, "app/a", []byte(tc.name))
+			c.expect(c.do("GET", "/v2/app/a/blobs/"+d, nil), 200)
+			continue
+		}
+		if !strings.Contains(readAll(c.do("POST", "/v2/app/a/blobs/uploads/", nil)), tc.refuse) {
+			t.Fatalf("%s: message lacks %q", tc.name, tc.refuse)
+		}
+		refused(c.do("POST", "/v2/app/a/blobs/uploads/", nil))
+		refused(c.do("POST", "/v2/app/a/blobs/uploads/?digest="+digestOf(blob), blob))
+		uploads(0)
+		// manifests and mounts write nothing that grows, so they stay allowed
+		pushManifest(c, "app/a", "latest", cfg)
+		c.expect(c.do("POST", "/v2/app/b/blobs/uploads/?mount="+cfg+"&from=app/a", nil), 201)
+	}
+
+	// an upload that was fine when it started is refused (and dropped) at its PATCH and at its PUT
+	fakeDisk(t, 100, 900)
+	patch, put := newUpload(), newUpload()
+	fakeDisk(t, 99, 1)
+	refused(c.do("PATCH", patch, blob))
+	uploads(1)
+	refused(c.do("PUT", put+"?digest="+digestOf(blob), nil))
+	uploads(0)
+
+	// a body that streams is checked every diskCheckEvery bytes: the disk fills after the first chunk of ten
+	fakeDisk(t, 100, 900)
+	loc := newUpload()
+	old := diskCheckEvery
+	diskCheckEvery = 1024
+	t.Cleanup(func() { diskCheckEvery = old })
+	calls := 0
+	statfs = func(string) (uint64, uint64, error) {
+		if calls++; calls > 1 {
+			return 99 << 30, 1 << 30, nil
+		}
+		return 100 << 30, 900 << 30, nil
+	}
+	refused(c.do("PATCH", loc, bytes.Repeat([]byte("x"), 10*1024)))
+	uploads(0)
+	if calls != 2 {
+		t.Fatalf("%d disk checks", calls)
+	}
+}
+
+// An index counts each child once, and one that points at itself ends.
+func TestImageSize(t *testing.T) {
+	reg, _, _ := testRegistry(t)
+	put := func(d string, content string) string {
+		p := reg.blobPath(d)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return d
+	}
+	child := `{"config":{"size":10},"layers":[{"size":100}]}`
+	cd := put(digestOf([]byte(child)), child)
+	index := fmt.Sprintf(`{"manifests":[{"digest":%q},{"digest":%q}]}`, cd, cd)
+	id := put(digestOf([]byte(index)), index)
+	if got, want := reg.imageSize(id, 0, map[string]bool{}), int64(len(index)+len(child)+110); got != want {
+		t.Fatalf("index with a child twice: %d, want %d", got, want)
+	}
+	self := digestOf([]byte("self"))
+	loop := fmt.Sprintf(`{"manifests":[{"digest":%q}]}`, self)
+	put(self, loop)
+	if got := reg.imageSize(self, 0, map[string]bool{}); got != int64(len(loop)) {
+		t.Fatalf("self-referencing index: %d, want %d", got, len(loop))
 	}
 }
 

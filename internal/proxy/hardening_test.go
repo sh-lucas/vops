@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -245,5 +246,111 @@ func TestUpgrade(t *testing.T) {
 	fmt.Fprint(c, "hi\n")
 	if line, err := br.ReadString('\n'); err != nil || line != "echo hi\n" {
 		t.Fatalf("upgraded connection: %q %v", line, err)
+	}
+}
+
+// A replica that refuses connections costs a retry on the next one, not a 502: every request is answered, bodies (sized or chunked) arrive whole, max_body still answers 413.
+func TestFailoverToTheNextReplica(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			return
+		}
+		fmt.Fprintf(w, "%s %s %s", r.Method, r.Host, b)
+	}))
+	t.Cleanup(up.Close)
+	tb := NewTable()
+	tb.SetRoutes([]Route{{Project: "a", Service: "web", Domains: []string{"a.test"}, Backends: []string{freeAddr(t), strings.TrimPrefix(up.URL, "http://")}, Limits: &Limits{MaxBody: 1 << 10}}})
+	h := Handler(tb)
+	srv := httptest.NewServer(idleBodies(h))
+	t.Cleanup(srv.Close)
+	for i := range 4 { // round-robin: half of them start at the dead replica
+		var body io.Reader = strings.NewReader(fmt.Sprint("body ", i))
+		if i >= 2 {
+			body = io.MultiReader(body) // unknown length: chunked
+		}
+		req, _ := http.NewRequest("POST", srv.URL, body)
+		if code, got := do(t, srv, req); code != 200 || got != fmt.Sprint("POST a.test body ", i) {
+			t.Fatalf("request %d: %d %q", i, code, got)
+		}
+	}
+	for range 2 {
+		if w := serve(h, "10.0.0.1", "POST", io.LimitReader(zeros{}, 1<<20), -1); w.Code != 413 {
+			t.Fatalf("chunked over max_body: %d %s", w.Code, w.Body)
+		}
+	}
+}
+
+// Failover stays in the request's group: a canary client never lands on stable, even with every canary replica down, and the groups count what their clients got.
+func TestFailoverStaysInItsGroup(t *testing.T) {
+	answer := func(name string) string {
+		s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { io.WriteString(w, name) }))
+		t.Cleanup(s.Close)
+		return strings.TrimPrefix(s.URL, "http://")
+	}
+	stable, canary, dead := answer("stable"), answer("canary"), freeAddr(t)
+	tb := NewTable()
+	tb.SetRoutes([]Route{{Project: "a", Service: "web", Domains: []string{"a.test"}, Backends: []string{dead, stable}, Canary: &Canary{ID: 1, Weight: 50, Backends: []string{dead, canary}}}})
+	srv := httptest.NewServer(Handler(tb))
+	t.Cleanup(srv.Close)
+	get := func(group string) (int, string) {
+		req, _ := http.NewRequest("GET", srv.URL, nil)
+		req.Header.Set("Cookie", CanaryCookie+"=1."+group)
+		return do(t, srv, req)
+	}
+	for range 2 { // each group's round-robin starts once at the dead replica
+		for group, want := range map[string]string{"on": "canary", "off": "stable"} {
+			if code, body := get(group); code != 200 || body != want {
+				t.Fatalf("%s: %d %q", group, code, body)
+			}
+		}
+	}
+	tb.SetCanary(Key{"a", "web"}, &Canary{ID: 1, Weight: 50, Backends: []string{dead}})
+	if code, body := get("on"); code != 502 {
+		t.Fatalf("canary group down: %d %q, want a 502, not stable", code, body)
+	}
+	for deadline := time.Now().Add(5 * time.Second); ; time.Sleep(20 * time.Millisecond) {
+		st := tb.Canaries()["a/web"]
+		if st.Canary == (Counts{3, 1}) && st.Stable == (Counts{2, 0}) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stats: %+v", st)
+		}
+	}
+}
+
+// A replica that took the request and then dropped the connection is not retried: the request may have run.
+func TestNoFailoverOnceWritten(t *testing.T) {
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	go func() {
+		for {
+			c, err := l.Accept()
+			if err != nil {
+				return
+			}
+			http.ReadRequest(bufio.NewReader(c))
+			c.Close()
+		}
+	}()
+	var hits atomic.Int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hits.Add(1) }))
+	t.Cleanup(up.Close)
+	tb := NewTable()
+	tb.SetRoutes([]Route{{Project: "a", Service: "web", Domains: []string{"a.test"}, Backends: []string{l.Addr().String(), strings.TrimPrefix(up.URL, "http://")}}})
+	srv := httptest.NewServer(Handler(tb))
+	t.Cleanup(srv.Close)
+	codes := map[int]int{}
+	for range 2 { // no body: only the written request stops the retry
+		req, _ := http.NewRequest("POST", srv.URL, nil)
+		code, _ := do(t, srv, req)
+		codes[code]++
+	}
+	if codes[200] != 1 || codes[502] != 1 || hits.Load() != 1 {
+		t.Fatalf("codes %v, live replica hit %d times", codes, hits.Load())
 	}
 }

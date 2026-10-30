@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -196,6 +198,17 @@ networks:
 	if ids := running(v.containers(p)); len(ids) != 0 {
 		t.Fatal("a project with mixed data was started")
 	}
+	// held: neither boot nor an apply starts it on mixed data
+	if flags, _ := v.e.DB.Projects(); !strings.Contains(flags[p].Held, "partly restored") {
+		t.Fatalf("not held: %+v", flags[p])
+	}
+	v.e.StartStopped(ctx, io.Discard)
+	if _, out, err := v.apply(ApplyOpts{}); err == nil || !strings.Contains(out, p+": ✗ held: ") {
+		t.Fatalf("apply of a held project: %v\n%s", err, out)
+	}
+	if ids := running(v.containers(p)); len(ids) != 0 {
+		t.Fatal("a held project was started")
+	}
 	latest, _ := v.e.DB.Snapshots(p)
 	if latest[0].Reason != "pre-rollback" {
 		t.Fatalf("no undo point: %+v", latest[0])
@@ -203,10 +216,70 @@ networks:
 	if err := v.e.Rollback(ctx, io.Discard, RollbackOpts{Project: p, Snapshot: latest[0].ID}); err != nil {
 		t.Fatal(err)
 	}
+	if flags, _ := v.e.DB.Projects(); flags[p].Held != "" {
+		t.Fatalf("still held after a good restore: %q", flags[p].Held)
+	}
+	v.e.DB.SetHeld(p, "by the test") // a restart by hand releases it too
 	if err := v.e.Restart(ctx, p, ""); err != nil {
 		t.Fatal(err)
 	}
+	if flags, _ := v.e.DB.Projects(); flags[p].Held != "" {
+		t.Fatalf("still held after a restart: %q", flags[p].Held)
+	}
 	if got := read(); got != "B|B" {
 		t.Fatalf("after recovering: %q", got)
+	}
+}
+
+// A daemon that died during a rolling release left new replicas that never finished readiness: boot removes
+// them and routes only the old ones.
+func TestBootDropsInterruptedRollout(t *testing.T) {
+	v := newEnv(t)
+	ctx := context.Background()
+	p, host := v.ns+"/web", "web."+v.ns+".test"
+	v.e.DB.SetEnv(p, "MSG", "v1")
+	v.commit(map[string]string{p + "/compose.yml": "services:\n  app:\n    image: APP\n    environment: [MSG]\n    x-vops: {port: 8080, domains: [" + host + "]}\n"})
+	v.mustApply()
+	old := running(v.containers(p))
+	time.Sleep(time.Second) // podman's Created has seconds
+	v.e.DB.SetEnv(p, "MSG", "v2")
+	plan, err := v.e.Plan(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i := slices.IndexFunc(plan.Projects, func(pp *ProjectPlan) bool { return pp.Path == p })
+	if _, err := v.e.start(ctx, plan.Projects[i].specs["app"]); err != nil { // started, readiness never ran
+		t.Fatal(err)
+	}
+	v.e.StartStopped(ctx, io.Discard)
+	if cs := v.containers(p); len(cs) != 1 || !slices.Equal(running(cs), old) {
+		t.Fatalf("after boot: %d containers, running %v, want %v", len(cs), running(cs), old)
+	}
+	for range 5 {
+		if _, body := v.get(host); body != "v1" {
+			t.Fatalf("unready replica routed: %q", body)
+		}
+	}
+	if evs, _ := v.e.DB.Events(p, 10); len(evs) == 0 || !strings.Contains(evs[0].Message, "rolling release interrupted") {
+		t.Fatalf("events: %+v", evs)
+	}
+}
+
+// A host repo whose HEAD can't be read while projects run is a plan error: apply removes nothing.
+func TestUnreadableHeadRemovesNothing(t *testing.T) {
+	v := newEnv(t)
+	p := v.ns + "/web"
+	v.commit(map[string]string{p + "/compose.yml": "services:\n  app:\n    image: APP\n"})
+	v.mustApply()
+	ids := running(v.containers(p))
+	os.WriteFile(filepath.Join(v.repo, ".git", "HEAD"), []byte("garbage\n"), 0o644)
+	if _, err := v.e.Plan(context.Background()); err == nil || !strings.Contains(err.Error(), "no readable HEAD") {
+		t.Fatalf("plan with a broken HEAD: %v", err)
+	}
+	if _, out, err := v.apply(ApplyOpts{}); err == nil {
+		t.Fatalf("apply with a broken HEAD succeeded:\n%s", out)
+	}
+	if now := running(v.containers(p)); len(ids) != 1 || !slices.Equal(now, ids) {
+		t.Fatalf("containers: %v, want %v", now, ids)
 	}
 }

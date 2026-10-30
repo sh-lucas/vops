@@ -21,6 +21,8 @@ func TestAuditTriggers(t *testing.T) {
 	db.SetDisabled("shop", true)
 	db.SetDisabled("shop", false)
 	db.SetApplied("shop", "abcdef1234567890")
+	db.SetHeld("shop", "data partly restored")
+	db.SetHeld("shop", "")
 	db.SetEnv("shop", "DB_PASSWORD", "hunter2")
 	db.SetEnv("shop", "DB_PASSWORD", "hunter3")
 	db.UnsetEnv("shop", "DB_PASSWORD")
@@ -51,6 +53,8 @@ func TestAuditTriggers(t *testing.T) {
 		"projects insert shop disabled",
 		"projects update shop enabled",
 		"projects update shop commit  -> abcdef123456",
+		"projects update shop held\n",
+		"projects update shop not held",
 		"env insert shop DB_PASSWORD",
 		"env update shop DB_PASSWORD value changed",
 		"env delete shop DB_PASSWORD",

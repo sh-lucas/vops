@@ -239,7 +239,7 @@ func Host(h string) string {
 	return strings.ToLower(strings.TrimSuffix(h, "."))
 }
 
-type ctxKey struct{}
+type ctxKey struct{} // the request's backends in order: the first gets it, the rest of its group are the failover
 
 type timeoutKey struct{}
 
@@ -320,6 +320,47 @@ func (b cancelBody) Close() error {
 	return err
 }
 
+// failover tries the next backend of the request's group when a dial fails: nothing was sent, so a dead replica costs a retry, not a 502.
+// Never once the request went out (a timeout or reset may have run it), nor once a byte of its body was read.
+type failover struct{ rt http.RoundTripper }
+
+func (f failover) RoundTrip(r *http.Request) (*http.Response, error) {
+	backends, _ := r.Context().Value(ctxKey{}).([]string)
+	if len(backends) < 2 {
+		return f.rt.RoundTrip(r)
+	}
+	var body *replayBody
+	if r.Body != nil && r.Body != http.NoBody {
+		body = &replayBody{ReadCloser: r.Body}
+	}
+	for i := 0; ; i++ {
+		out, u := *r, *r.URL
+		u.Host = backends[i]
+		out.URL = &u
+		if body != nil {
+			out.Body = body
+		}
+		resp, err := f.rt.RoundTrip(&out)
+		var op *net.OpError
+		if err == nil || i == len(backends)-1 || !errors.As(err, &op) || op.Op != "dial" || r.Context().Err() != nil || body != nil && body.read.Load() {
+			return resp, err
+		}
+	}
+}
+
+// replayBody survives a failed dial: the Transport closes the body on any error, ReverseProxy closes the real one.
+type replayBody struct {
+	io.ReadCloser
+	read atomic.Bool
+}
+
+func (b *replayBody) Read(p []byte) (int, error) {
+	b.read.Store(true)
+	return b.ReadCloser.Read(p)
+}
+
+func (b *replayBody) Close() error { return nil }
+
 // Handler proxies to the table, round-robin over replicas.
 func Handler(t *Table) http.Handler {
 	dialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
@@ -331,13 +372,13 @@ func Handler(t *Table) http.Handler {
 	rp := &httputil.ReverseProxy{
 		// SetXForwarded overwrites X-Forwarded-*: ReverseProxy drops the client's before Rewrite
 		Rewrite: func(r *httputil.ProxyRequest) {
-			backend := r.In.Context().Value(ctxKey{}).(string)
+			backend := r.In.Context().Value(ctxKey{}).([]string)[0]
 			r.Out.URL.Scheme = "http"
 			r.Out.URL.Host = backend
 			r.Out.Host = r.In.Host
 			r.SetXForwarded()
 		},
-		Transport: headerTimeout{transport},
+		Transport: headerTimeout{failover{transport}},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			switch mbe := (*http.MaxBytesError)(nil); {
 			case errors.As(err, &mbe):
@@ -366,7 +407,7 @@ func Handler(t *Table) http.Handler {
 			timeout = time.Duration(tg.limits.Timeout) * time.Second
 		}
 		if tg.e.canary == nil {
-			ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, tg.stable()[0]), timeoutKey{}, timeout)
+			ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, tg.stable()), timeoutKey{}, timeout)
 			rp.ServeHTTP(w, r.WithContext(ctx))
 			return
 		}
@@ -380,7 +421,7 @@ func Handler(t *Table) http.Handler {
 		}
 		sw := &statusWriter{ResponseWriter: w}
 		defer func() { t.count(tg.key, tg.e.canary, on, sw.code) }() // also when the client left mid-stream (ErrAbortHandler)
-		ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, backends[0]), timeoutKey{}, timeout)
+		ctx := context.WithValue(context.WithValue(r.Context(), ctxKey{}, backends), timeoutKey{}, timeout)
 		rp.ServeHTTP(sw, r.WithContext(ctx))
 	})
 }

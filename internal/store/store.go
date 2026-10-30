@@ -143,13 +143,14 @@ type Project struct {
 	Commit    string `json:"commit"`
 	AppliedAt int64  `json:"applied_at"`
 	Limits    string `json:"limits,omitempty"` // proxy limits as applied (json proxy.Limits), '' = none
+	Held      string `json:"held,omitempty"`   // why vops must not start or deploy it, '' = not held
 }
 
 func (d *DB) Projects() (map[string]Project, error) {
 	rows, err := d.q.ListProjects(ctx)
 	out := map[string]Project{}
 	for _, r := range rows {
-		out[r.Path] = Project{r.Path, r.Disabled, r.CommitSha, r.AppliedAt, r.Limits}
+		out[r.Path] = Project{r.Path, r.Disabled, r.CommitSha, r.AppliedAt, r.Limits, r.Held}
 	}
 	return out, err
 }
@@ -165,6 +166,11 @@ func (d *DB) SetApplied(path, commit string) error {
 // SetLimits records a project's applied proxy limits (json, ” = none).
 func (d *DB) SetLimits(path, limits string) error {
 	return d.q.SetProjectLimits(ctx, queries.SetProjectLimitsParams{Path: path, Limits: limits})
+}
+
+// SetHeld holds a project with a reason, or releases it with an empty one.
+func (d *DB) SetHeld(path, reason string) error {
+	return d.q.SetProjectHeld(ctx, queries.SetProjectHeldParams{Path: path, Held: reason})
 }
 
 func (d *DB) DeleteProject(path string) error { return d.q.DeleteProject(ctx, path) }

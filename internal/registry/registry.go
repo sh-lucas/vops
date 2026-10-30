@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -49,7 +50,8 @@ type Registry struct {
 	// OnPush is called (in a goroutine) after a tag is written.
 	OnPush func(Push)
 
-	mu sync.Mutex // guards tag/manifest writes against GC
+	mu        sync.Mutex // guards tag/manifest writes against GC
+	uploading sync.Map   // upload id -> *sync.Mutex: a PATCH still writing must not append to the blob a PUT published
 }
 
 var (
@@ -60,6 +62,39 @@ var (
 )
 
 const maxManifest = 4 << 20
+
+// Uploads are refused when the filesystem of Root is over maxDiskUsed percent used or has under minDiskFree bytes available:
+// a full disk also breaks sqlite, journald and the containers, and a push has no size limit.
+const (
+	maxDiskUsed = 95
+	minDiskFree = 2 << 30
+)
+
+// diskCheckEvery is how many body bytes are copied between two disk checks (a var for tests).
+var diskCheckEvery int64 = 64 << 20
+
+// statfs returns used (like df: total minus free) and available (to unprivileged users) bytes; a var for tests.
+var statfs = func(path string) (used, avail uint64, err error) {
+	var st syscall.Statfs_t
+	if err := syscall.Statfs(path, &st); err != nil {
+		return 0, 0, err
+	}
+	return (st.Blocks - st.Bfree) * uint64(st.Bsize), st.Bavail * uint64(st.Bsize), nil
+}
+
+// diskFull is the 507 for an upload on a nearly full disk, nil when it may go on (or the disk can't be read: fail open).
+func (reg *Registry) diskFull() *apiErr {
+	used, avail, err := statfs(reg.Root)
+	if err != nil || used+avail == 0 {
+		return nil
+	}
+	if used*100 <= maxDiskUsed*(used+avail) && avail >= minDiskFree {
+		return nil
+	}
+	pct := float64(used) / float64(used+avail) * 100
+	return errf(507, "DENIED", "registry disk is %.1f%% full (%.1fGB free): refusing uploads above %d%% used or under %dGB free; free space or run vops registry gc",
+		pct, float64(avail)/(1<<30), maxDiskUsed, minDiskFree>>30)
+}
 
 func New(root string) (*Registry, error) {
 	for _, d := range []string{"blobs/sha256", "repos", "uploads"} {
@@ -94,6 +129,9 @@ func writeErr(w http.ResponseWriter, e *apiErr) {
 
 func (reg *Registry) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Docker-Distribution-API-Version", "registry/2.0")
+	// a pushed manifest picks its own Content-Type: a browser must never run it (vops.<domain>/v2/ is the dashboard's origin)
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 	perm, err := reg.authenticate(r)
 	if err != nil {
 		w.Header().Set("Retry-After", "900")
@@ -275,6 +313,9 @@ func (reg *Registry) upload(w http.ResponseWriter, r *http.Request, perm *Perm, 
 				return nil
 			}
 		}
+		if err := reg.diskFull(); err != nil {
+			return err
+		}
 		id = newUUID()
 		if err := os.WriteFile(reg.uploadPath(id), nil, 0o644); err != nil {
 			return errf(500, "UNKNOWN", "%v", err)
@@ -290,6 +331,9 @@ func (reg *Registry) upload(w http.ResponseWriter, r *http.Request, perm *Perm, 
 	if !uuidRe.MatchString(id) {
 		return errf(404, "BLOB_UPLOAD_UNKNOWN", "upload %q", id)
 	}
+	mu, _ := reg.uploading.LoadOrStore(id, new(sync.Mutex))
+	mu.(*sync.Mutex).Lock()
+	defer mu.(*sync.Mutex).Unlock()
 	if repo, err := os.ReadFile(reg.uploadPath(id) + ".repo"); err != nil || string(repo) != name {
 		return errf(404, "BLOB_UPLOAD_UNKNOWN", "upload %q", id)
 	}
@@ -303,8 +347,7 @@ func (reg *Registry) upload(w http.ResponseWriter, r *http.Request, perm *Perm, 
 		w.WriteHeader(204)
 		return nil
 	case http.MethodDelete:
-		os.Remove(reg.uploadPath(id))
-		os.Remove(reg.uploadPath(id) + ".repo")
+		reg.dropUpload(id)
 		w.WriteHeader(204)
 		return nil
 	case http.MethodPatch:
@@ -315,9 +358,9 @@ func (reg *Registry) upload(w http.ResponseWriter, r *http.Request, perm *Perm, 
 				return errf(416, "BLOB_UPLOAD_INVALID", "range %s does not start at %d", cr, st.Size())
 			}
 		}
-		size, err := appendBody(reg.uploadPath(id), r.Body)
-		if err != nil {
-			return errf(500, "UNKNOWN", "%v", err)
+		size, aerr := reg.appendBody(id, r.Body)
+		if aerr != nil {
+			return aerr
 		}
 		reg.uploadAccepted(w, name, id, size)
 		w.WriteHeader(202)
@@ -328,31 +371,51 @@ func (reg *Registry) upload(w http.ResponseWriter, r *http.Request, perm *Perm, 
 	return errf(405, "UNSUPPORTED", "method %s", r.Method)
 }
 
-func appendBody(path string, body io.Reader) (int64, error) {
-	f, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0o644)
+// dropUpload deletes an upload's files.
+func (reg *Registry) dropUpload(id string) {
+	os.Remove(reg.uploadPath(id))
+	os.Remove(reg.uploadPath(id) + ".repo")
+	reg.uploading.Delete(id) // a request waiting on its lock finds the upload gone
+}
+
+// appendBody checks the disk before the first byte and then every diskCheckEvery: one huge layer can't fill it. A refusal drops the upload.
+func (reg *Registry) appendBody(id string, body io.Reader) (int64, *apiErr) {
+	f, err := os.OpenFile(reg.uploadPath(id), os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		return 0, err
+		return 0, errf(500, "UNKNOWN", "%v", err)
 	}
 	defer f.Close()
-	if _, err := io.Copy(f, body); err != nil {
-		return 0, err
+	for {
+		if aerr := reg.diskFull(); aerr != nil {
+			reg.dropUpload(id)
+			return 0, aerr
+		}
+		if _, err := io.CopyN(f, body, diskCheckEvery); err == io.EOF {
+			break
+		} else if err != nil {
+			return 0, errf(500, "UNKNOWN", "%v", err)
+		}
 	}
 	st, err := f.Stat()
-	if err != nil {
-		return 0, err
+	if err == nil {
+		err = f.Sync()
 	}
-	return st.Size(), f.Sync()
+	if err != nil {
+		return 0, errf(500, "UNKNOWN", "%v", err)
+	}
+	return st.Size(), nil
 }
 
 func (reg *Registry) finishUpload(w http.ResponseWriter, r *http.Request, name, id, digest string) *apiErr {
 	path := reg.uploadPath(id)
 	defer os.Remove(path + ".repo")
+	defer reg.uploading.Delete(id) // a request waiting on its lock finds the upload gone
 	if !digestRe.MatchString(digest) {
 		os.Remove(path)
 		return errf(400, "DIGEST_INVALID", "invalid digest %q", digest)
 	}
-	if _, err := appendBody(path, r.Body); err != nil {
-		return errf(500, "UNKNOWN", "%v", err)
+	if _, aerr := reg.appendBody(id, r.Body); aerr != nil {
+		return aerr
 	}
 	f, err := os.Open(path)
 	if err != nil {
@@ -515,6 +578,8 @@ func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, user, n
 	if mt == "" {
 		mt = ociManifest
 	}
+	reg.mu.Lock() // before checking the refs: GC must not sweep them before the manifest is written
+	defer reg.mu.Unlock()
 	for _, d := range m.refs() {
 		if !digestRe.MatchString(d.Digest) {
 			return errf(400, "MANIFEST_INVALID", "invalid digest %q", d.Digest)
@@ -527,8 +592,6 @@ func (reg *Registry) putManifest(w http.ResponseWriter, r *http.Request, user, n
 			return errf(400, "MANIFEST_BLOB_UNKNOWN", "blob %s not in %s", d.Digest, name)
 		}
 	}
-	reg.mu.Lock()
-	defer reg.mu.Unlock()
 	dst := reg.blobPath(digest)
 	if !exists(dst) {
 		os.MkdirAll(filepath.Dir(dst), 0o755)
@@ -574,18 +637,30 @@ func isIndexChild(m manifest, d descriptor) bool {
 // ---- tags, catalog, referrers
 
 func (reg *Registry) tagMap(name string) map[string]string {
+	out, _ := reg.readTags(name)
+	return out
+}
+
+// readTags is tagMap with its errors (a missing repo or tag isn't one): GC must not delete what it failed to read.
+func (reg *Registry) readTags(name string) (map[string]string, error) {
 	out := map[string]string{}
-	entries, _ := os.ReadDir(reg.repoPath(name, "tags"))
+	entries, err := os.ReadDir(reg.repoPath(name, "tags"))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return out, err
+	}
 	for _, e := range entries {
 		if strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		b, err := os.ReadFile(reg.repoPath(name, "tags", e.Name()))
-		if err == nil {
+		switch {
+		case err == nil:
 			out[e.Name()] = strings.TrimSpace(string(b))
+		case !errors.Is(err, fs.ErrNotExist):
+			return out, err
 		}
 	}
-	return out
+	return out, nil
 }
 
 func paginate(w http.ResponseWriter, r *http.Request, items []string) []string {
@@ -695,10 +770,22 @@ func ValidName(name string) bool {
 
 // Repos lists every repository name.
 func (reg *Registry) Repos() []string {
+	out, _ := reg.repos()
+	return out
+}
+
+// repos is Repos with its errors: a repo GC can't see would lose its blobs.
+func (reg *Registry) repos() ([]string, error) {
 	var out []string
 	base := filepath.Join(reg.Root, "repos")
-	filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
-		if err != nil || !d.IsDir() {
+	err := filepath.WalkDir(base, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.IsDir() {
 			return nil
 		}
 		switch d.Name() {
@@ -711,7 +798,7 @@ func (reg *Registry) Repos() []string {
 		return nil
 	})
 	slices.Sort(out)
-	return out
+	return out, err
 }
 
 type Tag struct {
@@ -725,7 +812,7 @@ type Tag struct {
 func (reg *Registry) Tags(name string) []Tag {
 	out := []Tag{}
 	for tag, digest := range reg.tagMap(name) {
-		t := Tag{Name: tag, Digest: digest, Size: reg.imageSize(digest, 0)}
+		t := Tag{Name: tag, Digest: digest, Size: reg.imageSize(digest, 0, map[string]bool{})}
 		if st, err := os.Stat(reg.repoPath(name, "tags", tag)); err == nil {
 			t.PushedAt = st.ModTime()
 		}
@@ -735,9 +822,14 @@ func (reg *Registry) Tags(name string) []Tag {
 	return out
 }
 
-func (reg *Registry) imageSize(digest string, depth int) int64 {
+// imageSize counts each child once: an index repeating its children can't make it read the disk billions of times.
+func (reg *Registry) imageSize(digest string, depth int, seen map[string]bool) int64 {
+	if depth > 2 || seen[digest] || !digestRe.MatchString(digest) {
+		return 0
+	}
+	seen[digest] = true
 	b, err := os.ReadFile(reg.blobPath(digest))
-	if err != nil || depth > 2 {
+	if err != nil {
 		return 0
 	}
 	m, err := parseManifest(b)
@@ -752,7 +844,7 @@ func (reg *Registry) imageSize(digest string, depth int) int64 {
 		size += l.Size
 	}
 	for _, c := range m.Manifests {
-		size += reg.imageSize(c.Digest, depth+1)
+		size += reg.imageSize(c.Digest, depth+1, seen)
 	}
 	return size
 }

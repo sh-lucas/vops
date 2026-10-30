@@ -44,6 +44,8 @@ type Daemon struct {
 	restart    chan struct{}                 // the ui listener changed: Run returns ErrRestart
 	pullToken  string
 	authCache  sync.Map     // sha256(user:pass) -> cachedAuth
+	authMu     sync.Mutex   // a check that read the db before a user change must not cache its answer after forgetAuth
+	authGen    uint64       // bumped by forgetAuth (under authMu)
 	limiter    *authLimiter // wrong credentials per client, dashboard and registry together (limit.go)
 	proxy      *proxy.Client
 	pushMu     sync.Mutex
@@ -260,6 +262,9 @@ func (d *Daemon) registryAuth(r *http.Request, user, pass string) (*registry.Per
 	if c, ok := d.authCache.Load(key); ok && time.Now().Before(c.(cachedAuth).expires) {
 		return c.(cachedAuth).perm, nil
 	}
+	d.authMu.Lock()
+	gen := d.authGen
+	d.authMu.Unlock()
 	var u store.User
 	ok, blocked, err := d.limiter.check(r, func() bool {
 		var ok bool
@@ -273,13 +278,22 @@ func (d *Daemon) registryAuth(r *http.Request, user, pass string) (*registry.Per
 		return nil, err
 	}
 	perm := &registry.Perm{Name: user, Pull: u.Allows, Push: u.Allows}
-	d.authCache.Store(key, cachedAuth{perm, time.Now().Add(5 * time.Minute)})
+	d.authMu.Lock()
+	if d.authGen == gen {
+		d.authCache.Store(key, cachedAuth{perm, time.Now().Add(5 * time.Minute)})
+	}
+	d.authMu.Unlock()
 	return perm, nil
 }
 
 // forgetAuth drops cached registry credentials: every user change calls it, so a deleted user or an old token
 // stops working at once.
-func (d *Daemon) forgetAuth() { d.authCache.Clear() }
+func (d *Daemon) forgetAuth() {
+	d.authMu.Lock()
+	defer d.authMu.Unlock()
+	d.authGen++
+	d.authCache.Clear()
+}
 
 // ---- push trigger (the watchtower replacement, and previews from tags)
 
@@ -356,12 +370,16 @@ func fromProxy(h http.Handler) http.Handler {
 		if ip := r.Header.Get("X-Forwarded-For"); ip != "" {
 			r.RemoteAddr = strings.TrimSpace(ip[strings.LastIndex(ip, ",")+1:])
 		}
+		r = r.WithContext(context.WithValue(r.Context(), forwardedKey{}, true))
 		if r.Header.Get("X-Forwarded-Proto") == "https" {
 			r.TLS = &tls.ConnectionState{}
 		}
 		h.ServeHTTP(w, r)
 	})
 }
+
+// forwardedKey marks requests that came through the proxy: their loopback address is not a `vops ui` tunnel.
+type forwardedKey struct{}
 
 // UIHandler serves the dashboard, its api (session auth) and the registry (for loopback pulls and `vops ui` tunnels).
 func (d *Daemon) UIHandler() http.Handler {

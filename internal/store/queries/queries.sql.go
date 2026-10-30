@@ -555,7 +555,7 @@ func (q *Queries) GetRelease(ctx context.Context, id int64) (Release, error) {
 }
 
 const getSession = `-- name: GetSession :one
-SELECT user, expires FROM sessions WHERE id_hash = ?
+SELECT s.user, s.expires FROM sessions s JOIN users u ON u.name = s.user WHERE s.id_hash = ? AND u.role = 'admin'
 `
 
 type GetSessionRow struct {
@@ -563,6 +563,7 @@ type GetSessionRow struct {
 	Expires int64  `json:"expires"`
 }
 
+// only admins log in: a session created by a login that raced a demotion is not one
 func (q *Queries) GetSession(ctx context.Context, idHash string) (GetSessionRow, error) {
 	row := q.db.QueryRowContext(ctx, getSession, idHash)
 	var i GetSessionRow
@@ -1113,7 +1114,7 @@ func (q *Queries) ListPreviews(ctx context.Context, project interface{}) ([]Prev
 }
 
 const listProjects = `-- name: ListProjects :many
-SELECT path, disabled, commit_sha, applied_at, limits FROM projects ORDER BY path
+SELECT path, disabled, commit_sha, applied_at, limits, held FROM projects ORDER BY path
 `
 
 func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
@@ -1131,6 +1132,7 @@ func (q *Queries) ListProjects(ctx context.Context) ([]Project, error) {
 			&i.CommitSha,
 			&i.AppliedAt,
 			&i.Limits,
+			&i.Held,
 		); err != nil {
 			return nil, err
 		}
@@ -1789,6 +1791,21 @@ type SetProjectDisabledParams struct {
 
 func (q *Queries) SetProjectDisabled(ctx context.Context, arg SetProjectDisabledParams) error {
 	_, err := q.db.ExecContext(ctx, setProjectDisabled, arg.Path, arg.Disabled)
+	return err
+}
+
+const setProjectHeld = `-- name: SetProjectHeld :exec
+INSERT INTO projects (path, held) VALUES (?, ?)
+ON CONFLICT (path) DO UPDATE SET held = excluded.held
+`
+
+type SetProjectHeldParams struct {
+	Path string `json:"path"`
+	Held string `json:"held"`
+}
+
+func (q *Queries) SetProjectHeld(ctx context.Context, arg SetProjectHeldParams) error {
+	_, err := q.db.ExecContext(ctx, setProjectHeld, arg.Path, arg.Held)
 	return err
 }
 

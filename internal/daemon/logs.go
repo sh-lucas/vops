@@ -318,6 +318,7 @@ func podmanLogs(ctx context.Context, w io.Writer, project, service string, q log
 		return err
 	}
 	go func() { cmd.Wait(); pw.Close() }()
+	defer pr.Close() // a line over the scanner's limit stops it: podman's writes must fail, not block Wait forever
 	sc := bufio.NewScanner(pr)
 	for sc.Scan() {
 		if q.Grep == "" || strings.Contains(strings.ToLower(sc.Text()), strings.ToLower(q.Grep)) {

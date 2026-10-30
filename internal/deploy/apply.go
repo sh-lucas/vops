@@ -683,7 +683,8 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 	return nil
 }
 
-// StartStopped starts vops containers of enabled projects that are not running (after a reboot).
+// StartStopped starts vops containers of enabled projects that are not running (after a reboot), except held
+// projects. A rolling release the daemon died in loses its new replicas first: they never finished readiness.
 func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 	e.lock()
 	defer e.unlock()
@@ -692,6 +693,7 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 		fmt.Fprintln(w, err)
 		return
 	}
+	cs = e.dropInterrupted(ctx, w, cs)
 	flags, _ := e.DB.Projects()
 	for _, c := range cs {
 		if c.State == "paused" { // the daemon died while a snapshot had them paused
@@ -704,12 +706,69 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 		if c.State == "running" || flags[c.Labels[LProject]].Disabled || c.Labels[LJob] != "" {
 			continue
 		}
+		if p := c.Labels[LProject]; flags[p].Held != "" {
+			fmt.Fprintf(w, "not starting %s: %s is held (vops status %s)\n", c.Name(), p, p)
+			continue
+		}
 		fmt.Fprintf(w, "starting %s\n", c.Name())
 		if _, err := podman.Run(ctx, "start", c.ID); err != nil {
 			fmt.Fprintln(w, err)
 		}
 	}
 	e.RefreshRoutes(ctx)
+}
+
+// dropInterrupted removes, for each service with replicas of two or more hashes (not canaries or jobs), the
+// group with the newest container: a rolling release that never finished. It returns the containers left.
+func (e *Engine) dropInterrupted(ctx context.Context, w io.Writer, cs []podman.Container) []podman.Container {
+	groups := map[proxy.Key]map[string][]podman.Container{}
+	for _, c := range cs {
+		if isCanary(c) || c.Labels[LJob] != "" {
+			continue
+		}
+		k := proxy.Key{Project: c.Labels[LProject], Service: c.Labels[LService]}
+		if groups[k] == nil {
+			groups[k] = map[string][]podman.Container{}
+		}
+		groups[k][c.Labels[LHash]] = append(groups[k][c.Labels[LHash]], c)
+	}
+	gone := map[string]bool{}
+	for k, byHash := range groups {
+		if len(byHash) < 2 {
+			continue
+		}
+		var newest []podman.Container
+		var at int64
+		for _, g := range byHash {
+			for _, c := range g {
+				if c.Created > at {
+					at, newest = c.Created, g
+				}
+			}
+		}
+		for _, c := range newest {
+			gone[c.ID] = true // not started even if removing fails
+		}
+		msg := fmt.Sprintf("%s/%s: rolling release interrupted (daemon restarted): removed %d replica(s) that never finished readiness; the next apply retries", k.Project, k.Service, len(newest))
+		if err := e.remove(ctx, newest); err != nil {
+			msg = fmt.Sprintf("%s/%s: rolling release interrupted (daemon restarted): removing its %d unready replica(s) failed: %v", k.Project, k.Service, len(newest), err)
+		}
+		fmt.Fprintln(w, msg)
+		e.DB.Event(k.Project, "remove", "%s", msg)
+	}
+	return slices.DeleteFunc(cs, func(c podman.Container) bool { return gone[c.ID] })
+}
+
+// unhold releases a held project, with an event saying why its data can be trusted again.
+func (e *Engine) unhold(project, why string) {
+	if flags, _ := e.DB.Projects(); flags[project].Held == "" {
+		return
+	}
+	if err := e.DB.SetHeld(project, ""); err != nil {
+		e.DB.Event(project, "error", "release the hold: %v", err)
+		return
+	}
+	e.DB.Event(project, "rollback", "no longer held: %s", why)
 }
 
 // Restart restarts the containers of a project (or one service of it). A whole project leaves its finished jobs alone.
@@ -737,6 +796,9 @@ func (e *Engine) Restart(ctx context.Context, project, service string) error {
 		}
 	}
 	e.DB.Event(project, "restart", "restarted %s", strings.TrimSpace(service+" "))
+	if service == "" {
+		e.unhold(project, "restarted by hand")
+	}
 	return e.RefreshRoutes(ctx)
 }
 

@@ -230,6 +230,25 @@ func TestAuthLimiter(t *testing.T) {
 	if w := from("[::1]:5001", "POST", "/api/login", `{"user":"admin","password":"admin password 1"}`); w.Code != 200 {
 		t.Fatalf("a tunnel after another tunnel's failures: %d", w.Code)
 	}
+	// through the proxy, loopback is a container (rootless pasta), not a tunnel: limited like anyone
+	cfg := *d.cfg.Load()
+	cfg.Domain = "test" // the proxy forwards vops.test
+	d.cfg.Store(&cfg)
+	web := d.WebHandler()
+	proxied := func() int {
+		r := httptest.NewRequest("POST", "http://vops.test/api/login", strings.NewReader(`{"user":"admin","password":"guess"}`))
+		r.Header.Set("X-Vops", "1")
+		r.Header.Set("X-Forwarded-For", "127.0.0.1")
+		w := httptest.NewRecorder()
+		web.ServeHTTP(w, r)
+		return w.Code
+	}
+	for range authMaxFails {
+		proxied()
+	}
+	if code := proxied(); code != 429 {
+		t.Fatalf("proxied loopback past the limit: %d", code)
+	}
 	if code := reg(attacker, "vops-internal", d.pullToken); code != 200 {
 		t.Fatalf("the internal user: %d", code)
 	}

@@ -29,7 +29,7 @@ Full detail of every feature. The README has the short list.
 - Before any deploy that changes a project, its data is snapshotted (`pre-deploy`); containers using it are paused for the few milliseconds it takes, so all volumes are captured at the same instant.
 - `vops rollback <project> [deploy-id]` goes back to right before a deploy (default: the last non-rollback one): the **images** that ran then and the **data** from just before it. It shows the plan per service (`web: shop/web:v2 (sha256:…) → shop/web:v1 (sha256:…)`, skipped ones and why, the snapshot, the git command if the code differs) and asks. `--images`/`--data` for one part, `--service web` for some images, `--snapshot id` restores any snapshot.
 - Images roll back without git, by digest, with a rolling release. The service is then **pinned** (`web pinned to #12, compose says shop/web:latest`, nothing pending) until a newer version arrives (a push of its tag, or another `image:` in compose) or `vops unpin <project> [service]`. Built images (`build:`) and local images without a digest are skipped, and the plan says so.
-- Data rollback stops the project, snapshots the current data (`pre-rollback`), restores and starts it again. Always the whole project, every volume at the same instant (a db back an hour with the uploads dir not is data that no longer matches). Compose and code are not touched.
+- Data rollback stops the project, snapshots the current data (`pre-rollback`), restores and starts it again. Always the whole project, every volume at the same instant (a db back an hour with the uploads dir not is data that no longer matches). Compose and code are not touched. If a restore fails part way and putting the data back fails too, the project stays stopped and held (boot and apply don't start it) until a good restore or `vops restart`.
 - Every rollback can be undone: `vops rollback <project> <rollback-id>`.
 - `vops snapshot ls|create|rm`, also in the dashboard. The newest 5 automatic snapshots per project are kept (`snapshot_keep`); manual and uploaded ones stay until deleted.
 - Off-host backups: `vops snapshot export shop 12 > shop.tar.gz` (or Download in the dashboard) streams a snapshot as .tar.gz with owners, modes and xattrs. `vops snapshot import shop < shop.tar.gz` (or "Upload backup") makes it a snapshot again, restorable like any other. Imports are checked entry by entry (no absolute paths, `..`, devices, writes through symlinks); a failed one leaves nothing.
@@ -62,7 +62,8 @@ Full detail of every feature. The README has the short list.
 ## Registry
 - Own OCI registry at `registry.<domain>` (works with `podman push`/`docker push`, manifest lists, referrers).
 - Users are admins or deployers. Admins log into the dashboard and push/pull every repo with their password (`vops user add ops --admin` prompts it). Deployers only use the registry, with a generated token: every repo (`--global`) or a list (`vops user add ci --repo shop/web --repo shop/api`). Push and pull are one permission. `vops user ls|token|password|rm`, or the Users page.
-- Wrong credentials are limited per client ip, dashboard and registry together: after 10, `429` for 15 minutes (an `auth` event says who).
+- Pushes are refused (`507`) while the disk is over 95% used or has under 2GB free; the disk alert fires at 70%.
+- Wrong credentials are limited per client ip (ipv6: per /64), dashboard and registry together: after 10, `429` for 15 minutes (an `auth` event says who).
 - Pushing a tag that a service runs redeploys it (rolling). No watchtower. Opt out with `x-vops.watch: false`. Tags like `preview-pr-42` create previews instead (see Previews).
 - Pushes record who pushed (in events and, for gated projects, in the release).
 
@@ -76,8 +77,9 @@ Full detail of every feature. The README has the short list.
 - Our own, in its own process (`vops-proxy.service`): :80/:443, Let's Encrypt, http→https, HSTS, routing to containers. It knows nothing about sqlite, podman or the registry.
 - The daemon crashing, deadlocking (a watchdog restarts it) or being upgraded never takes the sites down; the dashboard and registry answer 502 until it's back. `vops install` restarts the proxy only when the proxy itself changed.
 - The daemon sends the routing table on every change and waits for the swap (a switch the proxy never confirms fails and keeps the old replicas). The proxy keeps its last table on disk, so it restarts with the right routes even with the daemon down. `vops status` and the top bar show its state.
-- Per-project limits (`x-vops: {rate: 20/s, burst: 40, max_body: 10MB, timeout: 5m}` at the compose top level): a token bucket per client ip (`429` + `Retry-After`), a body limit (`413`) and a response header timeout (default 60s, then `504`; streams like SSE are never cut), for every routed service and its previews. `vops status` and the project header show what they refused.
-- Hardened defaults: 10s and 64KB for request headers, a body silent for 30s is dropped (`408`), at most 256 connections per client ip and 10000 total. `X-Forwarded-For` is always the client's address.
+- A replica that refuses connections (stopped, removed) costs a retry on the next replica of its group, not a 502.
+- Per-project limits (`x-vops: {rate: 20/s, burst: 40, max_body: 10MB, timeout: 5m}` at the compose top level): a token bucket per client ip (ipv6: per /64; `429` + `Retry-After`), a body limit (`413`) and a response header timeout (default 60s, then `504`; streams like SSE are never cut), for every routed service and its previews. `vops status` and the project header show what they refused.
+- Hardened defaults: 10s and 64KB for request headers, a body silent for 30s is dropped (`408`), at most 256 connections per client ip (ipv6: per /64) and 10000 total. `X-Forwarded-For` is always the client's address.
 
 ## Dashboard
 - `vops ui` opens it through an ssh tunnel; also at `https://vops.<domain>` with an admin's user and password (session cookie). Deployers can't log in.
@@ -85,7 +87,7 @@ Full detail of every feature. The README has the short list.
 
 ## Notifications
 - Web Push, no third-party service: Notifications page → "Enable notifications on this device" (and "Send test"), on `https://vops.<domain>` or through `vops ui`. iOS only pushes to installed web apps: Share → Add to Home Screen first.
-- On by default: **deploy failed** (and failed canaries), **waiting approval** (a gated push), **restart** (a container died without vops stopping it), **out of memory** (containers and the host's OOM killer), **down** (a routed service with no replica, or failing its probe `down_after` times), **unhealthy** (`x-vops.health` 4xx/5xx or the compose healthcheck), **resources** (host cpu > 90% for 10m, memory available < 10% for 5m, a filesystem > 90%, memory PSI > 20%; containers near their limits). Off by default: **resolved**, **deploy succeeded**. What vops itself does never alerts.
+- On by default: **deploy failed** (and failed canaries), **waiting approval** (a gated push), **restart** (a container died without vops stopping it), **out of memory** (containers and the host's OOM killer), **down** (a routed service with no replica, or failing its probe `down_after` times), **unhealthy** (`x-vops.health` 4xx/5xx or the compose healthcheck), **resources** (host cpu > 90% for 10m, memory available < 10% for 5m, a filesystem > 70%, memory PSI > 20%; containers near their limits). Off by default: **resolved**, **deploy succeeded**. What vops itself does never alerts.
 - Sent at once, then hourly, expiring after 24h. Repeats coalesce ("shop/web restarted (5 times in 12m)"). Anyone can silence an alert for everyone; `vops notifications` lists them.
 - Per user: which kinds. Global ("Advanced"): thresholds and intervals. Every user's devices are listed and removable. All in the host's database, not `vops.yml`. You only get alerts of projects you can see.
 

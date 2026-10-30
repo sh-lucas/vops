@@ -143,6 +143,12 @@ func TestSessions(t *testing.T) {
 	if _, ok := db.CheckSession(id); ok {
 		t.Fatal("deleted session accepted")
 	}
+	// a login that raced a demotion inserts its session after the cascade: it must not let a deployer in
+	mustPut(t, db, User{Name: "ci", Role: Deployer, Global: true}, "ci-token-01234")
+	raced, _ := db.NewSession("ci", time.Hour)
+	if _, ok := db.CheckSession(raced); ok {
+		t.Fatal("a deployer's session accepted")
+	}
 }
 
 // A host at migration 006: registry users with '.*', a repo list and a custom regex, and the dashboard password
