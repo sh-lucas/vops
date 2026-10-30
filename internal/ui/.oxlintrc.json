@@ -1,0 +1,76 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "eslint",
+    "import",
+    "unicorn",
+    "oxc",
+    "promise"
+  ],
+  "categories": {
+    "correctness": "error",
+    "suspicious": "warn",
+    "perf": "warn"
+  },
+  "env": {
+    "browser": true,
+    "es2024": true
+  },
+  "rules": {
+    "no-undef": "error",
+    "no-unused-vars": [
+      "error",
+      {
+        "caughtErrors": "none"
+      }
+    ],
+    "no-shadow": "off",
+    "eqeqeq": "error",
+    "no-var": "error",
+    "prefer-const": "error",
+    "no-console": "warn",
+    "import/no-cycle": "error",
+    "import/named": "error",
+    "import/first": "error",
+    "import/no-duplicates": "error",
+    "unicorn/prefer-node-protocol": "off",
+    "no-unused-expressions": [
+      "error",
+      {
+        "allowShortCircuit": true,
+        "allowTernary": true
+      }
+    ],
+    "unicorn/consistent-function-scoping": "off",
+    "unicorn/prefer-add-event-listener": "off",
+    "oxc/no-map-spread": "off",
+    "unicorn/no-array-sort": "off",
+    "unicorn/no-array-reverse": "off"
+  },
+  "overrides": [
+    {
+      "files": [
+        "static/sw.js"
+      ],
+      "env": {
+        "browser": false,
+        "serviceworker": true
+      },
+      "rules": {
+        "unicorn/require-post-message-target-origin": "off"
+      }
+    },
+    {
+      "files": [
+        "*.test.js"
+      ],
+      "env": {
+        "browser": false,
+        "node": true
+      }
+    }
+  ],
+  "ignorePatterns": [
+    "node_modules"
+  ]
+}
