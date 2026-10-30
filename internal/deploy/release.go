@@ -154,9 +154,15 @@ func (e *Engine) Pushed(ctx context.Context, w io.Writer, p registry.Push) error
 		return err
 	}
 	var deploy []proxy.Key
+	var held []error
 	for _, pp := range plan.Projects {
 		keys := plan.WatchingIn(pp.Path, p.Repo, p.Tag)
 		if len(keys) == 0 {
+			continue
+		}
+		if pp.held != "" { // no release, pin change or canary on mixed data
+			fmt.Fprintf(w, "%s: ✗ %s\n", pp.Path, pp.Error)
+			held = append(held, fmt.Errorf("%s: %s", pp.Path, pp.Error))
 			continue
 		}
 		if !pp.project.Release.Gated() {
@@ -170,11 +176,10 @@ func (e *Engine) Pushed(ctx context.Context, w io.Writer, p registry.Push) error
 			e.startCanary(ctx, w, *r, keys)
 		}
 	}
-	if len(deploy) == 0 {
-		return nil
+	if len(deploy) > 0 {
+		_, err = e.apply(ctx, w, ApplyOpts{Services: deploy, Trigger: "push"})
 	}
-	_, err = e.apply(ctx, w, ApplyOpts{Services: deploy, Trigger: "push"})
-	return err
+	return errors.Join(append(held, err)...)
 }
 
 // holdPush records a push to a gated project as a pending release, unless none of its services would change.
@@ -270,8 +275,14 @@ func (e *Engine) Approve(ctx context.Context, w io.Writer, id int64, by string) 
 	if now := e.Registry.Resolve(r.Repo, r.Tag); now != r.Digest {
 		return fmt.Errorf("%s:%s points at %s now, not %s: reject #%d (a newer push makes its own release)", r.Repo, r.Tag, cmpOr(shortDigest(now), "nothing"), shortDigest(r.Digest), id)
 	}
-	if flags, _ := e.DB.Projects(); flags[r.Project].Disabled {
+	flags, err := e.DB.Projects()
+	switch {
+	case err != nil:
+		return err
+	case flags[r.Project].Disabled:
 		return fmt.Errorf("%s is disabled: enable it first", r.Project)
+	case flags[r.Project].Held != "":
+		return fmt.Errorf("%s: held: %s", r.Project, flags[r.Project].Held)
 	}
 	if ok, err := e.DB.DecideRelease(id, "approved", by, ""); err != nil || !ok {
 		return cmp.Or(err, fmt.Errorf("release #%d is not pending anymore", id))

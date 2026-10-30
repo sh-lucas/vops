@@ -161,6 +161,16 @@ services:
 		t.Fatal("gc would drop the pending digest")
 	}
 
+	// held (mixed data): a push records no release and an approval keeps it pending, both fail with held:
+	v.e.DB.SetHeld(p, "by the test")
+	if err := v.e.Pushed(ctx, io.Discard, v2); err == nil || !strings.Contains(err.Error(), "held: by the test") || latest().ID != r1.ID {
+		t.Fatalf("push to a held project: %v %+v", err, latest())
+	}
+	if err := v.e.Approve(ctx, io.Discard, r1.ID, "admin"); err == nil || !strings.Contains(err.Error(), "held: by the test") || latest().Status != "pending" {
+		t.Fatalf("approve of a held project: %v %+v", err, latest())
+	}
+	v.e.DB.SetHeld(p, "")
+
 	// approve: exactly that digest, everywhere it runs, with a history row
 	var out strings.Builder
 	if err := v.e.Approve(ctx, &out, r1.ID, "admin"); err != nil {

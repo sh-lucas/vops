@@ -408,8 +408,8 @@ func (reg *Registry) appendBody(id string, body io.Reader) (int64, *apiErr) {
 
 func (reg *Registry) finishUpload(w http.ResponseWriter, r *http.Request, name, id, digest string) *apiErr {
 	path := reg.uploadPath(id)
-	defer os.Remove(path + ".repo")
-	defer reg.uploading.Delete(id) // a request waiting on its lock finds the upload gone
+	defer reg.uploading.Delete(id)  // a request waiting on its lock finds the upload gone
+	defer os.Remove(path + ".repo") // runs first: the upload is gone before its lock is released
 	if !digestRe.MatchString(digest) {
 		os.Remove(path)
 		return errf(400, "DIGEST_INVALID", "invalid digest %q", digest)

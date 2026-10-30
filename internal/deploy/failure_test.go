@@ -167,6 +167,9 @@ networks:
 	// the second volume fails to restore: the first is put back, the project runs on its data from before
 	calls := 0
 	restoreVolume = func(ctx context.Context, snap, target string) error {
+		if flags, _ := v.e.DB.Projects(); !strings.Contains(flags[p].Held, "was interrupted") {
+			t.Errorf("not held while restoring (a daemon dying now would boot it on mixed data): %q", flags[p].Held)
+		}
 		if calls++; calls == 2 {
 			return errors.New("injected")
 		}
@@ -179,6 +182,9 @@ networks:
 	}
 	if got := read(); got != "B|B" {
 		t.Fatalf("data after a failed restore: %q\n%s", got, buf.String())
+	}
+	if flags, _ := v.e.DB.Projects(); flags[p].Held != "" {
+		t.Fatalf("held after a restore that put the data back: %q", flags[p].Held)
 	}
 
 	// putting it back fails too: the project stays stopped and the error says how to recover

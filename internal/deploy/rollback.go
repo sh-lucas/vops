@@ -448,6 +448,24 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err
 			start(nil)
 			return err
 		}
+		flags, err := e.DB.Projects()
+		if err != nil {
+			start(nil)
+			return err
+		}
+		prev := flags[project].Held
+		if prev == "" { // a daemon dying mid-restore leaves mixed data: boot must not start it
+			interrupted := fmt.Sprintf("restoring its data to #%d was interrupted: it may be partly restored. recover with: vops rollback %s --snapshot %d, then vops restart %s", s.ID, project, s.ID, project)
+			if err = e.DB.SetHeld(project, interrupted); err != nil {
+				start(nil)
+				return fmt.Errorf("hold %s while restoring: %w; nothing was restored", project, err)
+			}
+		}
+		putBack := func() { // the hold of this restore goes, an earlier one stays
+			if herr := e.DB.SetHeld(project, prev); herr != nil {
+				e.DB.Event(project, "error", "release the hold: %v", herr)
+			}
+		}
 		undo, consistent, err := e.restore(ctx, w, project, *s, rp.Commit)
 		rec.SnapshotID = undo
 		if err != nil && !consistent {
@@ -463,10 +481,15 @@ func (e *Engine) Rollback(ctx context.Context, w io.Writer, o RollbackOpts) (err
 			return err
 		}
 		if err != nil {
+			putBack()
 			start(nil)
 			return err
 		}
-		e.unhold(project, fmt.Sprintf("its data was restored to #%d", s.ID))
+		if prev == "" {
+			putBack()
+		} else {
+			e.unhold(project, fmt.Sprintf("its data was restored to #%d", s.ID))
+		}
 	}
 
 	var keys []proxy.Key

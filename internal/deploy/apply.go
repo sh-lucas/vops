@@ -633,7 +633,10 @@ func (e *Engine) RefreshRoutes(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	flags, _ := e.DB.Projects()
+	flags, err := e.DB.Projects()
+	if err != nil {
+		return err
+	}
 	pending, err := e.DB.PendingReleases()
 	if err != nil {
 		return err
@@ -693,8 +696,11 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 		fmt.Fprintln(w, err)
 		return
 	}
+	flags, ferr := e.DB.Projects()
+	if ferr != nil { // without them held projects would start on mixed data
+		fmt.Fprintf(w, "not starting stopped containers: %v\n", ferr)
+	}
 	cs = e.dropInterrupted(ctx, w, cs)
-	flags, _ := e.DB.Projects()
 	for _, c := range cs {
 		if c.State == "paused" { // the daemon died while a snapshot had them paused
 			fmt.Fprintf(w, "unpausing %s\n", c.Name())
@@ -703,7 +709,7 @@ func (e *Engine) StartStopped(ctx context.Context, w io.Writer) {
 			}
 			continue
 		}
-		if c.State == "running" || flags[c.Labels[LProject]].Disabled || c.Labels[LJob] != "" {
+		if ferr != nil || c.State == "running" || flags[c.Labels[LProject]].Disabled || c.Labels[LJob] != "" {
 			continue
 		}
 		if p := c.Labels[LProject]; flags[p].Held != "" {

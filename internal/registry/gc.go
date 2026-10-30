@@ -109,7 +109,10 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 			}
 		}
 		// unlink blobs from the repo that none of its manifests use (unless recently uploaded)
-		links, _ := os.ReadDir(reg.repoPath(name, "blobs"))
+		links, err := os.ReadDir(reg.repoPath(name, "blobs"))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return res, err
+		}
 		used := map[string]bool{}
 		for d := range keep {
 			used[hexOf(d)] = true
@@ -139,8 +142,14 @@ func (reg *Registry) GC(grace time.Duration, keepDigests map[string]bool) (GCRes
 				}
 			}
 		}
-		if len(keep) == 0 && !fresh && len(reg.tagMap(name)) == 0 && !young(reg.repoPath(name)) {
-			reg.removeRepo(name)
+		if len(keep) == 0 && !fresh && !young(reg.repoPath(name)) {
+			left, err := reg.readTags(name)
+			if err != nil {
+				return res, err
+			}
+			if len(left) == 0 {
+				reg.removeRepo(name)
+			}
 		}
 	}
 
