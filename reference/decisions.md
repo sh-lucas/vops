@@ -195,7 +195,7 @@ Every non-obvious choice made while building vops, with the reason. Newest last.
 - Every `podman.Run` has a timeout (2m + the `-t` grace period; 30m for pull/build): a hung podman (storage lock, dead mount) would otherwise hold the deploy lock forever and block every apply and restart. Log streams are exempt.
 - A daemon crash doesn't touch containers (`KillMode=process`, systemd restarts it in 2s, routes rebuilt from labels) nor sites (the proxy is another process). Only the dashboard and registry are down for those seconds: the proxy answers 502 with a clear text for their hosts.
 - Removing a container counts as done when it is gone, even if podman errors cleaning up its network afterwards (seen with nested podman).
-- The daemon idles at ~16MB RSS.
+- The daemon idles at ~30MB RSS.
 - Tests: `just test` runs with `-race`; they share one isolated podman storage (`~/.cache/vops-test`) behind a file lock, so `go test ./...` runs packages in parallel safely. Fuzz tests (`FuzzSplitPath`, `FuzzLoad`) run their seed corpus in every `go test`; `go test -fuzz` explores (the registry path splitter and compose loader are what network and git feed). `just vps-test` is the production-like check: fake ssh in `go test` covers the logic fast, the vps container covers real sshd/systemd/root.
 
 ## The proxy process

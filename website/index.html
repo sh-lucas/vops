@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>vops: your server is a git repo</title>
+<meta name="description" content="Self-host containers from a git repo. GitOps, btrfs snapshots and rollback, plain linux. One static binary, no cluster.">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='4' fill='%234f6bed'/%3E%3Cpath d='M4 5l4 7 4-7' stroke='white' stroke-width='2' fill='none'/%3E%3C/svg%3E">
+<style>
+/* same tokens as the dashboard (internal/ui/static/style.css) */
+:root {
+  --bg: #f6f7f9; --panel: #fff; --text: #14161b; --muted: #5d6270; --faint: #9a9eaa;
+  --line: #e8e9ee; --code: #f3f4f7; --accent: #4f6bed; --accent-text: #fff; --ok: #15a34a;
+  --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #0c0d10; --panel: #141519; --text: #ececf0; --muted: #9b9ea9; --faint: #6b6e79; --line: #23242a; --code: #1b1c21; --accent: #8193ff; --accent-text: #0c0d10; --ok: #3fb96b; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; -webkit-font-smoothing: antialiased; overflow-x: hidden; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre { font-family: var(--mono); }
+
+/* background: a soft aurora behind the hero that sways slowly and fades into the page */
+.bg { position: absolute; top: 0; left: 0; right: 0; height: 900px; z-index: -1; pointer-events: none; overflow: hidden; mask-image: linear-gradient(#000 30%, transparent); }
+.bg span { position: absolute; top: -260px; width: 70vw; height: 520px; border-radius: 50%; filter: blur(100px); opacity: .28; animation: sway 18s ease-in-out infinite alternate; }
+.bg span:nth-child(1) { left: -10vw; background: var(--accent); }
+.bg span:nth-child(2) { left: 30vw; background: color-mix(in srgb, var(--accent) 60%, #b04ce0); opacity: .2; animation-duration: 24s; animation-direction: alternate-reverse; }
+.bg span:nth-child(3) { left: 55vw; top: -320px; background: color-mix(in srgb, var(--accent) 55%, #22b8cf); opacity: .16; animation-duration: 30s; }
+@keyframes sway { to { transform: translateX(12vw) scaleY(1.2); } }
+@media (prefers-reduced-motion: reduce) { .bg span { animation: none; } }
+
+.wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+nav { display: flex; align-items: center; justify-content: space-between; padding: 20px 0; }
+.brand { display: flex; align-items: center; gap: 10px; color: var(--text); font-weight: 650; font-size: 17px; }
+.brand:hover { text-decoration: none; }
+.logo { display: inline-grid; place-items: center; width: 30px; height: 30px; border-radius: 8px; background: var(--accent); color: var(--accent-text); }
+.logo svg { width: 16px; height: 16px; }
+nav .links { display: flex; gap: 20px; font-size: 14.5px; }
+nav .links a { color: var(--muted); }
+
+.hero { padding: 72px 0 40px; text-align: center; }
+.hero h1 { font-size: clamp(36px, 6vw, 60px); line-height: 1.08; letter-spacing: -.03em; margin: 0 0 18px; font-weight: 700; }
+.hero h1 em { font-style: normal; color: var(--accent); }
+.hero p { max-width: 620px; margin: 0 auto 30px; color: var(--muted); font-size: 18px; }
+.cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 10px 18px; border-radius: 10px; font-weight: 550; font-size: 15px; border: 1px solid var(--line); background: var(--panel); color: var(--text); }
+.btn:hover { text-decoration: none; border-color: var(--accent); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-text); }
+
+.term { max-width: 720px; margin: 48px auto 0; text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; box-shadow: 0 16px 40px rgba(16,24,40,.10); overflow: hidden; }
+.term .bar { display: flex; gap: 6px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.term .bar i { width: 11px; height: 11px; border-radius: 50%; background: var(--line); }
+.term pre { margin: 0; padding: 18px 20px; font-size: 13.5px; line-height: 1.7; overflow-x: auto; }
+.term .c { color: var(--faint); }
+.term .p { color: var(--accent); user-select: none; }
+.term .ok { color: var(--ok); }
+
+h2 { font-size: clamp(24px, 3.4vw, 32px); letter-spacing: -.02em; margin: 0 0 8px; text-align: center; }
+.lead { text-align: center; color: var(--muted); margin: 0 auto 36px; max-width: 560px; }
+section { padding: 64px 0; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(290px, 1fr)); gap: 16px; }
+.card { background: color-mix(in srgb, var(--panel) 85%, transparent); backdrop-filter: blur(6px); border: 1px solid var(--line); border-radius: 14px; padding: 22px; }
+.card h3 { margin: 0 0 6px; font-size: 17px; }
+.card p { margin: 0; color: var(--muted); font-size: 15px; }
+.card code { font-size: 13px; background: var(--code); padding: 1px 5px; border-radius: 5px; }
+
+.nope { display: flex; flex-wrap: wrap; gap: 10px; justify-content: center; max-width: 760px; margin: 0 auto; }
+.nope span { padding: 6px 14px; border: 1px solid var(--line); border-radius: 99px; color: var(--muted); font-size: 14.5px; text-decoration: line-through; text-decoration-color: var(--faint); background: var(--panel); }
+.yes { text-align: center; margin-top: 22px; font-size: 18px; }
+.yes b { color: var(--accent); }
+
+.limits { max-width: 640px; margin: 0 auto; text-align: center; color: var(--muted); font-size: 15px; }
+footer { border-top: 1px solid var(--line); padding: 28px 0 40px; color: var(--faint); font-size: 14px; display: flex; justify-content: space-between; flex-wrap: wrap; gap: 12px; }
+</style>
+</head>
+<body>
+<div class="bg" aria-hidden="true"><span></span><span></span><span></span></div>
+
+<div class="wrap">
+  <nav>
+    <a class="brand" href="/"><span class="logo"><svg viewBox="0 0 16 16"><path d="M4 5l4 7 4-7" stroke="currentColor" stroke-width="2" fill="none"/></svg></span>vops</a>
+    <div class="links">
+      <a href="https://github.com/sh-lucas/vops/blob/main/reference/features.md">Docs</a>
+      <a href="https://github.com/sh-lucas/vops">GitHub</a>
+    </div>
+  </nav>
+
+  <header class="hero">
+    <h1>Your server is<br>a <em>git repo</em>.</h1>
+    <p>Push compose files over ssh. vops deploys them with podman, serves them over https and snapshots their data on btrfs. One static binary. No cluster, no extra services.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/sh-lucas/vops#quick-start">Get started</a>
+      <a class="btn" href="https://github.com/sh-lucas/vops">View on GitHub</a>
+    </div>
+
+    <div class="term" role="img" aria-label="Terminal: deploying a site with vops">
+      <div class="bar"><i></i><i></i><i></i></div>
+<pre><span class="p">$ </span>vops init --domain example.com
+<span class="p">$ </span>vops install root@203.0.113.10
+<span class="p">$ </span>git add site/compose.yml && git commit -m site
+<span class="p">$ </span>vops sync
+<span class="c">site
+  + web</span>
+<span class="c">apply? [y/N]</span> y
+<span class="c"># </span><span class="ok">https://site.example.com</span></pre>
+    </div>
+  </header>
+
+  <section>
+    <h2>Simple on purpose</h2>
+    <p class="lead">Everything a small team needs to run apps on its own server, and nothing it doesn't.</p>
+    <div class="grid">
+      <div class="card"><h3>GitOps, for real</h3><p>The repo is the server. Review deploys like code.</p></div>
+      <div class="card"><h3>btrfs snapshots</h3><p>Roll back images <em>and</em> data in one command.</p></div>
+      <div class="card"><h3>Plain linux</h3><p>systemd, podman and git. Idles at ~30MB of RAM.</p></div>
+      <div class="card"><h3>Safe releases</h3><p>Rolling deploys. A failed check keeps the old version up.</p></div>
+      <div class="card"><h3>Previews with real data</h3><p>Per-branch copies with a copy-on-write clone of prod data.</p></div>
+      <div class="card"><h3>Batteries included</h3><p>https, registry, secrets and a dashboard, built in.</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>One binary instead of a stack</h2>
+    <p class="lead">To deploy one simple app you shouldn't have to deploy ten other things first.</p>
+    <div class="nope">
+      <span>kubernetes</span><span>reverse proxy</span><span>cert manager</span><span>container registry</span><span>deploy agent</span><span>secrets vault</span><span>image watcher</span><span>monitoring stack</span>
+    </div>
+    <p class="yes">Just <b>vops</b>.</p>
+  </section>
+
+  <section>
+    <p class="limits">Honest limits: one host, linux and podman only, and snapshots need btrfs. If you need a cluster, vops is not for you. <a href="https://github.com/sh-lucas/vops/blob/main/reference/limitations.md">All limitations</a>.</p>
+  </section>
+
+  <footer>
+    <span>vops</span>
+    <a href="https://github.com/sh-lucas/vops">github.com/sh-lucas/vops</a>
+  </footer>
+</div>
+</body>
+</html>

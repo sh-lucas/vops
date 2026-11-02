@@ -1,6 +1,44 @@
 # Features
 
-Full detail of every feature. The README has the short list.
+Full detail of every feature. The README has the short version.
+
+## State and requirements
+- In production on one real server, covered by end-to-end tests against real podman and by `just vps-test` (real systemd + sshd). Details: [migrating.md](migrating.md).
+- Host deps: linux, systemd, podman 4+ (netavark), git. btrfs (+ btrfs-progs) only for snapshots and data rollback.
+- Two processes of the same binary: the daemon (deploys, registry, dashboard; idles at ~30MB RSS) and a small proxy that owns :80/:443. The binary is static, ~13MB.
+- `vops install` copies the cli's own binary to the host, so it must match the host (linux, same arch); running it again upgrades in place. cli and host must run the same major.minor; patch versions may differ. From a mac or for an arm64 host: `GOOS=linux GOARCH=arm64 go install github.com/sh-lucas/vops/cmd/vops@latest`, then `vops install user@host --binary $(go env GOPATH)/bin/linux_arm64/vops`.
+
+## How it works
+
+```
+your laptop                                   the host
+./ (git repo)  --- git push over ssh --->     ~/vops/ (working tree, updated on push)
+  vops.yml                                      shop/api/compose.yml  -> containers
+  shop/api/compose.yml                          registry/data/        -> your images
+  vops-lock.yml (gitignored)                  ~/.vops/                -> sqlite, certs, binary, sockets
+```
+
+The daemon runs the containers with podman and serves a registry at `registry.<domain>` and a dashboard at `vops.<domain>`. The proxy, a separate process, routes `https://<service>.<project>.<domain>` to the containers and gets certificates from Let's Encrypt; it keeps serving when the daemon crashes or is upgraded.
+
+## Commands
+
+```
+vops init | install user@host [--force] | sync [-y] | ui
+vops status | plan | apply [-y] [project...]
+vops logs <project> [service] [-f] [-n N] [--grep s] [--since t] [--until t]
+vops restart <project> [service] | enable <project> | disable <project>
+vops env ls|set|rm <project> [--preview] ...   vops env recipients | restore [file]
+vops user ls|add|rm|token|password ...
+vops registry ls|rm|gc                    vops events | notifications | audit | version
+vops snapshot ls|create|rm|export|import ...   vops history <project> [-n N]
+vops rollback <project> [deploy-id] [--images] [--data] [--service s]... [--snapshot id] [-y]
+vops unpin <project> [service...]
+vops releases [project] | releases approve|reject <id>
+vops preview up <project> --name n [--image svc=ref]... [--ref r] [--from id]
+vops preview ls [project] | rm <project> <name>
+```
+
+Inside a linked repo commands run on the host over ssh (`sync`, `apply` and `install` only work that way); on the host they talk to the daemon directly. The web-facing parts are the dashboard (admins) and the registry (admins' passwords, deployers' tokens). On the host, systemd runs `vops daemon` and `vops proxy`.
 
 ## Git sync
 - `vops sync`: `git pull` from the host, `git push`, plan, confirm, apply. `-y` for CI.
