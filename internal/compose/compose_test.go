@@ -199,6 +199,14 @@ func TestMergeFilesAndDomains(t *testing.T) {
 	if !slices.Equal(got["web"], []string{"web.my-shop.example.com"}) || !slices.Equal(got["admin_ui"], []string{"admin-ui.my-shop.example.com"}) || got["worker"] != nil {
 		t.Fatalf("domains %v", got)
 	}
+	p, err = load(t, "shop", "services:\n  web:\n    image: x\n    x-vops: {port: 80, domains: [web.shop.example.com, shop.example.com]}\n", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// explicit domains that repeat the generated ones are not listed twice
+	if specs, _ := p.Specs("example.com", nil); !slices.Equal(specs[0].Domains, []string{"web.shop.example.com", "shop.example.com"}) {
+		t.Fatalf("dedup: %v", specs[0].Domains)
+	}
 	if _, err := load(t, "p", "services:\n  a:\n    image: x\n", nil, "b.compose.yml", "services:\n  a:\n    image: y\n"); err == nil || !strings.Contains(err.Error(), "twice") {
 		t.Fatalf("duplicate: %v", err)
 	}

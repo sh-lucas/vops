@@ -160,10 +160,16 @@ func (p *Project) spec(s *Service, rootDomain string, onlyRouted bool, projectEn
 		sp.Domains = append(sp.Domains, s.Vops.Domains...)
 		if rootDomain != "" {
 			base := DNSName(p.Path) + "." + rootDomain
+			auto := []string{dnsLabel(s.Name) + "." + base}
 			if onlyRouted {
-				sp.Domains = append(sp.Domains, base)
+				auto = []string{base, auto[0]}
 			}
-			sp.Domains = append(sp.Domains, dnsLabel(s.Name)+"."+base)
+			for _, d := range auto {
+				// x-vops.domains may already list the generated name; twice reads as a conflict with itself
+				if !slices.Contains(sp.Domains, d) {
+					sp.Domains = append(sp.Domains, d)
+				}
+			}
 		}
 	}
 	var a []string
