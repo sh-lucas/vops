@@ -6,7 +6,7 @@ Full detail of every feature. The README has the short version.
 - In production on one real server, covered by end-to-end tests against real podman and by `just vps-test` (real systemd + sshd). Details: [migrating.md](migrating.md).
 - Host deps: linux, systemd, podman 4+ (netavark), git. btrfs (+ btrfs-progs) only for snapshots and data rollback.
 - Two processes of the same binary: the daemon (deploys, registry, dashboard; idles at ~30MB RSS) and a small proxy that owns :80/:443. The binary is static, ~13MB.
-- `vops install` copies the cli's own binary to the host, so it must match the host (linux, same arch); running it again upgrades in place. cli and host must run the same major.minor; patch versions may differ. From a mac or for an arm64 host: `GOOS=linux GOARCH=arm64 go install github.com/sh-lucas/vops/cmd/vops@latest`, then `vops install user@host --binary $(go env GOPATH)/bin/linux_arm64/vops`.
+- `vops install` copies the cli's own binary to the host, so it must match the host (linux, same arch) and be static (`CGO_ENABLED=0`): install refuses a cgo build, whose libc loader (e.g. NixOS's `/nix/store/...`) doesn't exist on the host; running it again upgrades in place. cli and host must run the same major.minor; patch versions may differ. From a mac or for an arm64 host: `CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go install github.com/sh-lucas/vops/cmd/vops@latest`, then `vops install user@host --binary $(go env GOPATH)/bin/linux_arm64/vops`.
 
 ## How it works
 

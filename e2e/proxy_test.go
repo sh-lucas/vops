@@ -164,7 +164,7 @@ func TestVersionCheck(t *testing.T) {
 		t.Fatalf("upgrade: %v\n%s", err, out)
 	}
 	// now the cli is the older one
-	if out, err := w.try(dev, "", "status"); code(err) != 3 || !strings.Contains(out, "the host runs vops v9.9") || !strings.Contains(out, "update yours (go install") {
+	if out, err := w.try(dev, "", "status"); code(err) != 3 || !strings.Contains(out, "the host runs vops v9.9") || !strings.Contains(out, "update yours (CGO_ENABLED=0 go install") {
 		t.Fatalf("older cli: %v\n%s", err, out)
 	}
 	if out, err := w.try(dev, "", "install", "dev@fakehost", "--binary", w.bin); code(err) != 3 || !strings.Contains(out, "--force") {

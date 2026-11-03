@@ -10,7 +10,7 @@ import (
 // exitVersion is the exit code when the cli and the host differ in major.minor.
 const exitVersion = 3
 
-const updateCmd = "go install github.com/sh-lucas/vops/cmd/vops@latest"
+const updateCmd = "CGO_ENABLED=0 go install github.com/sh-lucas/vops/cmd/vops@latest"
 
 // versionError refuses a command because the cli and the host run different major.minor versions.
 type versionError struct{ msg string }
