@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"debug/buildinfo"
+	"debug/elf"
 	"encoding/json/v2"
 	"errors"
 	"flag"
@@ -175,7 +176,7 @@ func cmdInstall(g globals, args []string) error {
 	bin := *binary
 	if bin == "" {
 		if arch != runtime.GOARCH || runtime.GOOS != "linux" {
-			return fmt.Errorf("the host is linux/%s but this vops is %s/%s: get one with `GOOS=linux GOARCH=%s go install github.com/sh-lucas/vops/cmd/vops@latest` and pass --binary $(go env GOPATH)/bin/linux_%s/vops", arch, runtime.GOOS, runtime.GOARCH, arch, arch)
+			return fmt.Errorf("the host is linux/%s but this vops is %s/%s: get one with `CGO_ENABLED=0 GOOS=linux GOARCH=%s go install github.com/sh-lucas/vops/cmd/vops@latest` and pass --binary $(go env GOPATH)/bin/linux_%s/vops", arch, runtime.GOOS, runtime.GOARCH, arch, arch)
 		}
 		if bin, err = os.Executable(); err != nil {
 			return err
@@ -198,6 +199,9 @@ func cmdInstall(g globals, args []string) error {
 		fmt.Fprintf(os.Stderr, "downgrading vops %s → %s (--force)\n", hostVersion, newVersion)
 	default:
 		fmt.Fprintf(os.Stderr, "upgrading vops %s → %s\n", hostVersion, newVersion)
+	}
+	if err := checkStatic(bin); err != nil {
+		return err
 	}
 	f, err := os.Open(bin)
 	if err != nil {
@@ -671,4 +675,20 @@ func cmdRollback(g globals, args []string) error {
 		rest = append(rest, fmt.Sprint(rp.Before.ID)) // exactly the point shown, even if a deploy lands in between
 	}
 	return forward(g, "rollback", append(rest, "--yes"), nil, os.Stdout)
+}
+
+// checkStatic refuses a dynamically linked binary: a cgo build (go install on NixOS, a mac cross-build with cgo)
+// points at the builder's libc loader and doesn't start on the host.
+func checkStatic(bin string) error {
+	f, err := elf.Open(bin)
+	if err != nil {
+		return fmt.Errorf("%s is not a linux binary: %w", bin, err)
+	}
+	defer f.Close()
+	for _, p := range f.Progs {
+		if p.Type == elf.PT_INTERP {
+			return fmt.Errorf("%s is dynamically linked (built with cgo) and won't run on the host: rebuild it with `CGO_ENABLED=0 go install github.com/sh-lucas/vops/cmd/vops@latest`", bin)
+		}
+	}
+	return nil
 }

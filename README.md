@@ -10,7 +10,7 @@ Self-host containers from a git repo. Push compose files over ssh; vops deploys 
 ## Quick start
 
 ```sh
-go install github.com/sh-lucas/vops/cmd/vops@latest   # go 1.27+
+CGO_ENABLED=0 go install github.com/sh-lucas/vops/cmd/vops@latest   # go 1.27+; static, so `vops install` can copy it to any linux host
 
 vops init --domain example.com --email you@example.com
 vops install root@203.0.113.10        # dns: example.com and *.example.com -> the host
