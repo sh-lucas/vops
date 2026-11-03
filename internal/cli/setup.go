@@ -37,7 +37,7 @@ RestartSec=2
 WatchdogSec=60
 # containers are not children of the daemon: restarting vops must never stop them
 KillMode=process
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=PATH=%s
 
 [Install]
 WantedBy=%s
@@ -168,9 +168,21 @@ func snapshotRootKeys(vh string, say func(string, ...any)) {
 	}
 }
 
+// unitPath is the daemon's PATH: the one setup runs with (NixOS keeps podman in /run/current-system/sw/bin
+// and newuidmap in /run/wrappers/bin), then the usual dirs for a minimal ssh PATH.
+func unitPath(env string) string {
+	var dirs []string
+	for _, d := range slices.Concat(filepath.SplitList(env), []string{"/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"}) {
+		if filepath.IsAbs(d) && !slices.Contains(dirs, d) {
+			dirs = append(dirs, d)
+		}
+	}
+	return strings.Join(dirs, ":")
+}
+
 func installUnit(vh string, say, warn func(string, ...any)) error {
 	home := filepath.Dir(vh)
-	u := units{vh: vh, home: home, say: say, warn: warn}
+	u := units{vh: vh, home: home, path: unitPath(os.Getenv("PATH")), say: say, warn: warn}
 	var ctl []string
 	if os.Getuid() == 0 {
 		u.dir, u.after, u.wanted, ctl = "/etc/systemd/system", "After=network-online.target\nWants=network-online.target\n", "multi-user.target", []string{"systemctl"}
@@ -214,10 +226,10 @@ func installUnit(vh string, say, warn func(string, ...any)) error {
 // the proxy only when it isn't running, its unit changed or it speaks another proxy.Version, because
 // restarting it is the only thing that interrupts the sites.
 type units struct {
-	vh, home, dir, after, wanted, journal string
-	systemctl                             func(args ...string) error
-	syncRoutes                            func() error // the daemon sends its table to the proxy now
-	say, warn                             func(string, ...any)
+	vh, home, dir, after, wanted, journal, path string
+	systemctl                                   func(args ...string) error
+	syncRoutes                                  func() error // the daemon sends its table to the proxy now
+	say, warn                                   func(string, ...any)
 }
 
 func (u units) install() error {
@@ -226,9 +238,8 @@ func (u units) install() error {
 	running, perr := proxy.NewClient(u.vh).Status(ctx)
 	cancel()
 	os.MkdirAll(u.dir, 0o755)
-	write := func(name, tmpl string) (changed, isNew bool, err error) {
+	write := func(name string, b []byte) (changed, isNew bool, err error) {
 		path := filepath.Join(u.dir, name)
-		b := fmt.Appendf(nil, tmpl, u.after, bin, u.home, u.wanted)
 		old, rerr := os.ReadFile(path)
 		if rerr == nil && bytes.Equal(old, b) {
 			return false, false, nil
@@ -239,10 +250,10 @@ func (u units) install() error {
 		u.say("wrote %s", path)
 		return true, rerr != nil, nil
 	}
-	if _, _, err := write("vops.service", daemonUnit); err != nil {
+	if _, _, err := write("vops.service", fmt.Appendf(nil, daemonUnit, u.after, bin, u.home, u.path, u.wanted)); err != nil {
 		return err
 	}
-	proxyChanged, proxyNew, err := write("vops-proxy.service", proxyUnit)
+	proxyChanged, proxyNew, err := write("vops-proxy.service", fmt.Appendf(nil, proxyUnit, u.after, bin, u.home, u.wanted))
 	if err != nil {
 		return err
 	}
