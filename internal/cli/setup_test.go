@@ -31,7 +31,7 @@ func TestSetupRestartsTheProxyOnlyWhenNeeded(t *testing.T) {
 	vh := filepath.Join(home, ".vops")
 	os.MkdirAll(vh, 0o700)
 	var calls []string
-	u := units{vh: vh, home: home, dir: filepath.Join(home, "units"), wanted: "default.target", journal: "journalctl",
+	u := units{vh: vh, home: home, dir: filepath.Join(home, "units"), wanted: "default.target", journal: "journalctl", path: "/run/current-system/sw/bin:/usr/bin",
 		systemctl:  func(args ...string) error { calls = append(calls, strings.Join(args, " ")); return nil },
 		syncRoutes: func() error { return nil },
 		say:        func(string, ...any) {}, warn: func(string, ...any) {}}
@@ -54,6 +54,9 @@ func TestSetupRestartsTheProxyOnlyWhenNeeded(t *testing.T) {
 	if !strings.Contains(string(unit), "proxy\n") || !strings.Contains(string(unit), "WatchdogSec=") || !strings.Contains(string(unit), "Type=notify") {
 		t.Fatalf("proxy unit:\n%s", unit)
 	}
+	if unit, _ := os.ReadFile(filepath.Join(u.dir, "vops.service")); !strings.Contains(string(unit), "Environment=PATH=/run/current-system/sw/bin:/usr/bin\n") {
+		t.Fatalf("daemon unit must carry the host PATH:\n%s", unit)
+	}
 
 	// upgrade, same proxy.Version running, unit unchanged: the daemon restarts, the proxy doesn't
 	fakeProxy(t, vh, proxy.Version)
@@ -66,5 +69,13 @@ func TestSetupRestartsTheProxyOnlyWhenNeeded(t *testing.T) {
 	fakeProxy(t, vh, proxy.Version-1)
 	if c := install(); !slices.Contains(c, "restart vops-proxy.service") {
 		t.Fatalf("another proxy version must be restarted: %v", c)
+	}
+}
+
+func TestUnitPathKeepsTheHostPath(t *testing.T) {
+	got := unitPath("/run/wrappers/bin::relative:/run/current-system/sw/bin:/usr/bin")
+	want := "/run/wrappers/bin:/run/current-system/sw/bin:/usr/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:/bin"
+	if got != want {
+		t.Fatalf("unitPath = %q, want %q", got, want)
 	}
 }
