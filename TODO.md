@@ -25,6 +25,7 @@ Timeouts, header size and connection caps are done (reference/decisions.md, "The
 
 - Outbound webhooks (generic JSON, ntfy, Discord, Slack) as one more kind of device: a row with its URL (a secret, sealed like env), the same kinds, toggles and access rule, "Send test", added from the Notifications page.
 - Per-project mutes.
+- Maintenance mute for everyone with an end (`vops notifications mute 2h`, a banner while on): hand work on the host (backups, moving a project) today means stopping the daemon and writing `notify_prefs` rows by hand to not wake the team, and putting them back after.
 - Opt-in early kill: `x-vops.oom: kill-first` on a service lets vops restart it when memory PSI stays high, before the kernel or systemd-oomd picks a victim (maybe the proxy). Never a default: it could pick a database. `mem_limit` is the first answer.
 
 ## Data

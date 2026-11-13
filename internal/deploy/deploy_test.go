@@ -321,6 +321,31 @@ func TestRollingLifecycle(t *testing.T) {
 	}
 }
 
+// A project moved to a dir that sorts before its old one, keeping its data by volume name: the old containers go
+// before the moved ones start, or two databases would run on the same files for a moment.
+func TestMovedProjectStopsBeforeItsSuccessor(t *testing.T) {
+	v := newEnv(t)
+	old, moved := v.ns+"-z", v.ns+"-a"
+	db := func(msg string) string {
+		return "services:\n  db:\n    image: APP\n    environment: {PORT: \"8080\", MSG: " + msg + "}\n    volumes: [data:/data]\n" +
+			"volumes:\n  data: {name: vops-" + old + "-data}\n"
+	}
+	v.commit(map[string]string{old + "/compose.yml": db("old")})
+	v.mustApply()
+	v.commit(map[string]string{old: "", moved + "/compose.yml": db("new")})
+	_, out, err := v.apply(ApplyOpts{})
+	if err != nil {
+		t.Fatalf("apply: %v\n%s", err, out)
+	}
+	gone, started := strings.Index(out, old+"/db: removing"), strings.Index(out, moved+"/db: started")
+	if gone < 0 || started < 0 || gone > started {
+		t.Fatalf("the old db must be gone before the moved one starts:\n%s", out)
+	}
+	if len(v.containers(old)) != 0 || len(v.containers(moved)) != 1 {
+		t.Fatalf("containers: old %d, moved %d", len(v.containers(old)), len(v.containers(moved)))
+	}
+}
+
 // Recreate strategy, dependency order, dns between services and between projects, volumes, bad compose.
 func TestProjectsTalkToEachOther(t *testing.T) {
 	v := newEnv(t)

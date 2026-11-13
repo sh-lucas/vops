@@ -21,6 +21,17 @@ func TestParseVersion(t *testing.T) {
 	}
 }
 
+// --help after a command is the usage, wherever it runs: no host needed (HOME has no daemon, no repo is linked)
+func TestCommandHelp(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Chdir(t.TempDir())
+	for _, args := range [][]string{{"env", "--help"}, {"logs", "shop", "-h"}, {"sync", "--help"}} {
+		if code := Main(args); code != 0 {
+			t.Errorf("%v: exit %d", args, code)
+		}
+	}
+}
+
 func TestVersionMismatch(t *testing.T) {
 	if msg := versionMismatch("v1.3.0", "v1.3.7+dirty"); msg != "" {
 		t.Fatalf("patch differences are fine: %s", msg)

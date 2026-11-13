@@ -83,7 +83,12 @@ func (e *Engine) apply(ctx context.Context, w io.Writer, opts ApplyOpts) (*Plan,
 		return plan, fmt.Errorf("the host is at %.12s, not %.12s: someone pushed in between, run sync again", plan.Commit, opts.Commit)
 	}
 	var failed []string
-	for _, pp := range plan.Projects {
+	// what stops goes first: a project moved to another dir that keeps its volume by name (or one taking over a
+	// disabled project's) must never start next to the old containers, two databases on the same files
+	for _, pp := range slices.Concat(
+		slices.DeleteFunc(slices.Clone(plan.Projects), func(pp *ProjectPlan) bool { return !pp.Gone && !pp.Disabled }),
+		slices.DeleteFunc(slices.Clone(plan.Projects), func(pp *ProjectPlan) bool { return pp.Gone || pp.Disabled }),
+	) {
 		if err := e.applyProject(ctx, w, plan, pp, opts); err != nil {
 			fmt.Fprintf(w, "%s: ✗ %v\n", pp.Path, err)
 			e.DB.Event(pp.Path, "error", "%v", err)

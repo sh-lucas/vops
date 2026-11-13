@@ -90,6 +90,11 @@ func Main(args []string) int {
 		return 2
 	}
 	cmd, rest := rest[0], rest[1:]
+	// `vops env --help` shows the usage here, instead of reaching (or failing to reach) the host
+	if slices.ContainsFunc(rest, func(a string) bool { return a == "-h" || a == "-help" || a == "--help" }) {
+		fmt.Print(usage)
+		return 0
+	}
 	var err error
 	// a forwarded command: refuse when the cli that sent it has another major.minor (setup: install decided)
 	if client := os.Getenv("VOPS_CLIENT"); client != "" && !slices.Contains([]string{"version", "--version", "help", "-h", "--help", "setup"}, cmd) {
